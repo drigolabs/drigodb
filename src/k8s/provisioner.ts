@@ -82,12 +82,21 @@ export class Provisioner {
 
   static fromCluster(): Provisioner {
     const kc = new KubeConfig();
-    // In-cluster when running as a pod; falls back to the local kubeconfig so
-    // the same code path works in development.
-    try {
+    // Detect in-cluster by the environment the kubelet injects, rather than by
+    // catching a failure: loadFromCluster() does not throw outside a cluster,
+    // it silently yields a config whose server is undefined, and the first API
+    // call then fails with `Invalid URL: https://undefined:undefined/...`.
+    if (process.env.KUBERNETES_SERVICE_HOST) {
       kc.loadFromCluster();
-    } catch {
+    } else {
       kc.loadFromDefault();
+    }
+
+    const cluster = kc.getCurrentCluster();
+    if (!cluster?.server) {
+      throw new Error(
+        "no Kubernetes cluster in context — set KUBECONFIG, or run inside a pod with a service account",
+      );
     }
     return new Provisioner(
       kc.makeApiClient(AppsV1Api),
@@ -194,18 +203,30 @@ export class Provisioner {
     return { database: await this.get(id), uri: connectionUri(id, password), created: true };
   }
 
+  // Read-modify-replace on the scale subresource, retried on conflict. The
+  // StatefulSet controller writes status continuously, so the resourceVersion
+  // read a moment ago is routinely stale by the time the replace lands —
+  // especially right after create, where the object is being actively
+  // reconciled. A 409 here is normal, not exceptional.
   async scale(id: string, replicas: number): Promise<Database> {
-    const scale = await this.apps.readNamespacedStatefulSetScale({
-      name: statefulSetName(id),
-      namespace: config.databaseNamespace,
-    });
-    scale.spec = { ...(scale.spec ?? {}), replicas };
-    await this.apps.replaceNamespacedStatefulSetScale({
-      name: statefulSetName(id),
-      namespace: config.databaseNamespace,
-      body: scale,
-    });
-    return this.get(id);
+    const name = statefulSetName(id);
+    const namespace = config.databaseNamespace;
+    let lastErr: unknown;
+
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const scale = await this.apps.readNamespacedStatefulSetScale({ name, namespace });
+        scale.spec = { ...(scale.spec ?? {}), replicas };
+        await this.apps.replaceNamespacedStatefulSetScale({ name, namespace, body: scale });
+        return await this.get(id);
+      } catch (err) {
+        const code = (err as { code?: number })?.code;
+        if (code !== 409) throw err;
+        lastErr = err;
+        await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
+      }
+    }
+    throw lastErr;
   }
 
   async delete(id: string): Promise<void> {
