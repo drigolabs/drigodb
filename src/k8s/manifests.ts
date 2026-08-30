@@ -134,6 +134,13 @@ export function buildStatefulSet(id: string, externalId: string): V1StatefulSet 
             runAsUser: RUN_AS_USER,
             runAsGroup: RUN_AS_USER,
             fsGroup: RUN_AS_USER,
+            // Without this, Kubernetes recursively chmods g+rwX on every mount.
+            // initdb creates PGDATA as 0700 on first boot, and the next mount
+            // turns it group-writable — which PostgreSQL refuses to start on
+            // ("data directory has invalid permissions"). The database comes up
+            // once and never wakes again. OnRootMismatch skips the recursion
+            // when the volume root already has the right ownership.
+            fsGroupChangePolicy: "OnRootMismatch",
           },
           automountServiceAccountToken: false,
           containers: [

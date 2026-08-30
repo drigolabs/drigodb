@@ -37,6 +37,13 @@ describe("statefulset", () => {
     }
   });
 
+  it("does not let fsGroup break PostgreSQL on remount", () => {
+    // Recursive g+rwX on every mount turns PGDATA group-writable, which
+    // PostgreSQL refuses to start on — so the database wakes exactly never.
+    expect(buildStatefulSet(ID, EXT).spec?.template.spec?.securityContext?.fsGroupChangePolicy)
+      .toBe("OnRootMismatch");
+  });
+
   it("starts hibernated and retains its volume", () => {
     const spec = buildStatefulSet(ID, EXT).spec;
     expect(spec?.replicas).toBe(0);

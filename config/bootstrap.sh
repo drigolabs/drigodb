@@ -61,5 +61,10 @@ else
   chmod 0600 "${PGDATA}/pg_hba.conf" "${PGDATA}/pg_ident.conf"
 fi
 
+# Belt and braces alongside fsGroupChangePolicy: PostgreSQL refuses to start
+# unless PGDATA is 0700 or 0750, so any volume plugin that relaxes it on mount
+# would otherwise break every restart after the first.
+chmod 0700 "${PGDATA}"
+
 log "starting postmaster"
 exec postgres -D "${PGDATA}"
