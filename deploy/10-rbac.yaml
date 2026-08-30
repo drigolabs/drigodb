@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: drigodb-api
+  namespace: drigodb-system
+---
+# Deliberately a Role, not a ClusterRole: the API can act only inside
+# drigodb-databases. It cannot read a Secret anywhere else in the cluster.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: drigodb-api
+  namespace: drigodb-databases
+rules:
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["create", "get", "list", "watch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets/scale"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["services", "secrets", "persistentvolumeclaims"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: drigodb-api
+  namespace: drigodb-databases
+subjects:
+  - kind: ServiceAccount
+    name: drigodb-api
+    namespace: drigodb-system
+roleRef:
+  kind: Role
+  name: drigodb-api
+  apiGroup: rbac.authorization.k8s.io

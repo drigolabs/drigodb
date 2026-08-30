@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: drigodb-api
+  namespace: drigodb-system
+  labels: { app: drigodb-api }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: drigodb-api }
+  template:
+    metadata:
+      labels: { app: drigodb-api }
+    spec:
+      serviceAccountName: drigodb-api
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: api
+          image: ghcr.io/drigolabs/drigodb-api:0.0.1
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: DRIGODB_API_TOKEN
+              valueFrom:
+                secretKeyRef: { name: drigodb-api-token, key: token }
+            - name: DRIGODB_STORAGE_CLASS
+              value: do-block-storage
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: drigodb-api
+  namespace: drigodb-system
+spec:
+  type: ClusterIP
+  selector: { app: drigodb-api }
+  ports:
+    - name: http
+      port: 80
+      targetPort: http

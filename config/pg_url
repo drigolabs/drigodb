@@ -1,0 +1,1 @@
+postgresql://postgres@%2Fsockets:5432/app
