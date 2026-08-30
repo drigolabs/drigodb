@@ -2,6 +2,16 @@
 # Deploy the drigodb control plane to the current kubectl context.
 #
 # Idempotent. Generates an API token on first run and prints it once.
+#
+# Deploys exactly what deploy/20-api.yaml pins unless told otherwise. The
+# release pipeline overrides the API image with the version it has just built
+# and pushed, because that image exists before the commit recording it does:
+#
+#   DRIGODB_API_IMAGE=ghcr.io/drigolabs/drigodb-api:0.1.0 bash scripts/deploy.sh
+#
+# DRIGODB_PG_IMAGE and DRIGODB_GATEWAY_IMAGE override the data-plane images the
+# same way. Existing databases keep the images their StatefulSet already names;
+# an override changes what the next provision or wake uses.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -41,11 +51,41 @@ else
   TOKEN="$(head -c 32 /dev/urandom | base64 | tr -d '=+/' | cut -c1-40)"
   k create secret generic drigodb-api-token -n drigodb-system --from-literal=token="$TOKEN" >/dev/null
   ok "token generated"
-  printf "\n  ${BOLD}API token (shown once):${RESET} %s\n\n" "$TOKEN"
+  # Printed only to a terminal. Under CI this same output is a build log, and on
+  # a public repository that log is world-readable — so there the script says
+  # where the token is rather than what it is.
+  if [ -t 1 ]; then
+    printf "\n  ${BOLD}API token (shown once):${RESET} %s\n\n" "$TOKEN"
+  else
+    note "token stored in secret drigodb-api-token; read it with:"
+    note "  kubectl -n drigodb-system get secret drigodb-api-token -o jsonpath='{.data.token}' | base64 -d"
+  fi
 fi
 
 step "Control plane"
-k apply -f "${ROOT}/deploy/20-api.yaml" >/dev/null
+# Substitution is anchored on the image name rather than a placeholder, so
+# deploy/20-api.yaml stays a valid manifest you can read, diff, and apply by
+# hand. Only the overrides that are actually set become sed expressions —
+# an empty one would blank the line rather than leave the pinned value alone.
+SED_ARGS=()
+if [ -n "${DRIGODB_API_IMAGE:-}" ]; then
+  SED_ARGS+=(-e "s#^\( *image: \).*drigodb-api:.*#\1${DRIGODB_API_IMAGE}#")
+fi
+if [ -n "${DRIGODB_PG_IMAGE:-}" ]; then
+  SED_ARGS+=(-e "s#^\( *value: \).*drigodb-postgres:.*#\1${DRIGODB_PG_IMAGE}#")
+fi
+if [ -n "${DRIGODB_GATEWAY_IMAGE:-}" ]; then
+  SED_ARGS+=(-e "s#^\( *value: \).*drigodb-gateway:.*#\1${DRIGODB_GATEWAY_IMAGE}#")
+fi
+
+if [ ${#SED_ARGS[@]} -gt 0 ]; then
+  sed "${SED_ARGS[@]}" "${ROOT}/deploy/20-api.yaml" | k apply -f - >/dev/null
+  for img in "${DRIGODB_API_IMAGE:-}" "${DRIGODB_PG_IMAGE:-}" "${DRIGODB_GATEWAY_IMAGE:-}"; do
+    if [ -n "$img" ]; then ok "pinned ${img}"; fi
+  done
+else
+  k apply -f "${ROOT}/deploy/20-api.yaml" >/dev/null
+fi
 k rollout status deployment/drigodb-api -n drigodb-system --timeout=300s >/dev/null
 ok "drigodb-api Ready"
 

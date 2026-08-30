@@ -20,6 +20,11 @@ function required(name: string): string {
 export const config = {
   port: Number(envOr("DRIGODB_PORT", "8080")),
 
+  // Stamped into the image at build time so /healthz reports the build that
+  // is actually running. A local `docker build` says "dev"; only CI, which
+  // knows the version it is releasing, sets a real one.
+  version: envOr("DRIGODB_VERSION", "dev"),
+
   // Namespace the provisioned databases live in. The API's own pod runs
   // elsewhere; this is the blast radius of its RBAC.
   databaseNamespace: envOr("DRIGODB_DATABASE_NAMESPACE", "drigodb-databases"),
