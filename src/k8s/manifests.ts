@@ -183,13 +183,24 @@ export function buildStatefulSet(id: string, externalId: string): V1StatefulSet 
                 { name: "config", mountPath: CONFIG_MOUNT_PATH, readOnly: true },
                 { name: GATEWAY_STATE_VOLUME, mountPath: GATEWAY_STATE_DIR },
               ],
+              // Two probes, because they answer different questions and only
+              // both together mean "a client can connect".
+              //
               // `check` verifies the backend is reachable and the extension is
-              // loaded, so Ready means "a driver would succeed".
-              readinessProbe: {
+              // loaded. It says nothing about whether the gateway has bound its
+              // listener — it passes while the socket is still closed, which
+              // showed up as `connection refused` from a client the moment the
+              // pod reported Ready.
+              startupProbe: {
                 exec: { command: ["/usr/bin/documentdb-gateway", "check"] },
-                initialDelaySeconds: 5,
-                periodSeconds: 5,
-                failureThreshold: 12,
+                periodSeconds: 3,
+                failureThreshold: 40,
+              },
+              // Readiness is the listener actually accepting.
+              readinessProbe: {
+                tcpSocket: { port: GATEWAY_PORT_NAME },
+                periodSeconds: 3,
+                failureThreshold: 10,
               },
               resources: {
                 requests: { cpu: GATEWAY_CPU_REQUEST, memory: GATEWAY_MEMORY_REQUEST },

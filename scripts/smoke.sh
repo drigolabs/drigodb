@@ -77,8 +77,11 @@ esac
 
 step "Hibernate and wake"
 api -XPOST "localhost:${API_PORT}/v1/databases/${DB_ID}/hibernate" >/dev/null
-for _ in $(seq 1 40); do
-  [ "$(api "localhost:${API_PORT}/v1/databases/${DB_ID}" | jqf '["status"]')" = "hibernated" ] && break
+# Status reports the desired replica count, which reaches zero the moment the
+# scale is accepted — well before the pod is gone. Waiting on the pod instead,
+# otherwise the wake timing below measures a pod that never went away.
+for _ in $(seq 1 60); do
+  [ "$(k get pods -n drigodb-databases -l drigodb.io/database-id="${DB_ID}" --no-headers 2>/dev/null | wc -l | tr -d ' ')" = "0" ] && break
   sleep 2
 done
 ok "hibernated — zero compute, volume retained"

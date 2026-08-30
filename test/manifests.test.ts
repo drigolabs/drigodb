@@ -56,11 +56,15 @@ describe("statefulset", () => {
     expect(mount?.mountPath).toBe("/var/lib/documentdb-gateway");
   });
 
-  it("gates readiness on the gateway proving the backend works", () => {
+  it("separates 'backend works' from 'listener accepts'", () => {
+    // `check` passes while the gateway's socket is still closed, so using it
+    // for readiness reports Ready before a client can connect.
     const gw = buildStatefulSet(ID, EXT).spec?.template.spec?.containers?.find(
       (c) => c.name === "gateway",
     );
-    expect(gw?.readinessProbe?.exec?.command).toEqual(["/usr/bin/documentdb-gateway", "check"]);
+    expect(gw?.startupProbe?.exec?.command).toEqual(["/usr/bin/documentdb-gateway", "check"]);
+    expect(gw?.readinessProbe?.tcpSocket?.port).toBe("mongo");
+    expect(gw?.readinessProbe?.exec).toBeUndefined();
   });
 
   it("never inlines the password", () => {

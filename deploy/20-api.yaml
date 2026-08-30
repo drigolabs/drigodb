@@ -19,7 +19,12 @@ spec:
       containers:
         - name: api
           image: ghcr.io/drigolabs/drigodb-api:0.0.1
-          imagePullPolicy: IfNotPresent
+          # Always, because 0.0.1 is a moving tag while the service is this
+          # young: with IfNotPresent the node keeps serving whatever it cached
+          # under that tag, and a rollout restart silently redeploys the old
+          # build. Pin immutable tags per build and this can go back to
+          # IfNotPresent.
+          imagePullPolicy: Always
           ports:
             - name: http
               containerPort: 8080
