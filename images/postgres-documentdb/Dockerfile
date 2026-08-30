@@ -36,8 +36,12 @@ FROM ${BASE}
 
 ARG PG_MAJOR
 ARG DOCUMENTDB_VERSION
-# Set by buildx; defaulted so a plain `docker build` still works.
-ARG TARGETARCH=amd64
+# Populated per-platform by BuildKit. Deliberately declared WITHOUT a default:
+# giving a predefined platform ARG a default shadows the injected value, so a
+# multi-arch build silently downloads the same architecture's package for every
+# platform. Here that surfaced as `postgresql-18-documentdb:amd64 : Depends:
+# libc6:amd64 but it is not installable` on the arm64 leg.
+ARG TARGETARCH
 
 ENV PATH=$PATH:/usr/lib/postgresql/${PG_MAJOR}/bin
 ENV DEBIAN_FRONTEND=noninteractive
