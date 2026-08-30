@@ -8,8 +8,11 @@
 // One instance per database is not a preference either — DocumentDB cannot
 // isolate tenants within an instance. See docs/documentdb-multitenancy-spike.md.
 
+import { createHash } from "node:crypto";
+
 import type {
   V1NetworkPolicy,
+  V1PodTemplateSpec,
   V1Secret,
   V1Service,
   V1StatefulSet,
@@ -25,6 +28,16 @@ export const MANAGED_BY_VALUE = "drigodb";
 // A consumer pod carrying this label may reach the named database. It works
 // across namespaces, so consumers need not live anywhere in particular.
 export const ALLOW_LABEL = "drigodb.io/allow-database";
+
+// Which generation of the pod template a database was last built from. Wake
+// compares it against the template this build renders and reconciles when they
+// differ, which is how a patched data-plane image reaches a database that
+// already exists.
+//
+// On the StatefulSet's own metadata, deliberately — never the pod template's.
+// An annotation inside the template is part of the template, so writing it
+// would change the hash it records, and every wake would roll the pod forever.
+export const TEMPLATE_HASH_ANNOTATION = "drigodb.io/template-hash";
 
 export const CONFIG_MAP_NAME = "drigodb-config";
 export const CONFIG_MOUNT_PATH = "/drigodb-config";
@@ -114,12 +127,153 @@ export function buildSecret(id: string, externalId: string, password: string): V
   };
 }
 
+// The pod one database runs in. Split out from the StatefulSet because wake
+// reconciles exactly this — it is the only part of a StatefulSet's spec that is
+// mutable in a way that matters here, and the only part that carries the
+// data-plane images.
+export function buildPodTemplate(id: string, externalId: string): V1PodTemplateSpec {
+  const labels = labelsFor(id, externalId);
+  return {
+    metadata: { labels },
+    spec: {
+      securityContext: {
+        runAsUser: RUN_AS_USER,
+        runAsGroup: RUN_AS_USER,
+        fsGroup: RUN_AS_USER,
+        // Without this, Kubernetes recursively chmods g+rwX on every mount.
+        // initdb creates PGDATA as 0700 on first boot, and the next mount
+        // turns it group-writable — which PostgreSQL refuses to start on
+        // ("data directory has invalid permissions"). The database comes up
+        // once and never wakes again. OnRootMismatch skips the recursion
+        // when the volume root already has the right ownership.
+        fsGroupChangePolicy: "OnRootMismatch",
+      },
+      automountServiceAccountToken: false,
+      containers: [
+        {
+          name: "postgres",
+          image: config.pgImage,
+          // The image is a bare operand with no initialising entrypoint.
+          command: ["bash", `${CONFIG_MOUNT_PATH}/bootstrap.sh`],
+          env: [
+            { name: "PGDATA", value: PGDATA },
+            { name: "APP_DB_NAME", value: DB_NAME },
+            { name: "APP_DB_USER", value: DB_USER },
+            { name: "APP_DB_CONF_DIR", value: CONFIG_MOUNT_PATH },
+            {
+              name: "APP_DB_PASSWORD",
+              valueFrom: {
+                secretKeyRef: { name: secretName(id), key: PASSWORD_SECRET_KEY },
+              },
+            },
+          ],
+          volumeMounts: [
+            { name: DATA_VOLUME, mountPath: DATA_MOUNT_PATH },
+            { name: SOCKET_VOLUME, mountPath: SOCKET_MOUNT_PATH },
+            { name: "config", mountPath: CONFIG_MOUNT_PATH, readOnly: true },
+          ],
+          readinessProbe: {
+            exec: { command: ["pg_isready", "-U", "postgres", "-d", DB_NAME] },
+            initialDelaySeconds: 5,
+            periodSeconds: 5,
+            failureThreshold: 12,
+          },
+          resources: {
+            requests: { cpu: PG_CPU_REQUEST, memory: PG_MEMORY_REQUEST },
+            limits: { memory: PG_MEMORY_LIMIT },
+          },
+        },
+        {
+          name: "gateway",
+          image: config.gatewayImage,
+          env: [
+            { name: "DOCUMENTDB_PG_URL_FILE", value: `${CONFIG_MOUNT_PATH}/pg_url` },
+            { name: "DOCUMENTDB_TLS_STATE_DIR", value: GATEWAY_TLS_DIR },
+          ],
+          ports: [{ name: GATEWAY_PORT_NAME, containerPort: GATEWAY_PORT }],
+          volumeMounts: [
+            { name: SOCKET_VOLUME, mountPath: SOCKET_MOUNT_PATH },
+            { name: "config", mountPath: CONFIG_MOUNT_PATH, readOnly: true },
+            { name: GATEWAY_STATE_VOLUME, mountPath: GATEWAY_STATE_DIR },
+          ],
+          // Two probes, because they answer different questions and only
+          // both together mean "a client can connect".
+          //
+          // `check` verifies the backend is reachable and the extension is
+          // loaded. It says nothing about whether the gateway has bound its
+          // listener — it passes while the socket is still closed, which
+          // showed up as `connection refused` from a client the moment the
+          // pod reported Ready.
+          startupProbe: {
+            exec: { command: ["/usr/bin/documentdb-gateway", "check"] },
+            periodSeconds: 3,
+            failureThreshold: 40,
+          },
+          // Readiness is the listener actually accepting.
+          readinessProbe: {
+            tcpSocket: { port: GATEWAY_PORT_NAME },
+            periodSeconds: 3,
+            failureThreshold: 10,
+          },
+          resources: {
+            requests: { cpu: GATEWAY_CPU_REQUEST, memory: GATEWAY_MEMORY_REQUEST },
+            limits: { memory: GATEWAY_MEMORY_LIMIT },
+          },
+        },
+      ],
+      volumes: [
+        { name: SOCKET_VOLUME, emptyDir: {} },
+        { name: GATEWAY_STATE_VOLUME, emptyDir: {} },
+        {
+          name: "config",
+          // 0640 rather than 0644: the gateway warns when its URL file is
+          // world-readable.
+          configMap: { name: CONFIG_MAP_NAME, defaultMode: 0o640 },
+        },
+      ],
+    },
+  };
+}
+
+// A stable fingerprint of the rendered pod template.
+//
+// Compared against the annotation on the live StatefulSet to decide whether a
+// waking database needs its template rewritten. Deliberately not a comparison
+// of the live spec against this one: the API server defaults dozens of fields
+// the builder never sets — terminationMessagePath, dnsPolicy, schedulerName,
+// imagePullPolicy — so live-versus-rendered always differs, and every wake
+// would patch. Hashing compares desired against desired, which is the only
+// comparison that holds still.
+//
+// Keys are sorted before hashing so the fingerprint tracks content rather than
+// the order this file happens to declare things in. Reordering a field here
+// would otherwise roll every database in the fleet for no reason.
+export function templateHash(id: string, externalId: string): string {
+  return createHash("sha256").update(canonical(buildPodTemplate(id, externalId))).digest("hex").slice(0, 16);
+}
+
+function canonical(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
+}
+
 export function buildStatefulSet(id: string, externalId: string): V1StatefulSet {
   const labels = labelsFor(id, externalId);
   return {
     apiVersion: "apps/v1",
     kind: "StatefulSet",
-    metadata: { name: statefulSetName(id), namespace: config.databaseNamespace, labels },
+    metadata: {
+      name: statefulSetName(id),
+      namespace: config.databaseNamespace,
+      labels,
+      // Stamped at birth so a database created by this build is already
+      // current, and its first wake reconciles nothing.
+      annotations: { [TEMPLATE_HASH_ANNOTATION]: templateHash(id, externalId) },
+    },
     spec: {
       serviceName: serviceName(id),
       // Zero is hibernation: pods go, the volume stays.
@@ -127,106 +281,7 @@ export function buildStatefulSet(id: string, externalId: string): V1StatefulSet 
       selector: { matchLabels: { [DB_ID_LABEL]: id } },
       // Stated explicitly: the alternative silently deletes a customer's data.
       persistentVolumeClaimRetentionPolicy: { whenScaled: "Retain", whenDeleted: "Retain" },
-      template: {
-        metadata: { labels },
-        spec: {
-          securityContext: {
-            runAsUser: RUN_AS_USER,
-            runAsGroup: RUN_AS_USER,
-            fsGroup: RUN_AS_USER,
-            // Without this, Kubernetes recursively chmods g+rwX on every mount.
-            // initdb creates PGDATA as 0700 on first boot, and the next mount
-            // turns it group-writable — which PostgreSQL refuses to start on
-            // ("data directory has invalid permissions"). The database comes up
-            // once and never wakes again. OnRootMismatch skips the recursion
-            // when the volume root already has the right ownership.
-            fsGroupChangePolicy: "OnRootMismatch",
-          },
-          automountServiceAccountToken: false,
-          containers: [
-            {
-              name: "postgres",
-              image: config.pgImage,
-              // The image is a bare operand with no initialising entrypoint.
-              command: ["bash", `${CONFIG_MOUNT_PATH}/bootstrap.sh`],
-              env: [
-                { name: "PGDATA", value: PGDATA },
-                { name: "APP_DB_NAME", value: DB_NAME },
-                { name: "APP_DB_USER", value: DB_USER },
-                { name: "APP_DB_CONF_DIR", value: CONFIG_MOUNT_PATH },
-                {
-                  name: "APP_DB_PASSWORD",
-                  valueFrom: {
-                    secretKeyRef: { name: secretName(id), key: PASSWORD_SECRET_KEY },
-                  },
-                },
-              ],
-              volumeMounts: [
-                { name: DATA_VOLUME, mountPath: DATA_MOUNT_PATH },
-                { name: SOCKET_VOLUME, mountPath: SOCKET_MOUNT_PATH },
-                { name: "config", mountPath: CONFIG_MOUNT_PATH, readOnly: true },
-              ],
-              readinessProbe: {
-                exec: { command: ["pg_isready", "-U", "postgres", "-d", DB_NAME] },
-                initialDelaySeconds: 5,
-                periodSeconds: 5,
-                failureThreshold: 12,
-              },
-              resources: {
-                requests: { cpu: PG_CPU_REQUEST, memory: PG_MEMORY_REQUEST },
-                limits: { memory: PG_MEMORY_LIMIT },
-              },
-            },
-            {
-              name: "gateway",
-              image: config.gatewayImage,
-              env: [
-                { name: "DOCUMENTDB_PG_URL_FILE", value: `${CONFIG_MOUNT_PATH}/pg_url` },
-                { name: "DOCUMENTDB_TLS_STATE_DIR", value: GATEWAY_TLS_DIR },
-              ],
-              ports: [{ name: GATEWAY_PORT_NAME, containerPort: GATEWAY_PORT }],
-              volumeMounts: [
-                { name: SOCKET_VOLUME, mountPath: SOCKET_MOUNT_PATH },
-                { name: "config", mountPath: CONFIG_MOUNT_PATH, readOnly: true },
-                { name: GATEWAY_STATE_VOLUME, mountPath: GATEWAY_STATE_DIR },
-              ],
-              // Two probes, because they answer different questions and only
-              // both together mean "a client can connect".
-              //
-              // `check` verifies the backend is reachable and the extension is
-              // loaded. It says nothing about whether the gateway has bound its
-              // listener — it passes while the socket is still closed, which
-              // showed up as `connection refused` from a client the moment the
-              // pod reported Ready.
-              startupProbe: {
-                exec: { command: ["/usr/bin/documentdb-gateway", "check"] },
-                periodSeconds: 3,
-                failureThreshold: 40,
-              },
-              // Readiness is the listener actually accepting.
-              readinessProbe: {
-                tcpSocket: { port: GATEWAY_PORT_NAME },
-                periodSeconds: 3,
-                failureThreshold: 10,
-              },
-              resources: {
-                requests: { cpu: GATEWAY_CPU_REQUEST, memory: GATEWAY_MEMORY_REQUEST },
-                limits: { memory: GATEWAY_MEMORY_LIMIT },
-              },
-            },
-          ],
-          volumes: [
-            { name: SOCKET_VOLUME, emptyDir: {} },
-            { name: GATEWAY_STATE_VOLUME, emptyDir: {} },
-            {
-              name: "config",
-              // 0640 rather than 0644: the gateway warns when its URL file is
-              // world-readable.
-              configMap: { name: CONFIG_MAP_NAME, defaultMode: 0o640 },
-            },
-          ],
-        },
-      },
+      template: buildPodTemplate(id, externalId),
       volumeClaimTemplates: [
         {
           metadata: { name: DATA_VOLUME, labels },

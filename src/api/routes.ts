@@ -33,8 +33,10 @@ export function buildRoutes(provisioner: Provisioner): Hono {
 
   app.get("/v1/databases/:id", async (c) => c.json(await provisioner.get(c.req.param("id"))));
 
+  // wake(), not scale(id, 1): waking is also when a database picks up the
+  // pod template this build renders, including a rebuilt data-plane image.
   app.post("/v1/databases/:id/wake", async (c) =>
-    c.json(await provisioner.scale(c.req.param("id"), 1), 202),
+    c.json(await provisioner.wake(c.req.param("id")), 202),
   );
 
   app.post("/v1/databases/:id/hibernate", async (c) =>

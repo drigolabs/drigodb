@@ -86,6 +86,15 @@ for _ in $(seq 1 60); do
 done
 ok "hibernated — zero compute, volume retained"
 
+# Waking is also when a database picks up the pod template the control plane
+# currently renders — a rebuilt postgres image, a fixed probe. Staling the
+# recorded template hash makes the next wake think this database was built by
+# an older drigodb, which is exactly the state a real fleet is in after an
+# image rebuild. If the reconcile does not run, the hash stays "stale".
+k annotate statefulset "db-${DB_ID}" -n drigodb-databases \
+  drigodb.io/template-hash=stale --overwrite >/dev/null
+ok "marked as built by an older template"
+
 t0=$(date +%s)
 api -XPOST "localhost:${API_PORT}/v1/databases/${DB_ID}/wake" >/dev/null
 for _ in $(seq 1 60); do
@@ -93,6 +102,17 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 ok "woke in $(( $(date +%s) - t0 ))s"
+
+HASH="$(k get statefulset "db-${DB_ID}" -n drigodb-databases \
+  -o jsonpath='{.metadata.annotations.drigodb\.io/template-hash}')"
+case "$HASH" in
+  stale|"") fail "wake did not reconcile the template (hash: ${HASH:-unset})"; exit 1 ;;
+  *) ok "reconciled to template ${HASH} on the way up" ;;
+esac
+
+PG_RUNNING="$(k get pod -n drigodb-databases -l "drigodb.io/database-id=${DB_ID}" \
+  -o jsonpath='{.items[0].spec.containers[?(@.name=="postgres")].image}')"
+ok "running ${PG_RUNNING}"
 
 echo
 printf "${GREEN}${BOLD}drigodb works end to end.${RESET}\n"

@@ -14,7 +14,11 @@ metadata:
 rules:
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
-    verbs: ["create", "get", "list", "watch", "delete"]
+    # patch, so wake can rewrite a hibernated database's pod template onto the
+    # images and probes this build renders. Not update: the whole-object verb
+    # is not needed, and a StatefulSet's selector, serviceName and
+    # volumeClaimTemplates are immutable anyway.
+    verbs: ["create", "get", "list", "watch", "patch", "delete"]
   - apiGroups: ["apps"]
     resources: ["statefulsets/scale"]
     verbs: ["get", "update", "patch"]

@@ -146,6 +146,14 @@ which ships the rebuild down the same path as any other change.
 Upstream version bumps are one edit to `images/versions.env`, which CI and `scripts/publish-images.sh`
 both read.
 
+**Existing databases pick the new image up on their next wake.** A hosted database is its StatefulSet,
+and nothing rewrote that StatefulSet after creation — so a rebuilt image used to reach new databases
+only, and so did every pod-template fix before it. Wake now compares the template the running build
+renders against a hash recorded on the StatefulSet, and rewrites it while the database is still at zero
+replicas, where there are no pods to roll and the change is free. A database that is already awake is
+left alone — a speculative `wake` must not restart something serving traffic — and reconciles on its
+next hibernate/wake cycle. One that stays hibernated indefinitely never reconciles at all; a job that
+wakes the fleet on a schedule is the eventual answer to that.
 
 ### Setting it up
 
