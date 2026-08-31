@@ -3,9 +3,9 @@
 #
 # Idempotent. Generates an API token on first run and prints it once.
 #
-# Deploys exactly what deploy/20-api.yaml pins unless told otherwise. The
-# release pipeline overrides the API image with the version it has just built
-# and pushed, because that image exists before the commit recording it does:
+# Deploys the newest released version by default — the newest v-tag — and
+# whatever deploy/20-api.yaml pins if nothing has been tagged yet. Override it
+# to deploy something else:
 #
 #   DRIGODB_API_IMAGE=ghcr.io/drigolabs/drigodb-api:0.1.0 bash scripts/deploy.sh
 #
@@ -67,6 +67,22 @@ step "Control plane"
 # deploy/20-api.yaml stays a valid manifest you can read, diff, and apply by
 # hand. Only the overrides that are actually set become sed expressions —
 # an empty one would blank the line rather than leave the pinned value alone.
+# Nothing writes the released version back into deploy/20-api.yaml any more —
+# that would mean a pipeline pushing to main, and a main no one can push to is
+# worth more than the bookkeeping. The newest v-tag is the record of what was
+# released, so a hand-run deploy tracks the latest release without anyone
+# editing a manifest. Falls back to whatever the manifest pins if there are no
+# tags yet.
+if [ -z "${DRIGODB_API_IMAGE:-}" ]; then
+  # Best-effort: the tag is created by CI, so a local clone may not have it yet.
+  git -C "$ROOT" fetch --tags --quiet >/dev/null 2>&1 || true
+  LATEST="$(git -C "$ROOT" tag --list 'v[0-9]*' --sort=-v:refname 2>/dev/null | head -1)"
+  if [ -n "$LATEST" ]; then
+    DRIGODB_API_IMAGE="${DRIGODB_REGISTRY:-ghcr.io/drigolabs}/drigodb-api:${LATEST#v}"
+    note "deploying the newest release, ${LATEST}"
+  fi
+fi
+
 SED_ARGS=()
 if [ -n "${DRIGODB_API_IMAGE:-}" ]; then
   SED_ARGS+=(-e "s#^\( *image: \).*drigodb-api:.*#\1${DRIGODB_API_IMAGE}#")

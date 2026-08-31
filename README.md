@@ -95,9 +95,14 @@ and queries normally; its **Performance tab does not work**, because the gateway
 
 Merging to `main` is the whole release process. `.github/workflows/release.yml` reads the
 Conventional Commit subjects since the last tag, and if they earned a version it builds the API image
-for both architectures, publishes it under an immutable tag, tags the commit, cuts a GitHub release,
-and rolls it out to DOKS — then reads `/healthz` back to confirm the cluster is serving the build the
-run just made.
+for both architectures, publishes it under an immutable tag, tags the merged commit, cuts a GitHub
+release, and rolls it out to DOKS — then reads `/healthz` back to confirm the cluster is serving the
+build the run just made.
+
+Nothing in the pipeline writes to `main`. It creates a tag, and a tag is not a branch, so `main` stays
+protected against everyone. That tag is the record of what shipped: `scripts/next-version.sh` computes
+the next version from it, and `scripts/deploy.sh` deploys the newest one by default, so a hand-run
+deploy tracks the latest release without anyone editing a manifest.
 
 A merge of only `docs:` or `chore:` commits releases nothing. That is the intended amount of ceremony
 for a README fix.
@@ -168,9 +173,9 @@ The pipeline needs three things arranged once:
    with a personal token, so they are not yet linked to the repository. On each package's page →
    *Package settings* → *Manage Actions access* → add `drigolabs/drigodb` with **Write**, or the
    workflow's token cannot push.
-3. **`main` must accept the release commit.** The pipeline pushes `chore(release): vX.Y.Z [skip ci]`
-   and its tag directly. `main` is unprotected today, so this already works; a future rule requiring
-   pull requests would block it unless `github-actions[bot]` may bypass.
+3. **Nothing else.** `main` is protected and no one — the pipeline included — pushes to it. The
+   release writes a tag, and a tag is not a branch, so protection and automated releases do not
+   trade off against each other.
 
 The repository's default token is read-only, which is correct and needs no change — each job asks for
 exactly the access it needs. Nothing asks for `pull-requests: write`, so *Allow GitHub Actions to

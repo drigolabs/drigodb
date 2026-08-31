@@ -170,37 +170,34 @@ jobs:
     name: tag and record
     needs: [version, manifest]
     runs-on: ubuntu-latest
-    outputs:
-      sha: ${{ steps.commit.outputs.sha }}
     permissions:
+      # To push a tag ref. Not a branch: nothing in this pipeline writes to
+      # main, which is what lets main be protected against everyone.
       contents: write
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      # The commit follows the push rather than preceding it, so a tag never
-      # names a version whose image failed to build. The image does not read
-      # package.json — its version arrives as a build arg — so the two cannot
-      # disagree about what is running.
-      - id: commit
+      # A tag on the commit that was merged, and nothing else.
+      #
+      # An earlier version of this also committed the version into package.json
+      # and rewrote the image in deploy/20-api.yaml. Both were dropped: the
+      # commit had to be pushed to main, and a branch no one may push to is
+      # worth more than a bookkeeping commit. Neither was load-bearing —
+      # scripts/next-version.sh reads tags, the image takes its version from a
+      # build arg, and scripts/deploy.sh derives the image from the newest tag.
+      #
+      # The tag is created after the image is published, so a version tag can
+      # never name an image that failed to build.
+      - name: Tag the release
         env:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
-          sed -i -E "s#^( *image: ).*drigodb-api:.*#\1${IMAGE}:${VERSION}#" deploy/20-api.yaml
-
-          git add package.json package-lock.json deploy/20-api.yaml
-          # [skip ci] because this commit is the record of a release, not a
-          # change to release. The version job would work it out and stop
-          # anyway; this saves the runner minutes.
-          git commit -m "chore(release): v${VERSION} [skip ci]"
           git tag -a "v${VERSION}" -m "v${VERSION}"
-          git push origin HEAD:main --follow-tags
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git push origin "v${VERSION}"
 
       - name: GitHub release
         env:
@@ -220,11 +217,8 @@ jobs:
     env:
       CLUSTER: ${{ vars.DRIGODB_DO_CLUSTER || 'drigodb' }}
     steps:
+      # The merged commit, which is also what the tag now points at.
       - uses: actions/checkout@v5
-        with:
-          # The release commit, so the manifests applied are the manifests the
-          # tag records.
-          ref: ${{ needs.tag.outputs.sha }}
 
       - name: Is there anywhere to deploy to?
         id: target
