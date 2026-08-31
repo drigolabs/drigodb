@@ -36,11 +36,16 @@ spec:
             # The data-plane images every provisioned database runs. Pinned here
             # rather than left to the API's compiled-in defaults so the images in
             # production are the images recorded in git. The scheduled rebuild in
-            # .github/workflows/images.yml opens a PR against these two lines.
+            # .github/workflows/images.yml reports new tags as an issue carrying
+            # the diff for these two lines; a human moves them.
+            #
+            # Dated build tags, not the floating 18-0.116-0: a rebuild against a
+            # patched base is a different image under the same upstream version,
+            # and a node caching the floating tag would never notice.
             - name: DRIGODB_PG_IMAGE
-              value: ghcr.io/drigolabs/drigodb-postgres:18-0.116-0
+              value: ghcr.io/drigolabs/drigodb-postgres:18-0.116-0-20260831-b1
             - name: DRIGODB_GATEWAY_IMAGE
-              value: ghcr.io/drigolabs/drigodb-gateway:0.116-0
+              value: ghcr.io/drigolabs/drigodb-gateway:0.116-0-20260831-b1
           readinessProbe:
             httpGet: { path: /healthz, port: http }
             initialDelaySeconds: 3
