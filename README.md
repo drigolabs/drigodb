@@ -74,6 +74,9 @@ bash scripts/deploy.sh           # control plane; prints the API token once
 bash scripts/doks-down.sh        # stop billing
 ```
 
+CI does the publishing and deploying on every merge — see [Continuous delivery](#continuous-delivery).
+The one step it cannot do is `doks-up.sh`, because creating the cluster starts billing.
+
 Then:
 
 ```bash
@@ -87,6 +90,99 @@ curl -XPOST localhost:8080/v1/databases \
 Connect the returned `connection_uri` with any MongoDB driver, `mongosh`, or Compass. Compass browses
 and queries normally; its **Performance tab does not work**, because the gateway implements neither
 `serverStatus` nor `top`.
+
+## Continuous delivery
+
+Merging to `main` is the whole release process. `.github/workflows/release.yml` reads the
+Conventional Commit subjects since the last tag, and if they earned a version it builds the API image
+for both architectures, publishes it under an immutable tag, tags the merged commit, cuts a GitHub
+release, and rolls it out to DOKS — then reads `/healthz` back to confirm the cluster is serving the
+build the run just made.
+
+Nothing in the pipeline writes to `main`. It creates a tag, and a tag is not a branch, so `main` stays
+protected against everyone. That tag is the record of what shipped: `scripts/next-version.sh` computes
+the next version from it, and `scripts/deploy.sh` deploys the newest one by default, so a hand-run
+deploy tracks the latest release without anyone editing a manifest.
+
+A merge of only `docs:` or `chore:` commits releases nothing. That is the intended amount of ceremony
+for a README fix.
+
+| commits since the last tag | 0.x today | once past 1.0.0 |
+|---|---|---|
+| `feat:`, `feat!:`, `BREAKING CHANGE:` | minor — `0.1.0` | minor, or major for a breaking one |
+| `fix:`, `perf:`, `revert:` | patch — `0.0.2` | patch |
+| anything else | no release | no release |
+
+Below 1.0.0 the minor position is the one allowed to break, so a `!` bumps the minor rather than
+declaring a 1.0.0 nobody decided on. Reaching 1.0.0 is a deliberate `git tag`. Preview any of this
+before pushing:
+
+```bash
+scripts/next-version.sh --why
+```
+
+**The cluster being gone is not a failure.** DOKS bills whether or not anyone is connected, so it gets
+torn down between sessions. A merge with no cluster running publishes the image, says so, and stops —
+`scripts/doks-up.sh && scripts/deploy.sh` picks it up later.
+
+### The data-plane images
+
+`drigodb-postgres` and `drigodb-gateway` carry upstream's version, not this repo's, so they are not
+part of a semver release. `.github/workflows/images.yml` builds them when `images/` or `config/`
+changes, on demand, and **every Monday** — because
+[the postgres image is built on Ubuntu rather than CNPG's own image](images/postgres-documentdb/Dockerfile)
+and that trade bought drigodb the job of patching its own base.
+
+Nothing is published until it has been proved to run: the extension has to load under CNPG's preload
+set and round-trip a document, and a real MongoDB driver has to talk to the gateway through the
+`config/` files production mounts. A rebuild that merely *builds* would sail past the failure that
+matters, which is a runtime one.
+
+Each publish emits two tags — `18-0.116-0` naming the upstream release, and
+`18-0.116-0-20260830-b7` naming the exact build — and then files an issue carrying the two-line diff
+that moves `deploy/20-api.yaml` onto them. One standing issue, rewritten by each rebuild rather than
+duplicated weekly.
+
+The workflow stops there on purpose. Opening a pull request from Actions requires a repository setting
+that grants **approval** as well as creation, and a workflow able to approve its own pull request can
+satisfy a required review by itself. So CI reports and a human opens the PR; merging it is a `fix:`,
+which ships the rebuild down the same path as any other change.
+
+Upstream version bumps are one edit to `images/versions.env`, which CI and `scripts/publish-images.sh`
+both read.
+
+**Existing databases pick the new image up on their next wake.** A hosted database is its StatefulSet,
+and nothing rewrote that StatefulSet after creation — so a rebuilt image used to reach new databases
+only, and so did every pod-template fix before it. Wake now compares the template the running build
+renders against a hash recorded on the StatefulSet, and rewrites it while the database is still at zero
+replicas, where there are no pods to roll and the change is free. A database that is already awake is
+left alone — a speculative `wake` must not restart something serving traffic — and reconciles on its
+next hibernate/wake cycle. One that stays hibernated indefinitely never reconciles at all; a job that
+wakes the fleet on a schedule is the eventual answer to that.
+
+### Setting it up
+
+The pipeline needs three things arranged once:
+
+1. **`DIGITALOCEAN_ACCESS_TOKEN`** as a repository secret. `kubernetes: read` is the whole scope it
+   needs — the pipeline fetches a kubeconfig and nothing more, because creating the cluster starts
+   billing and stays a deliberate `doks-up.sh`. Without the secret the pipeline still builds and
+   publishes; it just reports the deploy as skipped. Set the repository variable
+   `DRIGODB_DO_CLUSTER` too if the cluster is not named `drigodb`.
+2. **Write access from this repo to the GHCR packages.** The three packages were first pushed by hand
+   with a personal token, so they are not yet linked to the repository. On each package's page →
+   *Package settings* → *Manage Actions access* → add `drigolabs/drigodb` with **Write**, or the
+   workflow's token cannot push.
+3. **Nothing else.** `main` is protected and no one — the pipeline included — pushes to it. The
+   release writes a tag, and a tag is not a branch, so protection and automated releases do not
+   trade off against each other.
+
+The repository's default token is read-only, which is correct and needs no change — each job asks for
+exactly the access it needs. Nothing asks for `pull-requests: write`, so *Allow GitHub Actions to
+create and approve pull requests* stays off.
+
+`scripts/publish-images.sh` and `scripts/deploy.sh` still work by hand — for publishing off a branch,
+bisecting a build, or bootstrapping a registry. They are the escape hatch, not the route.
 
 ## Measured
 

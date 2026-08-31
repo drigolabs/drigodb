@@ -1,0 +1,285 @@
+# Merge to main, and if the commits earned a version, it ships.
+#
+#   commits  →  version  →  multi-arch image  →  git tag + release  →  DOKS
+#
+# The version comes from the Conventional Commit subjects since the last tag
+# (scripts/next-version.sh, runnable locally). A merge of only docs: and chore:
+# commits releases nothing and deploys nothing, which is the correct amount of
+# ceremony for a README fix.
+#
+# The deploy step is deliberately forgiving about the cluster being gone. DOKS
+# billing runs whether or not anyone is using it, so the cluster is torn down
+# between sessions — a merge on a Sunday should publish an image and say so,
+# not fail because nothing was listening.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+# Never overlap: two runs minting tags at once would race on the version.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+# The floor. Only the two jobs that must write — the image push and the release
+# commit — raise it, and each raises only its own.
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/drigodb-api
+
+jobs:
+  version:
+    name: decide the version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.next.outputs.version }}
+      released: ${{ steps.next.outputs.released }}
+    steps:
+      # Full history and tags: the bump is computed from the range between the
+      # last v-tag and HEAD, and a shallow clone has neither end of it.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - id: next
+        run: |
+          VERSION="$(bash scripts/next-version.sh --why)"
+          if [ -z "$VERSION" ]; then
+            echo "released=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No feat:, fix:, perf: or breaking commits since the last release — nothing to ship."
+          else
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Releasing ${VERSION}"
+          fi
+
+  # ci.yml runs on this same commit, but it is a separate workflow: a red run
+  # there would not stop a release here. The gate has to be inside the pipeline
+  # that publishes, so it is repeated rather than referenced.
+  verify:
+    name: typecheck and test
+    needs: version
+    if: needs.version.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  build:
+    name: build ${{ matrix.arch }}
+    needs: [version, verify]
+    if: needs.version.outputs.released == 'true'
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Native runners rather than one QEMU-emulated job. This repo is
+          # public, so the arm64 runner costs nothing, and emulating a Node
+          # install and a TypeScript compile is slow for no benefit.
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Each arch is pushed as a nameless digest; the manifest job below binds
+      # them to one tag. Tagging here instead would have the second arch
+      # overwrite the first.
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            DRIGODB_VERSION=${{ needs.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.licenses=MIT
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=api-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=api-${{ matrix.arch }}
+
+      - name: Record the digest
+        run: |
+          mkdir -p /tmp/digests
+          # The filename is the bare hex; the manifest job puts the `sha256:`
+          # back. Keeping the prefix here would build `…@sha256:sha256:…`.
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-api-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  manifest:
+    name: publish ${{ needs.version.outputs.version }}
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-api-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The version tag is immutable — nothing ever pushes over it, which is
+      # what lets the deployment use imagePullPolicy: IfNotPresent. `latest`
+      # moves, and is for humans reading the package page, not for deployments.
+      - name: Bind both architectures to one tag
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE}:${{ needs.version.outputs.version }}" \
+            -t "${IMAGE}:latest" \
+            $(printf "${IMAGE}@sha256:%s " *)
+          docker buildx imagetools inspect "${IMAGE}:${{ needs.version.outputs.version }}"
+
+  tag:
+    name: tag and record
+    needs: [version, manifest]
+    runs-on: ubuntu-latest
+    permissions:
+      # To push a tag ref. Not a branch: nothing in this pipeline writes to
+      # main, which is what lets main be protected against everyone.
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # A tag on the commit that was merged, and nothing else.
+      #
+      # An earlier version of this also committed the version into package.json
+      # and rewrote the image in deploy/20-api.yaml. Both were dropped: the
+      # commit had to be pushed to main, and a branch no one may push to is
+      # worth more than a bookkeeping commit. Neither was load-bearing —
+      # scripts/next-version.sh reads tags, the image takes its version from a
+      # build arg, and scripts/deploy.sh derives the image from the newest tag.
+      #
+      # The tag is created after the image is published, so a version tag can
+      # never name an image that failed to build.
+      - name: Tag the release
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${VERSION}" -m "v${VERSION}"
+          git push origin "v${VERSION}"
+
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # --generate-notes walks back to the previous release on its own.
+          gh release create "v${{ needs.version.outputs.version }}" \
+            --title "v${{ needs.version.outputs.version }}" \
+            --generate-notes
+
+  deploy:
+    name: deploy to DOKS
+    needs: [version, manifest, tag]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      CLUSTER: ${{ vars.DRIGODB_DO_CLUSTER || 'drigodb' }}
+    steps:
+      # The merged commit, which is also what the tag now points at.
+      - uses: actions/checkout@v5
+
+      - name: Is there anywhere to deploy to?
+        id: target
+        env:
+          DO_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+        run: |
+          if [ -z "$DO_TOKEN" ]; then
+            echo "::notice::DIGITALOCEAN_ACCESS_TOKEN is not set — image published, deploy skipped."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: digitalocean/action-doctl@v2
+        if: steps.target.outputs.go == 'true'
+        with:
+          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+
+      # doctl writes a kubeconfig but does not bring a kubectl. The hosted
+      # runner ships one; this is the guard for the day it does not.
+      - name: Ensure kubectl
+        if: steps.target.outputs.go == 'true'
+        run: |
+          if ! command -v kubectl >/dev/null; then
+            VER="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+            curl -fsSLo /tmp/kubectl "https://dl.k8s.io/release/${VER}/bin/linux/amd64/kubectl"
+            sudo install -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+          fi
+          kubectl version --client
+
+      - name: Fetch kubeconfig, or stand down
+        id: cluster
+        if: steps.target.outputs.go == 'true'
+        run: |
+          # The cluster is torn down between sessions to stop billing. Its
+          # absence is a normal state of the world, not a broken pipeline.
+          if ! doctl kubernetes cluster get "$CLUSTER" >/dev/null 2>&1; then
+            echo "::notice::DOKS cluster '${CLUSTER}' is not running — image ${{ needs.version.outputs.version }} is published and will deploy on the next \`scripts/doks-up.sh && scripts/deploy.sh\`."
+            echo "up=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          doctl kubernetes cluster kubeconfig save "$CLUSTER" >/dev/null
+          echo "up=true" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy
+        if: steps.cluster.outputs.up == 'true'
+        env:
+          DRIGODB_API_IMAGE: ${{ env.IMAGE }}:${{ needs.version.outputs.version }}
+        run: bash scripts/deploy.sh
+
+      # Proves the rollout served the build this run produced, rather than
+      # trusting that a Ready pod is the new pod.
+      - name: Verify the running version
+        if: steps.cluster.outputs.up == 'true'
+        run: |
+          kubectl -n drigodb-system port-forward svc/drigodb-api 8080:80 >/tmp/pf.log 2>&1 &
+          for _ in $(seq 1 30); do grep -q "Forwarding from" /tmp/pf.log && break; sleep 1; done
+
+          GOT="$(curl -fsS --retry 5 --retry-delay 2 localhost:8080/healthz)"
+          echo "$GOT"
+          case "$GOT" in
+            *'"version":"${{ needs.version.outputs.version }}"'*) echo "::notice::${{ needs.version.outputs.version }} is live." ;;
+            *) echo "::error::/healthz reports something other than ${{ needs.version.outputs.version }}"; exit 1 ;;
+          esac

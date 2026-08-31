@@ -13,7 +13,7 @@ function main(): void {
   const app = new Hono();
 
   // Unauthenticated: probes must not need a credential.
-  app.get("/healthz", (c) => c.json({ status: "ok", version: "0.0.1" }));
+  app.get("/healthz", (c) => c.json({ status: "ok", version: config.version }));
 
   app.use("/v1/*", async (c, next) => {
     const header = c.req.header("authorization") ?? "";

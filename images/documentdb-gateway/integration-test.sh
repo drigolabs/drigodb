@@ -21,7 +21,12 @@
 # Usage: ./integration-test.sh [gateway-image] [postgres-image]
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+# Two levels up, not three: this script sits at images/documentdb-gateway/ in
+# this repo. The extra level is left over from infra/images/documentdb-gateway/
+# in openvoid, and it silently resolved to the directory *above* the repo —
+# Docker then created the empty bind-mount source for us, so the container
+# started and died on a missing postgresql.conf rather than failing at the mount.
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # The canonical PostgreSQL config lives in config and is mounted in, so
 # this test proves the files U3 actually ships rather than a copy of them.
 APP_DB_CONF="${REPO_ROOT}/config"
