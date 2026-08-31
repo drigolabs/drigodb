@@ -186,14 +186,21 @@ bisecting a build, or bootstrapping a registry. They are the escape hatch, not t
 
 ## Measured
 
-On a single node, warm image cache:
+| | warm cache, single node | DigitalOcean, first run on a fresh node |
+|---|---|---|
+| Provision from nothing | ~12s (includes `initdb` and `CREATE EXTENSION`) | 176s |
+| Wake from hibernation | ~8s | 16s |
+| Active memory | ~114 MiB (PostgreSQL 110, gateway 4) | not re-measured |
+| Hibernated | 0 pods; storage only | same |
 
-| | |
-|---|---|
-| Provision from nothing | ~12s (includes `initdb` and `CREATE EXTENSION`) |
-| Wake from hibernation | ~8s |
-| Active memory | ~114 MiB (PostgreSQL 110, gateway 4) |
-| Hibernated | 0 pods; storage only |
+The DigitalOcean column is a single observation, on a `s-2vcpu-4gb` node in `ams3` that had never
+run drigodb before. Its provisioning figure is dominated by pulling the postgres image — PostGIS and
+its dependencies are most of that image — and not by `initdb`. How close a second provision on the
+same warm node lands to the left-hand column has not been measured, so do not read 176s as the cost
+of provisioning; read it as the cost of the first one on a new node.
+
+The warm column stands as measured, but it was taken elsewhere, and the two should not be quoted as
+if they describe the same environment.
 
 Compute therefore tracks *concurrent* databases, not total ones. Storage tracks total, at the
 provisioned volume size each — that is the term that grows with signups.
