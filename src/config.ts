@@ -33,7 +33,16 @@ export const config = {
   gatewayImage: envOr("DRIGODB_GATEWAY_IMAGE", "ghcr.io/drigolabs/drigodb-gateway:0.116-0"),
 
   storageClass: envOr("DRIGODB_STORAGE_CLASS", "do-block-storage"),
-  storageSize: envOr("DRIGODB_STORAGE_SIZE", "2Gi"),
+  // 1Gi, against a measured floor of 73 MB and 365 bytes per document — about
+  // two million documents once config/postgresql.conf bounds the WAL. 2Gi was
+  // an unexamined default, and half of it was reserved for write-ahead log
+  // nobody had chosen.
+  //
+  // Deliberately the small end: a PVC can be expanded in place and can never be
+  // shrunk, and a StatefulSet's volumeClaimTemplates is immutable, so this
+  // value is permanent for every database created under it. Too small is a
+  // patch; too large is forever.
+  storageSize: envOr("DRIGODB_STORAGE_SIZE", "1Gi"),
 
   // The DNS suffix used to build connection endpoints. In-cluster for v0.0.1.
   endpointSuffix: envOr("DRIGODB_ENDPOINT_SUFFIX", "svc.cluster.local"),

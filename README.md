@@ -186,21 +186,38 @@ bisecting a build, or bootstrapping a registry. They are the escape hatch, not t
 
 ## Measured
 
-| | warm cache, single node | DigitalOcean, first run on a fresh node |
+| | warm cache, single node | DigitalOcean, `s-2vcpu-4gb` |
 |---|---|---|
-| Provision from nothing | ~12s (includes `initdb` and `CREATE EXTENSION`) | 176s |
-| Wake from hibernation | ~8s | 16s |
-| Active memory | ~114 MiB (PostgreSQL 110, gateway 4) | not re-measured |
+| Provision from nothing | ~12s (includes `initdb` and `CREATE EXTENSION`) | **27s** warm, **50s** on a node that has never pulled the images |
+| Wake from hibernation | ~8s | **18s** |
 | Hibernated | 0 pods; storage only | same |
 
-The DigitalOcean column is a single observation, on a `s-2vcpu-4gb` node in `ams3` that had never
-run drigodb before. Its provisioning figure is dominated by pulling the postgres image — PostGIS and
-its dependencies are most of that image — and not by `initdb`. How close a second provision on the
-same warm node lands to the left-hand column has not been measured, so do not read 176s as the cost
-of provisioning; read it as the cost of the first one on a new node.
+Storage, measured on DigitalOcean 2026-09-01:
 
-The warm column stands as measured, but it was taken elsewhere, and the two should not be quoted as
-if they describe the same environment.
+| | |
+|---|---|
+| A freshly provisioned database | **73 MB** |
+| — catalogs and extensions | 41 MB, of which PostGIS is 7.1 MB |
+| — write-ahead log | 33 MB |
+| One ~220-byte document | **365 bytes** — consistent at 20k and 100k |
+| Default volume | 1Gi, so roughly **2 million documents** once WAL is bounded |
+
+The volume is deliberately at the small end. A PVC can be expanded in place and can never be
+shrunk, and a StatefulSet's `volumeClaimTemplates` is immutable — so the default is permanent for
+every database created under it. Too small is a patch; too large is forever.
+
+`config/postgresql.conf` caps `max_wal_size` at 256MB for the same reason. Left at the PostgreSQL
+default of 1GB, the write-ahead log alone can claim more than a 1Gi volume before a single document
+is stored.
+
+**Active memory is not currently comparable across the two columns.** The `~114 MiB` (PostgreSQL 110,
+gateway 4) is resident set size. The DigitalOcean cluster had no metrics-server, so the only reading
+available was the cgroup's `memory.current` — 167 MiB and 3 MiB — which includes page cache and is
+not the same quantity. It needs a proper measurement rather than a substituted one.
+
+An earlier run of this table recorded 176s to provision on DigitalOcean. A second cluster of the same
+size in the same region did it in 50s, so that figure was not representative and has been replaced.
+Every DigitalOcean number here is still a single observation.
 
 Compute therefore tracks *concurrent* databases, not total ones. Storage tracks total, at the
 provisioned volume size each — that is the term that grows with signups.
