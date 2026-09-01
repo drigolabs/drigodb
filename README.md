@@ -210,6 +210,9 @@ every database created under it. Too small is a patch; too large is forever.
 default of 1GB, the write-ahead log alone can claim more than a 1Gi volume before a single document
 is stored.
 
+Growing a database past its tier is expansion in place, not a migration — design in
+[docs/storage-tiers.md](docs/storage-tiers.md). Not built yet.
+
 **Active memory is not currently comparable across the two columns.** The `~114 MiB` (PostgreSQL 110,
 gateway 4) is resident set size. The DigitalOcean cluster had no metrics-server, so the only reading
 available was the cgroup's `memory.current` — 167 MiB and 3 MiB — which includes page cache and is
