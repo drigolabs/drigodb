@@ -24,7 +24,10 @@ rules:
     verbs: ["get", "update", "patch"]
   - apiGroups: [""]
     resources: ["services", "secrets", "persistentvolumeclaims"]
-    verbs: ["create", "get", "list", "delete"]
+    # update, so credential rotation can replace a database's password Secret.
+    # The pod reads it at start, so rotation is a Secret write plus a restart —
+    # the API never connects to PostgreSQL itself.
+    verbs: ["create", "get", "list", "update", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]

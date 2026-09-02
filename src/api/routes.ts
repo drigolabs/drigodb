@@ -43,6 +43,15 @@ export function buildRoutes(provisioner: Provisioner): Hono {
     c.json(await provisioner.scale(c.req.param("id"), 0), 202),
   );
 
+  // 200, not 202: the URI in this response is the point of the call, and it is
+  // returned here and on creation only. For a running database the rotation has
+  // already been applied by the time this returns; for a hibernated one it
+  // applies on the next wake, which is the first moment the URI is usable.
+  app.post("/v1/databases/:id/credentials", async (c) => {
+    const { database, uri } = await provisioner.rotateCredentials(c.req.param("id"));
+    return c.json({ ...database, connection_uri: uri });
+  });
+
   app.delete("/v1/databases/:id", async (c) => {
     await provisioner.delete(c.req.param("id"));
     return c.body(null, 204);
