@@ -11,6 +11,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DB_ID_LABEL,
   EXTERNAL_ID_LABEL,
+  PASSWORD_SECRET_KEY,
   TEMPLATE_HASH_ANNOTATION,
   templateHash,
 } from "../src/k8s/manifests.js";
@@ -172,5 +173,94 @@ describe("templateHash", () => {
 
     vi.unstubAllEnvs();
     vi.resetModules();
+  });
+});
+
+
+// Rotation is the recovery path for a lost connection URI: without it a caller
+// that loses one can never reach its database again. The ordering is the part
+// that fails silently — restarting before the Secret is written brings the pod
+// back on the old password and the returned URI is simply wrong.
+
+type SecretBody = { body: { stringData: Record<string, string> } };
+
+function rotatableFor(sts: ReturnType<typeof statefulSet>) {
+  const replaceSecret = vi.fn(async (_r: SecretBody) => {
+    calls.push("secret");
+    return {};
+  });
+  const apps = {
+    readNamespacedStatefulSet: async () => {
+      calls.push("read");
+      return sts;
+    },
+    patchNamespacedStatefulSet: async () => {
+      calls.push("patch");
+      return sts;
+    },
+    readNamespacedStatefulSetScale: async () => ({ spec: { replicas: sts.spec.replicas } }),
+    replaceNamespacedStatefulSetScale: async (r: { body: { spec: { replicas: number } } }) => {
+      calls.push(`scale:${r.body.spec.replicas}`);
+      sts.spec.replicas = r.body.spec.replicas;
+      sts.status.readyReplicas = r.body.spec.replicas;
+      return {};
+    },
+  };
+  const core = {
+    replaceNamespacedSecret: replaceSecret,
+    listNamespacedPod: async () => ({ items: sts.spec.replicas > 0 ? [{}] : [] }),
+  };
+  const provisioner = new Provisioner(apps as never, core as never, {} as never);
+  return { provisioner, replaceSecret };
+}
+
+describe("credential rotation", () => {
+  it("writes the new Secret before restarting, never after", async () => {
+    const { provisioner, replaceSecret } = rotatableFor(statefulSet(1, templateHash(ID, EXT)));
+
+    const { uri } = await provisioner.rotateCredentials(ID);
+
+    // A restart that happens first brings the pod back on the old password.
+    expect(calls.indexOf("secret")).toBeLessThan(calls.indexOf("scale:0"));
+    expect(calls).toContain("scale:1");
+
+    // The URI must carry the password that was just written, not a stale one.
+    const written = replaceSecret.mock.calls[0]?.[0].body.stringData[PASSWORD_SECRET_KEY];
+    expect(written).toBeTruthy();
+    expect(uri).toContain(encodeURIComponent(written as string));
+  });
+
+  it("issues a different password every time", async () => {
+    const a = rotatableFor(statefulSet(1, templateHash(ID, EXT)));
+    const first = (await a.provisioner.rotateCredentials(ID)).uri;
+    calls = [];
+    const b = rotatableFor(statefulSet(1, templateHash(ID, EXT)));
+    const second = (await b.provisioner.rotateCredentials(ID)).uri;
+
+    expect(first).not.toBe(second);
+  });
+
+  it("does not restart a hibernated database", async () => {
+    // Nothing is connected and nothing is running, so there is nothing to
+    // apply the password to yet — bootstrap.sh does it on the next wake, which
+    // is the first moment the URI could be used.
+    const { provisioner, replaceSecret } = rotatableFor(statefulSet(0, templateHash(ID, EXT)));
+
+    await provisioner.rotateCredentials(ID);
+
+    expect(replaceSecret).toHaveBeenCalledTimes(1);
+    expect(calls).not.toContain("scale:0");
+    expect(calls).not.toContain("scale:1");
+  });
+
+  it("is a 404 rather than a 500 when there is no such database", async () => {
+    const apps = {
+      readNamespacedStatefulSet: async () => {
+        throw Object.assign(new Error("not found"), { code: 404 });
+      },
+    };
+    const provisioner = new Provisioner(apps as never, {} as never, {} as never);
+
+    await expect(provisioner.rotateCredentials(ID)).rejects.toBeInstanceOf(NotFoundError);
   });
 });

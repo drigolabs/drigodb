@@ -279,6 +279,74 @@ export class Provisioner {
     console.log(`[drigodb] reconciled ${id} to template ${want}`);
   }
 
+  // Issue a new password and return the URI that carries it.
+  //
+  // The second and only other time a connection URI leaves this service. That
+  // is what makes this operation matter rather than merely complete the
+  // contract: the URI is returned on creation and never from a GET, so without
+  // rotation a caller that loses one has no way back into a live database. It
+  // keeps its data, keeps its volume, keeps costing money, and is unreachable.
+  //
+  // The password is applied by bootstrap.sh on the next start, not from here.
+  // The control plane cannot reach PostgreSQL — pg_hba admits TCP from
+  // localhost only and the Service exposes the gateway's port — and giving it a
+  // route in would mean holding a superuser credential for every database,
+  // which is the connection the isolation model exists to prevent.
+  async rotateCredentials(id: string): Promise<{ database: Database; uri: string }> {
+    const sts = await this.statefulSetFor(id);
+    if (!sts) throw new NotFoundError(`no database with id ${id}`);
+
+    const externalId = sts.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "";
+    const password = newPassword();
+
+    // The Secret first, always. The pod reads it at start, so a restart that
+    // happened before this landed would come back on the old password. This
+    // order also fails safe: if the restart below never happens, the database
+    // still converges on the new password at its next wake.
+    await this.core.replaceNamespacedSecret({
+      name: secretName(id),
+      namespace: config.databaseNamespace,
+      body: buildSecret(id, externalId, password),
+    });
+
+    // A hibernated database has nothing to restart and nothing connected to it.
+    // It picks the new password up when it next wakes, which is the first
+    // moment the URI could be used anyway.
+    if ((sts.spec?.replicas ?? 0) > 0) {
+      await this.scale(id, 0);
+      await this.waitForPodsGone(id);
+      await this.wake(id);
+      await this.waitForReady(id);
+    }
+
+    return { database: await this.get(id), uri: connectionUri(id, password) };
+  }
+
+  // Scaling to zero is accepted long before the pod is gone — status reports
+  // the desired replica count. Waking before the old pod has terminated would
+  // hand the new one a name that is still taken.
+  private async waitForPodsGone(id: string, attempts = 60): Promise<void> {
+    for (let i = 0; i < attempts; i++) {
+      const pods = await this.core.listNamespacedPod({
+        namespace: config.databaseNamespace,
+        labelSelector: `${DB_ID_LABEL}=${id}`,
+      });
+      if ((pods.items ?? []).length === 0) return;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+
+  // Bounded, and deliberately not an error on timeout: by this point the new
+  // password is already in the Secret, so the rotation has happened whether or
+  // not the pod is back. The caller is told the truth through `status`.
+  private async waitForReady(id: string, attempts = 90): Promise<void> {
+    for (let i = 0; i < attempts; i++) {
+      const db = await this.get(id);
+      if (db.status === "ready" || db.status === "failed") return;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+
   // Read-modify-replace on the scale subresource, retried on conflict. The
   // StatefulSet controller writes status continuously, so the resourceVersion
   // read a moment ago is routinely stale by the time the replace lands —

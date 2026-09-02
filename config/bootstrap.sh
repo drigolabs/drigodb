@@ -14,8 +14,19 @@ set -euo pipefail
 : "${APP_DB_NAME:=app}"
 : "${APP_DB_USER:=appuser}"
 CONF_SRC="${APP_DB_CONF_DIR:-/app-db-config}"
+# Records which credential this cluster has had applied. A fingerprint, not the
+# password — this sits in PGDATA next to the data the password protects, and
+# there is no reason for the plaintext to be there too.
+CRED_MARKER="${PGDATA}/.drigodb-credential"
 
 log() { printf '[bootstrap] %s\n' "$1"; }
+
+credential_fingerprint() { printf '%s' "${APP_DB_PASSWORD:-}" | sha256sum | cut -d' ' -f1; }
+
+record_credential() {
+  credential_fingerprint > "${CRED_MARKER}"
+  chmod 0600 "${CRED_MARKER}"
+}
 
 if [ ! -s "${PGDATA}/PG_VERSION" ]; then
   : "${APP_DB_PASSWORD:?APP_DB_PASSWORD must be set for first-time initialisation}"
@@ -49,16 +60,47 @@ CREATE ROLE :"role" LOGIN PASSWORD :'pw';
 GRANT documentdb_admin_role TO :"role";
 SQL
 
+  record_credential
+
   pg_ctl -D "${PGDATA}" -m fast -w stop >/dev/null
   log "initialisation complete"
 else
   # pg_hba and pg_ident are ours to own; refresh them so a config change ships
-  # with a restart. Password rotation is not handled here — it needs a running
-  # server, and paying a start/stop cycle on every wake is the wrong trade.
-  # U7 owns rotation.
+  # with a restart.
   log "existing cluster, refreshing auth files"
   cp "${CONF_SRC}/pg_hba.conf" "${CONF_SRC}/pg_ident.conf" "${PGDATA}/"
   chmod 0600 "${PGDATA}/pg_hba.conf" "${PGDATA}/pg_ident.conf"
+
+  # Rotation lands here rather than in the control plane, because the control
+  # plane cannot reach this server: pg_hba admits TCP from 127.0.0.1 and ::1
+  # only, and the Service exposes the gateway's port, not PostgreSQL's. Giving
+  # the API a route in would mean a Service port, a NetworkPolicy hole and a
+  # superuser credential per database — the connection the isolation model
+  # exists to prevent.
+  #
+  # ALTER ROLE needs a running server, so this pays a start/stop cycle. It is
+  # paid ONLY when the credential has actually changed, which is what the
+  # fingerprint decides — an ordinary wake still execs straight into the
+  # postmaster and costs nothing.
+  #
+  # A cluster created before this existed has no marker, so its first restart
+  # re-applies the password it already has. Harmless, and it establishes the
+  # marker.
+  if [ -n "${APP_DB_PASSWORD:-}" ] && \
+     [ "$(credential_fingerprint)" != "$(cat "${CRED_MARKER}" 2>/dev/null || true)" ]; then
+    log "credential has changed; applying it"
+    pg_ctl -D "${PGDATA}" -w start >/dev/null
+    # Fed on stdin for the same reason as initialisation: psql interpolates
+    # file and stdin input but not -c strings, and interpolation keeps the
+    # password off the command line and quotes it correctly.
+    psql -U postgres -d "${APP_DB_NAME}" -v ON_ERROR_STOP=1 -q \
+      -v role="${APP_DB_USER}" -v pw="${APP_DB_PASSWORD}" -f - <<'SQL'
+ALTER ROLE :"role" PASSWORD :'pw';
+SQL
+    pg_ctl -D "${PGDATA}" -m fast -w stop >/dev/null
+    record_credential
+    log "credential applied"
+  fi
 fi
 
 # Belt and braces alongside fsGroupChangePolicy: PostgreSQL refuses to start

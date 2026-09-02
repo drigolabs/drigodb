@@ -114,6 +114,39 @@ PG_RUNNING="$(k get pod -n drigodb-databases -l "drigodb.io/database-id=${DB_ID}
   -o jsonpath='{.items[0].spec.containers[?(@.name=="postgres")].image}')"
 ok "running ${PG_RUNNING}"
 
+step "Rotating credentials"
+# The recovery path: the connection URI is handed out on creation and never
+# again, so without rotation a caller that loses one can never reach its
+# database. This proves the new credential works AND that the old one stops
+# working — a rotation that leaves the old password valid is not a rotation.
+NEW="$(api -XPOST "localhost:${API_PORT}/v1/databases/${DB_ID}/credentials")"
+NEW_URI="$(echo "$NEW" | jqf '["connection_uri"]')"
+[ -n "$NEW_URI" ] || { fail "rotation returned no connection_uri"; exit 1; }
+[ "$NEW_URI" != "$URI" ] || { fail "rotation returned the same URI"; exit 1; }
+ok "new credential issued"
+
+# The pod was replaced to apply it, so the old tunnel is pointing at a pod that
+# no longer exists.
+DB_PORT2=$((DB_PORT + 1))
+start_pf "svc/db-${DB_ID}" "$DB_PORT2" drigodb-databases 27017 /tmp/drigodb-smoke-db2.log || exit 1
+
+NEW_LOCAL="$(echo "$NEW_URI" | sed -E "s#@[^/]+/#@localhost:${DB_PORT2}/#")"
+OUT="$(npx --yes mongosh@latest "$NEW_LOCAL" --quiet --eval '
+  print(JSON.stringify(db.getSiblingDB("smoke").docs.find().toArray()));
+' 2>&1 | tail -2)" || true
+case "$OUT" in
+  *provisioned-by-api*) ok "new credential reads the same data" ;;
+  *) fail "new credential could not use the database"; echo "$OUT"; exit 1 ;;
+esac
+
+OLD_LOCAL="$(echo "$URI" | sed -E "s#@[^/]+/#@localhost:${DB_PORT2}/#")"
+OUT="$(npx --yes mongosh@latest "$OLD_LOCAL" --quiet \
+  --eval 'db.getSiblingDB("smoke").docs.find().toArray()' 2>&1 | tail -3)" || true
+case "$OUT" in
+  *provisioned-by-api*) fail "the OLD credential still works — rotation did not take"; exit 1 ;;
+  *) ok "old credential rejected" ;;
+esac
+
 echo
 printf "${GREEN}${BOLD}drigodb works end to end.${RESET}\n"
 printf "  database ${BOLD}%s${RESET} (external_id ${BOLD}%s${RESET}) is running.\n" "$DB_ID" "$EXTERNAL_ID"

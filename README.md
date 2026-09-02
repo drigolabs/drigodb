@@ -48,6 +48,7 @@ GET    /v1/databases            list
 GET    /v1/databases/{id}       status and endpoint
 POST   /v1/databases/{id}/wake       → 202
 POST   /v1/databases/{id}/hibernate  → 202
+POST   /v1/databases/{id}/credentials  → 200 + a new connection_uri
 DELETE /v1/databases/{id}       destroys the data
 ```
 
@@ -59,8 +60,15 @@ Bearer token on everything except `/healthz`.
 than creating a second one. Callers retry — failed requests, restarted processes, reconcile loops — and
 a duplicate would split one application's data across two instances while quietly doubling its cost.
 
-**The connection URI is returned on creation only**, never from a plain `GET`, so a leaked read token
-does not leak database credentials.
+**The connection URI is returned on creation and on rotation only**, never from a plain `GET`, so a
+leaked read token does not leak database credentials. Rotation is therefore also the recovery path: a
+caller that loses a URI has no other way back into a live database, since reading the credential
+Secret directly would mean holding access to *every* database's credentials.
+
+Rotating writes a new password into the database's Secret and restarts it, because the control plane
+deliberately cannot reach PostgreSQL — `pg_hba` admits TCP from localhost only. `config/bootstrap.sh`
+applies the change on start, and pays the start/stop cycle that needs *only* when the credential has
+actually changed, so an ordinary wake is unaffected.
 
 Kubernetes is the source of truth. There is no control-plane database: a hosted database *is* its
 StatefulSet, and the caller's identifier lives on it as a label.
