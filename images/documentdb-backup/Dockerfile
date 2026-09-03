@@ -18,7 +18,10 @@
 # remembering to bump two versions together. It is also nearly free at runtime:
 # the pod already pulls this image for its postgres container, so every layer
 # below rclone is shared and nothing extra is downloaded onto the node.
-ARG POSTGRES_IMAGE=ghcr.io/drigolabs/drigodb-postgres:18-0.116-0-20260831-b1
+# The floating tag: it always names the current build of this upstream release,
+# which is the postgres image these databases actually run. CI overrides it with
+# the tag it has just published, so the two can never drift apart.
+ARG POSTGRES_IMAGE=ghcr.io/drigolabs/drigodb-postgres:18-0.116-0
 
 FROM ${POSTGRES_IMAGE}
 

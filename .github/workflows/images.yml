@@ -121,8 +121,11 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: drigolabs/drigodb-backup:test
+          # See ci.yml: the container-driver builder cannot read the local
+          # daemon, so the base is the published image rather than the one
+          # loaded a step earlier.
           build-args: |
-            POSTGRES_IMAGE=drigolabs/drigodb-postgres:test
+            POSTGRES_IMAGE=ghcr.io/${{ github.repository_owner }}/drigodb-postgres:${{ needs.plan.outputs.postgres_floating }}
           cache-from: type=gha,scope=backup-amd64
           cache-to: type=gha,mode=max,scope=backup-amd64
 
@@ -158,8 +161,6 @@ jobs:
           - { image: postgres, context: images/postgres-documentdb, arch: arm64, runner: ubuntu-24.04-arm }
           - { image: gateway,  context: images/documentdb-gateway,  arch: amd64, runner: ubuntu-latest }
           - { image: gateway,  context: images/documentdb-gateway,  arch: arm64, runner: ubuntu-24.04-arm }
-          - { image: backup,   context: images/documentdb-backup,   arch: amd64, runner: ubuntu-latest }
-          - { image: backup,   context: images/documentdb-backup,   arch: arm64, runner: ubuntu-24.04-arm }
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v3
@@ -180,7 +181,6 @@ jobs:
           build-args: |
             PG_MAJOR=${{ needs.plan.outputs.pg_major }}
             DOCUMENTDB_VERSION=${{ needs.plan.outputs.documentdb_version }}
-            POSTGRES_IMAGE=ghcr.io/drigolabs/drigodb-postgres:18-0.116-0-20260831-b1
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -216,9 +216,6 @@ jobs:
           - image: gateway
             floating: ${{ needs.plan.outputs.gateway_floating }}
             pinned: ${{ needs.plan.outputs.gateway_pinned }}
-          - image: backup
-            floating: ${{ needs.plan.outputs.backup_floating }}
-            pinned: ${{ needs.plan.outputs.backup_pinned }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -243,9 +240,98 @@ jobs:
             $(printf "${IMAGE}@sha256:%s " *)
           docker buildx imagetools inspect "${IMAGE}:${{ matrix.pinned }}"
 
+  # Backup builds only once postgres is published, and never beside it.
+  #
+  # It derives FROM the postgres image so that pg_basebackup can never be older
+  # than the server it copies. Built in the same matrix as postgres, it would
+  # pull the PREVIOUS postgres build — so a PostgreSQL patch release would give
+  # the server a newer version than the tool backing it up, which is precisely
+  # the hazard sharing a base was meant to remove.
+  build-backup:
+    name: build backup ${{ matrix.arch }}
+    needs: [plan, manifest]
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-latest }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: images/documentdb-backup
+          platforms: linux/${{ matrix.arch }}
+          # The pinned tag from this very run: the manifest job published it a
+          # moment ago, so the sidecar is built from exactly the server image it
+          # will sit beside.
+          build-args: |
+            POSTGRES_IMAGE=ghcr.io/${{ github.repository_owner }}/drigodb-postgres:${{ needs.plan.outputs.postgres_pinned }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/drigodb-backup,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=backup-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=backup-${{ matrix.arch }}
+
+      - name: Record the digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-backup-${{ matrix.arch }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  manifest-backup:
+    name: publish backup
+    needs: [plan, build-backup]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-backup-*
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bind both architectures to both tags
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ghcr.io/${{ github.repository_owner }}/drigodb-backup
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE}:${{ needs.plan.outputs.backup_pinned }}" \
+            -t "${IMAGE}:${{ needs.plan.outputs.backup_floating }}" \
+            $(printf "${IMAGE}@sha256:%s " *)
+          docker buildx imagetools inspect "${IMAGE}:${{ needs.plan.outputs.backup_pinned }}"
+
   notify:
     name: report the new pins
-    needs: [plan, manifest]
+    needs: [plan, manifest, manifest-backup]
     runs-on: ubuntu-latest
     permissions:
       contents: read
