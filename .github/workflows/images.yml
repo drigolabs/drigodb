@@ -52,6 +52,8 @@ jobs:
       postgres_pinned: ${{ steps.v.outputs.postgres_pinned }}
       gateway_floating: ${{ steps.v.outputs.gateway_floating }}
       gateway_pinned: ${{ steps.v.outputs.gateway_pinned }}
+      backup_floating: ${{ steps.v.outputs.backup_floating }}
+      backup_pinned: ${{ steps.v.outputs.backup_pinned }}
     steps:
       - uses: actions/checkout@v5
       - id: v
@@ -75,6 +77,8 @@ jobs:
             echo "postgres_pinned=${PG_MAJOR}-${DOCUMENTDB_VERSION}-${BUILD}"
             echo "gateway_floating=${DOCUMENTDB_VERSION}"
             echo "gateway_pinned=${DOCUMENTDB_VERSION}-${BUILD}"
+            echo "backup_floating=${PG_MAJOR}-${DOCUMENTDB_VERSION}"
+            echo "backup_pinned=${PG_MAJOR}-${DOCUMENTDB_VERSION}-${BUILD}"
           } >> "$GITHUB_OUTPUT"
 
   test:
@@ -110,6 +114,18 @@ jobs:
           cache-from: type=gha,scope=gateway-amd64
           cache-to: type=gha,mode=max,scope=gateway-amd64
 
+      - name: Build backup
+        uses: docker/build-push-action@v6
+        with:
+          context: images/documentdb-backup
+          platforms: linux/amd64
+          load: true
+          tags: drigolabs/drigodb-backup:test
+          build-args: |
+            POSTGRES_IMAGE=drigolabs/drigodb-postgres:test
+          cache-from: type=gha,scope=backup-amd64
+          cache-to: type=gha,mode=max,scope=backup-amd64
+
       - name: Postgres smoke test
         run: bash images/postgres-documentdb/smoke-test.sh drigolabs/drigodb-postgres:test
 
@@ -117,6 +133,11 @@ jobs:
         run: |
           bash images/documentdb-gateway/integration-test.sh \
             drigolabs/drigodb-gateway:test drigolabs/drigodb-postgres:test
+
+      - name: Backup restore test
+        run: |
+          bash images/documentdb-backup/integration-test.sh \
+            drigolabs/drigodb-backup:test drigolabs/drigodb-postgres:test
 
   build:
     name: build ${{ matrix.image }} ${{ matrix.arch }}
@@ -137,6 +158,8 @@ jobs:
           - { image: postgres, context: images/postgres-documentdb, arch: arm64, runner: ubuntu-24.04-arm }
           - { image: gateway,  context: images/documentdb-gateway,  arch: amd64, runner: ubuntu-latest }
           - { image: gateway,  context: images/documentdb-gateway,  arch: arm64, runner: ubuntu-24.04-arm }
+          - { image: backup,   context: images/documentdb-backup,   arch: amd64, runner: ubuntu-latest }
+          - { image: backup,   context: images/documentdb-backup,   arch: arm64, runner: ubuntu-24.04-arm }
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-buildx-action@v3
@@ -157,6 +180,7 @@ jobs:
           build-args: |
             PG_MAJOR=${{ needs.plan.outputs.pg_major }}
             DOCUMENTDB_VERSION=${{ needs.plan.outputs.documentdb_version }}
+            POSTGRES_IMAGE=ghcr.io/drigolabs/drigodb-postgres:18-0.116-0-20260831-b1
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
@@ -192,6 +216,9 @@ jobs:
           - image: gateway
             floating: ${{ needs.plan.outputs.gateway_floating }}
             pinned: ${{ needs.plan.outputs.gateway_pinned }}
+          - image: backup
+            floating: ${{ needs.plan.outputs.backup_floating }}
+            pinned: ${{ needs.plan.outputs.backup_pinned }}
     steps:
       - uses: actions/download-artifact@v4
         with:

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and push the three drigodb images to GHCR, multi-arch.
+# Build and push the four drigodb images to GHCR, multi-arch.
 #
 # CI does this on every release (.github/workflows/release.yml for the API,
 # images.yml for the data-plane pair). This script stays for the times CI is not
@@ -52,6 +52,16 @@ docker buildx build --platform "$PLATFORMS" \
   -t "${REGISTRY}/drigodb-gateway:${DOCUMENTDB_VERSION}" \
   --push "${ROOT}/images/documentdb-gateway"
 ok "pushed drigodb-gateway:${DOCUMENTDB_VERSION}"
+
+step "backup (PostgreSQL ${PG_MAJOR} + DocumentDB ${DOCUMENTDB_VERSION})"
+# Built from the postgres image published above, by digest-free tag: pg_basebackup
+# must not be older than the server it copies, and deriving from the same image
+# makes that true rather than remembered.
+docker buildx build --platform "$PLATFORMS" \
+  --build-arg "POSTGRES_IMAGE=${REGISTRY}/drigodb-postgres:${PG_MAJOR}-${DOCUMENTDB_VERSION}" \
+  -t "${REGISTRY}/drigodb-backup:${PG_MAJOR}-${DOCUMENTDB_VERSION}" \
+  --push "${ROOT}/images/documentdb-backup"
+ok "pushed drigodb-backup:${PG_MAJOR}-${DOCUMENTDB_VERSION}"
 
 step "api (${API_VERSION})"
 docker buildx build --platform "$PLATFORMS" \

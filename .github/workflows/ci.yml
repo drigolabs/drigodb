@@ -96,7 +96,30 @@ jobs:
 
       # A real MongoDB driver talks to the gateway over the wire protocol,
       # through the pg_hba/pg_ident files in config/ that production mounts.
+      # Built from the postgres image this run just produced, so pg_dump and the
+      # server can never be different versions.
+      - name: Build backup
+        uses: docker/build-push-action@v6
+        with:
+          context: images/documentdb-backup
+          platforms: linux/amd64
+          load: true
+          tags: drigolabs/drigodb-backup:ci
+          build-args: |
+            POSTGRES_IMAGE=drigolabs/drigodb-postgres:ci
+          cache-from: type=gha,scope=backup-amd64
+          cache-to: type=gha,mode=max,scope=backup-amd64
+
       - name: Gateway integration test
         run: |
           bash images/documentdb-gateway/integration-test.sh \
             drigolabs/drigodb-gateway:ci drigolabs/drigodb-postgres:ci
+
+      # Backs up a database holding real documents, restores it into a second
+      # instance, and reads those documents back through the DocumentDB API.
+      # The API read is the assertion that matters: a pg_dump-based backup
+      # restored with no error at all and lost every collection.
+      - name: Backup restore test
+        run: |
+          bash images/documentdb-backup/integration-test.sh \
+            drigolabs/drigodb-backup:ci drigolabs/drigodb-postgres:ci
