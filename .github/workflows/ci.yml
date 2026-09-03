@@ -96,7 +96,34 @@ jobs:
 
       # A real MongoDB driver talks to the gateway over the wire protocol,
       # through the pg_hba/pg_ident files in config/ that production mounts.
+      # Built from the PUBLISHED postgres image, not the one loaded above.
+      # setup-buildx-action uses a container driver, which cannot see images in
+      # the local Docker daemon — `FROM drigolabs/drigodb-postgres:ci` does not
+      # resolve there. The published floating tag is the same upstream release,
+      # so pg_basebackup and the server still match on major version; the server
+      # under test is this PR's build, which is what the config changes need.
+      - name: Build backup
+        uses: docker/build-push-action@v6
+        with:
+          context: images/documentdb-backup
+          platforms: linux/amd64
+          load: true
+          tags: drigolabs/drigodb-backup:ci
+          build-args: |
+            POSTGRES_IMAGE=ghcr.io/${{ github.repository_owner }}/drigodb-postgres:${{ env.PG_MAJOR }}-${{ env.DOCUMENTDB_VERSION }}
+          cache-from: type=gha,scope=backup-amd64
+          cache-to: type=gha,mode=max,scope=backup-amd64
+
       - name: Gateway integration test
         run: |
           bash images/documentdb-gateway/integration-test.sh \
             drigolabs/drigodb-gateway:ci drigolabs/drigodb-postgres:ci
+
+      # Backs up a database holding real documents, restores it into a second
+      # instance, and reads those documents back through the DocumentDB API.
+      # The API read is the assertion that matters: a pg_dump-based backup
+      # restored with no error at all and lost every collection.
+      - name: Backup restore test
+        run: |
+          bash images/documentdb-backup/integration-test.sh \
+            drigolabs/drigodb-backup:ci drigolabs/drigodb-postgres:ci
