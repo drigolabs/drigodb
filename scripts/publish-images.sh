@@ -18,7 +18,6 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # publish and a pipeline publish cannot build different things.
 # shellcheck source=../images/versions.env
 . "${ROOT}/images/versions.env"
-DOCUMENTDB_VERSION="${DOCUMENTDB_VERSION}"
 PG_MAJOR="${PG_MAJOR}"
 API_VERSION="${API_VERSION:-$(node -p "require('${ROOT}/package.json').version")}"
 
@@ -39,29 +38,16 @@ ok "authenticated to ghcr.io"
 docker buildx inspect drigodb >/dev/null 2>&1 || docker buildx create --name drigodb --use >/dev/null
 docker buildx use drigodb
 
-step "postgres (PostgreSQL ${PG_MAJOR} + DocumentDB ${DOCUMENTDB_VERSION})"
+step "backup (PostgreSQL ${PG_MAJOR})"
+# Built from the same image the database runs: pg_dump must not be older than
+# the server it dumps, and deriving from that image makes it true rather than
+# remembered. CNPG publish and patch the base; drigodb no longer maintains a
+# postgres image of its own — see docs/leaving-documentdb.md.
 docker buildx build --platform "$PLATFORMS" \
-  --build-arg "PG_MAJOR=${PG_MAJOR}" --build-arg "DOCUMENTDB_VERSION=${DOCUMENTDB_VERSION}" \
-  -t "${REGISTRY}/drigodb-postgres:${PG_MAJOR}-${DOCUMENTDB_VERSION}" \
-  --push "${ROOT}/images/postgres-documentdb"
-ok "pushed drigodb-postgres:${PG_MAJOR}-${DOCUMENTDB_VERSION}"
-
-step "gateway (DocumentDB ${DOCUMENTDB_VERSION})"
-docker buildx build --platform "$PLATFORMS" \
-  --build-arg "DOCUMENTDB_VERSION=${DOCUMENTDB_VERSION}" \
-  -t "${REGISTRY}/drigodb-gateway:${DOCUMENTDB_VERSION}" \
-  --push "${ROOT}/images/documentdb-gateway"
-ok "pushed drigodb-gateway:${DOCUMENTDB_VERSION}"
-
-step "backup (PostgreSQL ${PG_MAJOR} + DocumentDB ${DOCUMENTDB_VERSION})"
-# Built from the postgres image published above, by digest-free tag: pg_basebackup
-# must not be older than the server it copies, and deriving from the same image
-# makes that true rather than remembered.
-docker buildx build --platform "$PLATFORMS" \
-  --build-arg "POSTGRES_IMAGE=${REGISTRY}/drigodb-postgres:${PG_MAJOR}-${DOCUMENTDB_VERSION}" \
-  -t "${REGISTRY}/drigodb-backup:${PG_MAJOR}-${DOCUMENTDB_VERSION}" \
-  --push "${ROOT}/images/documentdb-backup"
-ok "pushed drigodb-backup:${PG_MAJOR}-${DOCUMENTDB_VERSION}"
+  --build-arg "POSTGRES_IMAGE=ghcr.io/cloudnative-pg/postgresql:${PG_MAJOR}" \
+  -t "${REGISTRY}/drigodb-backup:${PG_MAJOR}" \
+  --push "${ROOT}/images/postgres-backup"
+ok "pushed drigodb-backup:${PG_MAJOR}"
 
 step "api (${API_VERSION})"
 docker buildx build --platform "$PLATFORMS" \

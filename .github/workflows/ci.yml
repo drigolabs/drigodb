@@ -49,6 +49,9 @@ jobs:
           cache-from: type=gha,scope=api-amd64
           cache-to: type=gha,mode=max,scope=api-amd64
 
+  # Name kept exactly as it is: branch protection on main requires the check
+  # "data-plane images work". Renaming it needs the protection rule updated in
+  # the same breath, or every pull request blocks on a check that never reports.
   data-plane-images:
     name: data-plane images work
     runs-on: ubuntu-latest
@@ -61,69 +64,34 @@ jobs:
         # and versions.env is commented.
         run: grep -E '^[A-Z_]+=' images/versions.env >> "$GITHUB_ENV"
 
-      # Loaded into the local daemon rather than pushed: the test scripts run
-      # `docker run` against these tags. amd64 only — a native arm64 leg would
-      # need a second runner and proves nothing these tests do not, and the
-      # release path builds arm64 anyway.
-      - name: Build postgres
-        uses: docker/build-push-action@v6
-        with:
-          context: images/postgres-documentdb
-          platforms: linux/amd64
-          load: true
-          tags: drigolabs/drigodb-postgres:ci
-          build-args: |
-            PG_MAJOR=${{ env.PG_MAJOR }}
-            DOCUMENTDB_VERSION=${{ env.DOCUMENTDB_VERSION }}
-          cache-from: type=gha,scope=postgres-amd64
-          cache-to: type=gha,mode=max,scope=postgres-amd64
-
-      - name: Build gateway
-        uses: docker/build-push-action@v6
-        with:
-          context: images/documentdb-gateway
-          platforms: linux/amd64
-          load: true
-          tags: drigolabs/drigodb-gateway:ci
-          build-args: |
-            DOCUMENTDB_VERSION=${{ env.DOCUMENTDB_VERSION }}
-          cache-from: type=gha,scope=gateway-amd64
-          cache-to: type=gha,mode=max,scope=gateway-amd64
-
-      # The extension loads under CNPG's preload set and a document round-trips.
-      - name: Postgres smoke test
-        run: bash images/postgres-documentdb/smoke-test.sh drigolabs/drigodb-postgres:ci
-
-      # A real MongoDB driver talks to the gateway over the wire protocol,
-      # through the pg_hba/pg_ident files in config/ that production mounts.
-      # Built from the PUBLISHED postgres image, not the one loaded above.
+      # Only the backup image is ours now. The postgres and gateway images are
+      # gone from the data plane — databases run CNPG's postgresql directly, so
+      # there is nothing here to smoke-test for a loaded extension and no
+      # wire-protocol gateway to drive a MongoDB driver against. Their sources
+      # are deleted in #27. See docs/leaving-documentdb.md.
+      #
+      # Built from the PUBLISHED base rather than a locally loaded one:
       # setup-buildx-action uses a container driver, which cannot see images in
-      # the local Docker daemon — `FROM drigolabs/drigodb-postgres:ci` does not
-      # resolve there. The published floating tag is the same upstream release,
-      # so pg_basebackup and the server still match on major version; the server
-      # under test is this PR's build, which is what the config changes need.
+      # the local Docker daemon.
       - name: Build backup
         uses: docker/build-push-action@v6
         with:
-          context: images/documentdb-backup
+          context: images/postgres-backup
           platforms: linux/amd64
           load: true
           tags: drigolabs/drigodb-backup:ci
           build-args: |
-            POSTGRES_IMAGE=ghcr.io/${{ github.repository_owner }}/drigodb-postgres:${{ env.PG_MAJOR }}-${{ env.DOCUMENTDB_VERSION }}
+            POSTGRES_IMAGE=ghcr.io/cloudnative-pg/postgresql:${{ env.PG_MAJOR }}
           cache-from: type=gha,scope=backup-amd64
           cache-to: type=gha,mode=max,scope=backup-amd64
 
-      - name: Gateway integration test
-        run: |
-          bash images/documentdb-gateway/integration-test.sh \
-            drigolabs/drigodb-gateway:ci drigolabs/drigodb-postgres:ci
-
-      # Backs up a database holding real documents, restores it into a second
-      # instance, and reads those documents back through the DocumentDB API.
-      # The API read is the assertion that matters: a pg_dump-based backup
-      # restored with no error at all and lost every collection.
+      # Writes rows to a real server, backs them up, restores into a SECOND
+      # RUNNING instance, and reads the rows and an expression index back.
+      # Asserting on the data is the assertion that matters: under DocumentDB a
+      # pg_dump-based backup restored with no error at all and lost every
+      # collection.
       - name: Backup restore test
         run: |
-          bash images/documentdb-backup/integration-test.sh \
-            drigolabs/drigodb-backup:ci drigolabs/drigodb-postgres:ci
+          bash images/postgres-backup/integration-test.sh \
+            drigolabs/drigodb-backup:ci \
+            ghcr.io/cloudnative-pg/postgresql:${{ env.PG_MAJOR }}

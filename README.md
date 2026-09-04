@@ -153,8 +153,8 @@ torn down between sessions. A merge with no cluster running publishes the image,
 ### The data-plane image
 
 `drigodb-backup` carries the PostgreSQL major it is built against, not this repo's version, so it is
-not part of a semver release. `.github/workflows/images.yml` builds it when `images/` or `config/`
-changes, and on demand.
+not part of a semver release. `.github/workflows/images.yml` builds it when `images/postgres-backup/`,
+`config/` or `images/versions.env` changes, and on demand.
 
 **There is no weekly rebuild any more.** It existed because the postgres image was built on Ubuntu
 rather than CNPG's own, and that trade bought drigodb the job of patching its own base. Databases now
