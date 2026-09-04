@@ -6,12 +6,13 @@ Each database is a PostgreSQL instance with its own volume, its own credentials 
 policy. Databases hibernate when idle — **zero compute, storage only** — and wake in about eight
 seconds.
 
-> **v0.0.1, mid-migration.** What is deployed today is a PostgreSQL instance running the
-> [DocumentDB](https://github.com/documentdb/documentdb) extension behind a MongoDB wire-protocol
-> gateway, and it still hands out a `mongodb://` URI. That data plane is being replaced by plain
-> PostgreSQL: MongoDB compatibility is dropped, the gateway goes, and `connection_uri` becomes a
-> `postgres://` string. The reasoning is in [docs/leaving-documentdb.md](docs/leaving-documentdb.md).
-> Everything below describes what runs today and changes as the migration lands.
+> **v0.0.1, mid-migration.** The data plane is now plain PostgreSQL 18 — no DocumentDB extension, no
+> MongoDB gateway, and a `postgres://` connection URI. The reasoning is in
+> [docs/leaving-documentdb.md](docs/leaving-documentdb.md).
+>
+> Still outstanding: the old image sources are not yet deleted (#27), nothing installs schema into a
+> provisioned database yet (#30), and the figures under [Measured](#measured) still describe the
+> DocumentDB data plane until they are taken again on a cluster (#32).
 >
 > There is no public endpoint, no accounts and no quotas. Backups exist but are off unless a bucket is
 > configured. See [Status](#status).
@@ -32,11 +33,14 @@ be installed once per instance.
 
 Full write-up, with the commands: [docs/documentdb-multitenancy-spike.md](docs/documentdb-multitenancy-spike.md).
 
-**This constraint is being removed.** Leaving DocumentDB makes a shared instance possible for the first
-time — many app databases in one cluster, isolated by ordinary PostgreSQL roles rather than by a
-catalog column. The migration itself does not change the topology: one instance per database stays,
-but as a choice rather than a forced move, and a shared tier becomes work that can be scheduled instead
-of work the engine forbids.
+**This constraint is removed, and the topology is now a choice.** Leaving DocumentDB makes a shared
+instance possible for the first time — many app databases in one cluster, isolated by ordinary
+PostgreSQL roles rather than by a catalog column.
+
+One instance per database stays anyway, deliberately: hibernation already takes idle compute to zero,
+so the shared tier's advantage is storage, and it only becomes material somewhere past a few hundred
+databases. The comparison and the trigger for revisiting it are in
+[docs/decisions/0001](docs/decisions/0001-instance-per-database-over-a-shared-cluster.md).
 
 ## Isolation
 
@@ -107,9 +111,10 @@ curl -XPOST localhost:8080/v1/databases \
   -d '{"external_id":"my-app"}'
 ```
 
-Connect the returned `connection_uri` with any MongoDB driver, `mongosh`, or Compass. Compass browses
-and queries normally; its **Performance tab does not work**, because the gateway implements neither
-`serverStatus` nor `top`.
+Connect the returned `connection_uri` with `psql`, `pg`, or any PostgreSQL client. The URI names the
+`app` database and carries `sslmode=require` — the server presents a self-signed certificate generated
+at first start, so a client can encrypt but cannot verify it. A real issuer is
+[#9](https://github.com/drigolabs/drigodb/issues/9).
 
 ## Continuous delivery
 
@@ -145,40 +150,25 @@ scripts/next-version.sh --why
 torn down between sessions. A merge with no cluster running publishes the image, says so, and stops —
 `scripts/doks-up.sh && scripts/deploy.sh` picks it up later.
 
-### The data-plane images
+### The data-plane image
 
-`drigodb-postgres` and `drigodb-gateway` carry upstream's version, not this repo's, so they are not
-part of a semver release. `.github/workflows/images.yml` builds them when `images/` or `config/`
-changes, on demand, and **every Monday** — because
-[the postgres image is built on Ubuntu rather than CNPG's own image](images/postgres-documentdb/Dockerfile)
-and that trade bought drigodb the job of patching its own base.
+`drigodb-backup` carries the PostgreSQL major it is built against, not this repo's version, so it is
+not part of a semver release. `.github/workflows/images.yml` builds it when `images/` or `config/`
+changes, and on demand.
 
-Nothing is published until it has been proved to run: the extension has to load under CNPG's preload
-set and round-trip a document, and a real MongoDB driver has to talk to the gateway through the
-`config/` files production mounts. A rebuild that merely *builds* would sail past the failure that
-matters, which is a runtime one.
+**There is no weekly rebuild any more.** It existed because the postgres image was built on Ubuntu
+rather than CNPG's own, and that trade bought drigodb the job of patching its own base. Databases now
+run `ghcr.io/cloudnative-pg/postgresql:18` directly; CNPG rebuild it and drigodb inherits that.
 
-Each publish emits two tags — `18-0.116-0` naming the upstream release, and
-`18-0.116-0-20260830-b7` naming the exact build — and then files an issue carrying the two-line diff
-that moves `deploy/20-api.yaml` onto them. One standing issue, rewritten by each rebuild rather than
-duplicated weekly.
+Nothing is published until it has been proved to run. For the backup image that means
+`images/postgres-backup/integration-test.sh`: write rows to a real PostgreSQL, back them up to MinIO
+standing in for Spaces, restore into a *second, running* instance, and read the rows and the expression
+index back. A rebuild that merely *builds* would sail past the failure that matters, which is a runtime
+one — and the DocumentDB era proved that exactly: a dump that exits zero and restores nothing.
 
-The workflow stops there on purpose. Opening a pull request from Actions requires a repository setting
-that grants **approval** as well as creation, and a workflow able to approve its own pull request can
-satisfy a required review by itself. So CI reports and a human opens the PR; merging it is a `fix:`,
-which ships the rebuild down the same path as any other change.
-
-Upstream version bumps are one edit to `images/versions.env`, which CI and `scripts/publish-images.sh`
-both read.
-
-**Existing databases pick the new image up on their next wake.** A hosted database is its StatefulSet,
-and nothing rewrote that StatefulSet after creation — so a rebuilt image used to reach new databases
-only, and so did every pod-template fix before it. Wake now compares the template the running build
-renders against a hash recorded on the StatefulSet, and rewrites it while the database is still at zero
-replicas, where there are no pods to roll and the change is free. A database that is already awake is
-left alone — a speculative `wake` must not restart something serving traffic — and reconciles on its
-next hibernate/wake cycle. One that stays hibernated indefinitely never reconciles at all; a job that
-wakes the fleet on a schedule is the eventual answer to that.
+The old `drigodb-postgres` and `drigodb-gateway` image sources are still in `images/` and are deleted
+in [#27](https://github.com/drigolabs/drigodb/issues/27), along with the workflow's rebuild schedule
+and its standing-issue writer.
 
 ### Setting it up
 
@@ -207,7 +197,7 @@ bisecting a build, or bootstrapping a registry. They are the escape hatch, not t
 ## Backups
 
 Off by default. Set a bucket and an endpoint and every database gains a sidecar that streams a
-physical backup to S3-compatible storage on an interval.
+logical backup to S3-compatible storage on an interval.
 
 ```bash
 kubectl create secret generic drigodb-backup-credentials -n drigodb-databases \
@@ -222,13 +212,12 @@ Existing databases pick the sidecar up on their next wake, through the same temp
 carries image updates. With no bucket configured no sidecar is added at all — a database is exactly
 what it was before, rather than one carrying a container that cannot do its job.
 
-**Physical, not logical, and that is not a preference.** `pg_dump` cannot back up a DocumentDB
-database: it never dumps the data of tables belonging to an extension, and `documentdb` marks none of
-its catalog for dumping. A collection's rows are dumped; the registry that makes them a collection is
-not. The restore completes with no error and every collection is invisible. `pg_basebackup` copies
-the cluster, catalogs included, so it is correct by construction — at the cost of a ~73 MB floor per
-backup and restores only into the same PostgreSQL major version.
-[Full write-up](images/documentdb-backup/README.md).
+**Logical, now that it can be.** A backup is `pg_dump` of the app database, gzipped and streamed
+straight to object storage. It was `pg_basebackup` under DocumentDB and not by preference — `pg_dump`
+never dumps the data of tables belonging to an extension, `documentdb` marked none of its catalog, and
+a restore completed with no error leaving every collection invisible. With the extension gone an empty
+database dumps to under a kilobyte instead of ~73 MB, and it restores across PostgreSQL major versions.
+[Full write-up](images/postgres-backup/README.md).
 
 **A broken bucket cannot take a database offline.** The sidecar carries no probes and absorbs its own
 failures. A readiness probe would put backups on the pod's Ready condition, and a NotReady pod leaves
@@ -239,8 +228,10 @@ nothing can have changed since the last backup. The sidecar only exists while th
 which is the only time it can have anything new to say.
 
 **Restore is not wired to the API yet.** The image can do it by hand — `drigodb-backup restore KEY`
-unpacks an archive into an empty `PGDATA`, and refuses one that already holds a cluster. Making that
-an operation is the next piece of work.
+loads a dump into the app database, and refuses a database that already holds tables unless
+`DRIGODB_RESTORE_FORCE=1` says otherwise. Making that an operation is
+[#22](https://github.com/drigolabs/drigodb/issues/22), which gets substantially simpler now that a
+restore loads into a running server rather than replacing a data directory.
 
 ## Measured
 
@@ -249,6 +240,12 @@ an operation is the next piece of work.
 | Provision from nothing | ~12s (includes `initdb` and `CREATE EXTENSION`) | **27s** warm, **50s** on a node that has never pulled the images |
 | Wake from hibernation | ~8s | **18s** |
 | Hibernated | 0 pods; storage only | same |
+
+**These figures predate the migration and describe the DocumentDB data plane.** They are kept until
+they can be taken again on a cluster ([#32](https://github.com/drigolabs/drigodb/issues/32)). An early
+Docker measurement of the replacement puts a fresh database at ~64 MB rather than 73 MB — the saving is
+the catalog term only, since the ~33 MB WAL floor is set by `min_wal_size` and does not care which
+extension is installed.
 
 Storage, measured on DigitalOcean 2026-09-01:
 
@@ -287,15 +284,16 @@ provisioned volume size each — that is the term that grows with signups.
 
 **In migration.** The DocumentDB data plane is being replaced by plain PostgreSQL — decision and
 reasoning in [docs/leaving-documentdb.md](docs/leaving-documentdb.md), design in
-[docs/plans/](docs/plans/2026-09-03-postgres-document-store-migration-plan.md), tracked from #24. Until
-that lands, everything described here is the DocumentDB data plane.
+[docs/plans/](docs/plans/2026-09-03-postgres-document-store-migration-plan.md), tracked from #24.
+Decisions taken along the way are logged in [docs/decisions/](docs/decisions/).
 
-Built: images, per-database topology, isolation, the control-plane API, DigitalOcean deployment,
-physical backups behind a configured bucket.
+Built: per-database topology, isolation, the control-plane API, DigitalOcean deployment, and logical
+backups behind a configured bucket.
 
-Not built: public endpoints (databases are in-cluster only), TLS from a real issuer — the gateway
-self-signs, so clients pass `tlsAllowInvalidCertificates` — accounts, quotas, billing, restore as an
-API operation, backup retention, and vertical or storage autoscaling.
+Not built: public endpoints (databases are in-cluster only), TLS from a real issuer — the server
+self-signs, so clients pass `sslmode=require` rather than `verify-full` — accounts, quotas, billing,
+restore as an API operation, backup retention, and vertical or storage autoscaling. Nothing installs
+schema into a provisioned database yet ([#30](https://github.com/drigolabs/drigodb/issues/30)).
 
 ## Licence
 

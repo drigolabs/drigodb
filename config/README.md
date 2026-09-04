@@ -1,57 +1,49 @@
-# app-db
+# `config/`
 
-PostgreSQL configuration for a per-app database pod. Every drigodb app gets its own instance of this
-— see `docs/service-boundary.md` (U3), and
-`docs/documentdb-multitenancy-spike.md` for why isolation has to work this way.
+The PostgreSQL configuration every hosted database mounts. `scripts/deploy.sh` loads these files into
+the `drigodb-config` ConfigMap, so the shipped config is the deployed config, and a pod picks up a
+change on its next start — which is also its next wake.
 
-These three files become a ConfigMap mounted into the app's pod. U4 assembles the StatefulSet around
-them.
-
-| File | Purpose |
+| File | What it is |
 |---|---|
-| `postgresql.conf` | DocumentDB's required settings — preload libraries, the pg_cron database, socket directories, and the internal-connection redirects |
-| `pg_hba.conf` | Who may connect and how. **Order-sensitive**: the scoped gateway rule must be first |
-| `pg_ident.conf` | Maps the gateway's OS user onto the `documentdb_*` role groups. Requires PostgreSQL 16+ |
+| `postgresql.conf` | Listen address, the two socket directories, TLS, and WAL sized against the volume |
+| `pg_hba.conf` | Who may connect and how. **Order-sensitive**: pg_hba is first-match |
+| `bootstrap.sh` | The postgres container's entrypoint. Owns first-start initialisation, credential rotation, and the hand-off to the postmaster |
 
-## Why these files are not boilerplate
+## What is load-bearing
 
-Each setting was established by a failure in `images/documentdb-gateway/integration-test.sh`, and
-each failure looked like something other than its cause:
+**Two socket directories.** The default, plus `/sockets` on a volume shared with the backup sidecar.
+The sidecar reaches the server over that socket and authenticates by peer as the same UID, which is why
+backups need no credential of their own and open no network path. Drop the second directory and backups
+stop working.
 
-- Without the `pg_ident` `+group` map, the gateway cannot authenticate clients at all. Its system pool
-  connects as its own role, but each client's data pool connects **as that client's role with an empty
-  password**, which peer auth allows only through a group ident entry.
-- Without `documentdb.localhost_connection_string` and `cron.host` pointed at the socket, everything
-  appears to work — the client authenticates, the gateway is healthy — and then every write fails with
-  `fe_sendauth: no password supplied`, raised from inside `create_collection`. The extension's own
-  internal libpq connections default to `host=localhost` over TCP, where they have no password.
-- Without `documentdb_core.bsonUseEJson`, documents read back as `BSONHEX7500...` when inspected over
-  SQL, which is what an operator sees in DBeaver (U13).
-- `cron.database_name` is why a PostgreSQL cluster can host exactly one DocumentDB database. It is the
-  constraint the whole cluster-per-app design rests on.
+**TLS is generated, not shipped.** The image carries Debian's snakeoil pair, but its private key is
+`root:ssl-cert 0640` and Kubernetes does not grant a pod the image's group memberships — so using it
+would mean pinning `supplementalGroups` to an image-specific gid. `bootstrap.sh` generates a
+self-signed certificate into `PGDATA` at first start instead. Still self-signed, so clients pass
+`sslmode=require`; a real issuer is issue #9.
 
-The pod also has two hard requirements the config cannot express: **both containers must run as the
-same UID** (26), because PostgreSQL resolves the peer's UID against its own passwd database, and the
-gateway's PostgreSQL URL **must state port 5432 explicitly**, because the gateway defaults to 9712.
-Both live in `images/documentdb-gateway/README.md`.
+**`pg_hba.conf` admits exactly two things**: local socket connections by peer, and `appuser` over TLS
+into `app`. There is no rule for any other database, any other role, or the control plane. A leaked
+credential reaches one database.
 
-## Storage class
+**The control plane is deliberately absent.** It holds every database's credential but has no route to
+use one; schema changes reach a database through `bootstrap.sh` rather than over the network. The
+reasoning is in issue #29.
 
-Per the provider-differences-in-values pattern
-(`docs/solutions/best-practices/helm-routing-abstraction-2026-05-03.md`), the class name is
-configuration, not code:
+**`include`, not append.** `bootstrap.sh` appends an `include` line to the generated `postgresql.conf`
+at init time rather than copying settings into it, so a later config change takes effect on restart
+instead of being frozen into `PGDATA` on the day the database was created.
 
-| Environment | StorageClass | Notes |
-|---|---|---|
-| kind (local) | `standard` | rancher local-path provisioner, shipped with kind |
-| DOKS | `do-block-storage` | DigitalOcean Block Storage; expands online |
+**The credential fingerprint.** Rotation needs a running server, so it costs a start/stop cycle. The
+fingerprint in `PGDATA` is what makes that cost apply only when the password actually changed — an
+ordinary wake execs straight into the postmaster.
 
-U4 reads this from `OPENVOID_APP_DB_STORAGE_CLASS`, following the env-overridable routing constants
-already in `services/session-api/src/k8s/client.ts`.
+## History
 
-## Verifying the cluster can enforce isolation
-
-The NetworkPolicy in U4 is only one of three isolation layers, and it is the one that fails silently:
-kind's default CNI accepts policies and ignores them. `scripts/kind-up.sh` installs Calico instead, and
-`scripts/check-netpol.sh` proves enforcement with a baseline → deny → allow sequence. Run it before
-trusting any local isolation test.
+This directory used to carry DocumentDB's required settings — preload libraries, `cron.database_name`,
+the internal-connection redirects, and a `pg_ident.conf` mapping the gateway's OS user onto the
+`documentdb_*` role groups. All of it is gone with the extension and the gateway; see
+[docs/leaving-documentdb.md](../docs/leaving-documentdb.md) for why, and
+[docs/documentdb-multitenancy-spike.md](../docs/documentdb-multitenancy-spike.md) for the isolation
+findings that forced the original design.

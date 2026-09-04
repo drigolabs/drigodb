@@ -1,20 +1,43 @@
 # drigodb-backup
 
-Physical backups of a drigodb database to S3-compatible storage, run as a
+Logical backups of a drigodb database to S3-compatible storage, run as a
 sidecar in the database's own pod.
 
-## Why it is physical
+A backup is `pg_dump` of the app database, gzipped and streamed straight to
+object storage. A restore loads it into a running server with `psql`.
 
-`pg_dump` cannot produce a restorable backup of a DocumentDB database, and it
-fails at it *silently*.
+## Why it is logical, now that it can be
 
-`pg_dump` never dumps the data of a table belonging to an extension unless that
-extension marks it with `pg_extension_config_dump()`. Measured on 2026-09-03:
+It was `pg_basebackup` until PostgreSQL replaced DocumentDB, and not by
+preference. `pg_dump` never dumps the data of a table belonging to an extension
+unless that extension marks it with `pg_extension_config_dump()`, and DocumentDB
+marked none. Measured on 2026-09-03:
 
 | | belongs to the extension | dumped |
 |---|---|---|
 | `documentdb_data.documents_<n>` — a collection's rows | no | yes |
 | `documentdb_api_catalog.collections` — the registry | **yes** | **no** |
+
+A collection's rows were dumped; the registry that made them a collection was
+not. The restore completed with no error and every collection was invisible —
+the data was there and nothing could find it.
+
+With the extension gone that failure mode goes with it, and logical is strictly
+better on every axis that mattered:
+
+| | physical (`pg_basebackup`) | logical (`pg_dump`) |
+|---|---|---|
+| An empty database | ~73 MB | under a kilobyte |
+| Restores across PostgreSQL majors | no | yes |
+| Restore target | a data directory that does not exist yet | a running server |
+| Readable by hand | no | yes |
+
+That third row is why restore stops being a special case: a logical restore is
+an ordinary operation against a live database rather than a provision in
+disguise. See issue #31.
+
+<details>
+<summary>The original measurement, kept as the record of why physical was necessary</summary>
 
 ```
 SELECT extname, extconfig FROM pg_extension;
@@ -89,3 +112,5 @@ Starts MinIO and a PostgreSQL, writes 50 documents through the DocumentDB API,
 backs up, restores into a second instance with no cluster in it, and reads the
 documents back **through the API**. That last assertion is the point — it is
 what caught `pg_dump` restoring without error and losing every collection.
+
+</details>

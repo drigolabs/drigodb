@@ -22,7 +22,7 @@ import {
   EXTERNAL_ID_LABEL,
   MANAGED_BY_LABEL,
   MANAGED_BY_VALUE,
-  MONGO_PORT,
+  POSTGRES_PORT,
   TEMPLATE_HASH_ANNOTATION,
   buildNetworkPolicy,
   buildPodTemplate,
@@ -154,7 +154,7 @@ export class Provisioner {
       external_id: labels[EXTERNAL_ID_LABEL] ?? "",
       status,
       endpoint: endpointHost(id),
-      port: MONGO_PORT,
+      port: POSTGRES_PORT,
       created_at: sts.metadata?.creationTimestamp?.toISOString(),
     };
   }
@@ -218,9 +218,9 @@ export class Provisioner {
   // after create — so before this existed, a database kept its original
   // data-plane images forever, through any number of hibernate/wake cycles. A
   // rebuilt postgres image reached new databases only. So did every pod-template
-  // fix: the fsGroupChangePolicy that stopped PostgreSQL waking, and the gateway
-  // startup probe that made readiness mean "a client can connect", both landed
-  // for new databases and never for existing ones.
+  // fix: the fsGroupChangePolicy that stopped PostgreSQL waking landed for new
+  // databases and never for existing ones. It is also how the plain-PostgreSQL
+  // data plane reaches a database created before the migration.
   async wake(id: string): Promise<Database> {
     const sts = await this.statefulSetFor(id);
     // Read first, so waking something that does not exist is a 404 rather than
@@ -288,10 +288,11 @@ export class Provisioner {
   // keeps its data, keeps its volume, keeps costing money, and is unreachable.
   //
   // The password is applied by bootstrap.sh on the next start, not from here.
-  // The control plane cannot reach PostgreSQL — pg_hba admits TCP from
-  // localhost only and the Service exposes the gateway's port — and giving it a
-  // route in would mean holding a superuser credential for every database,
-  // which is the connection the isolation model exists to prevent.
+  // The Service does publish PostgreSQL's port now, but pg_hba admits only
+  // appuser over TLS into its own database. Rotating from here would mean a
+  // pg_hba rule and a DDL-capable credential per database that the control
+  // plane holds and can use — it already holds every credential; the point is
+  // that it cannot use one from where it runs. See issue #29.
   async rotateCredentials(id: string): Promise<{ database: Database; uri: string }> {
     const sts = await this.statefulSetFor(id);
     if (!sts) throw new NotFoundError(`no database with id ${id}`);

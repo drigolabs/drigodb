@@ -1,12 +1,13 @@
 // Kubernetes objects for one hosted database.
 //
-// A database is a PostgreSQL instance running the DocumentDB extension, plus a
-// MongoDB wire-protocol gateway, in a single pod. The two containers share a
-// pod out of necessity: the gateway reaches PostgreSQL only over a Unix socket
-// with peer auth, so they must share a filesystem.
+// A database is a plain PostgreSQL instance in its own pod, with its own volume,
+// its own credentials and its own NetworkPolicy. Applications connect over TCP
+// with an ordinary PostgreSQL driver.
 //
-// One instance per database is not a preference either — DocumentDB cannot
-// isolate tenants within an instance. See docs/documentdb-multitenancy-spike.md.
+// One instance per database was forced by DocumentDB, which cannot isolate
+// tenants within an instance (docs/documentdb-multitenancy-spike.md). That
+// constraint is gone, and the topology is now a choice: a shared tier is
+// possible and not yet built. See docs/leaving-documentdb.md.
 
 import { createHash } from "node:crypto";
 
@@ -42,29 +43,32 @@ export const TEMPLATE_HASH_ANNOTATION = "drigodb.io/template-hash";
 export const CONFIG_MAP_NAME = "drigodb-config";
 export const CONFIG_MOUNT_PATH = "/drigodb-config";
 
-// PostgreSQL's UID in the drigodb-postgres image. The gateway must run as the
-// same UID: PostgreSQL resolves the peer's UID against its own passwd database,
+// PostgreSQL's UID and GID in CNPG's image: `uid=26(postgres) gid=102(postgres)`.
+//
+// The GID is not 26. It was under our own image, and carrying that assumption
+// across would leave PGDATA group-owned by a group the server does not belong
+// to. The backup sidecar must run as the same UID, because peer auth over the
+// shared socket resolves the caller's UID against the server's passwd database
 // and a mismatch fails every connection.
+//
+// Group 101 (ssl-cert) is deliberately NOT requested. It is how the image's
+// snakeoil TLS key is readable, but Kubernetes does not grant a pod the image's
+// group memberships, so using that key would mean pinning supplementalGroups to
+// an image-specific gid. bootstrap.sh generates a certificate instead.
 export const RUN_AS_USER = 26;
+export const RUN_AS_GROUP = 102;
 
+// Shared with the backup sidecar, which reaches the server over this socket and
+// authenticates by peer. It outlived the gateway it was introduced for: a
+// socket is still how a backup runs without a credential or a network path.
 export const SOCKET_VOLUME = "socket";
 export const SOCKET_MOUNT_PATH = "/sockets";
 export const DATA_VOLUME = "data";
 export const DATA_MOUNT_PATH = "/var/lib/postgresql/data";
 export const PGDATA = `${DATA_MOUNT_PATH}/pgdata`;
 
-// The gateway writes a self-signed certificate at startup. The volume is
-// mounted over its whole state directory, not the tls subdirectory: the image
-// ships that directory drwxrwx--- owned by its packaged user, which the pod's
-// UID cannot traverse, and fsGroup fixes a mounted volume rather than the image
-// directory above it.
-export const GATEWAY_STATE_VOLUME = "gateway-state";
-export const GATEWAY_STATE_DIR = "/var/lib/documentdb-gateway";
-export const GATEWAY_TLS_DIR = `${GATEWAY_STATE_DIR}/tls`;
-
-export const MONGO_PORT = 27017;
-export const GATEWAY_PORT = 10260;
-export const GATEWAY_PORT_NAME = "mongo";
+export const POSTGRES_PORT = 5432;
+export const POSTGRES_PORT_NAME = "postgres";
 
 export const BACKUP_KEY_SECRET_KEY = "access_key";
 export const BACKUP_SECRET_SECRET_KEY = "secret_key";
@@ -74,14 +78,11 @@ export const DB_NAME = "app";
 export const PASSWORD_SECRET_KEY = "password";
 
 // Sized from measurement on an idle, freshly initialised database: PostgreSQL
-// settled at 110 MiB, the gateway at 4 MiB. Requests keep headroom because that
-// workload was empty.
+// settled at 110 MiB. Requests keep headroom because that workload was empty.
+// Re-measurement after the migration is issue #32.
 const PG_CPU_REQUEST = "100m";
 const PG_MEMORY_REQUEST = "256Mi";
 const PG_MEMORY_LIMIT = "1Gi";
-const GATEWAY_CPU_REQUEST = "50m";
-const GATEWAY_MEMORY_REQUEST = "32Mi";
-const GATEWAY_MEMORY_LIMIT = "256Mi";
 // Idle almost all the time; it streams a backup out on an interval and holds
 // nothing between them. Requests are what the scheduler reserves, so keeping
 // them small is what stops backups halving how many databases fit on a node.
@@ -115,10 +116,11 @@ export function endpointHost(id: string): string {
 
 export function connectionUri(id: string, password: string): string {
   return (
-    `mongodb://${DB_USER}:${encodeURIComponent(password)}@${endpointHost(id)}:${MONGO_PORT}/` +
-    // The gateway presents a self-signed certificate. A real issuer arrives
-    // with public endpoints; until then clients must accept it.
-    `?tls=true&tlsAllowInvalidCertificates=true&directConnection=true`
+    `postgres://${DB_USER}:${encodeURIComponent(password)}@${endpointHost(id)}:${POSTGRES_PORT}/${DB_NAME}` +
+    // require, not verify-full: bootstrap.sh generates a self-signed
+    // certificate, so a client can encrypt but cannot verify. A real issuer is
+    // issue #9, and it is what turns this into verify-full.
+    `?sslmode=require`
   );
 }
 
@@ -147,8 +149,8 @@ export function buildPodTemplate(id: string, externalId: string): V1PodTemplateS
     spec: {
       securityContext: {
         runAsUser: RUN_AS_USER,
-        runAsGroup: RUN_AS_USER,
-        fsGroup: RUN_AS_USER,
+        runAsGroup: RUN_AS_GROUP,
+        fsGroup: RUN_AS_GROUP,
         // Without this, Kubernetes recursively chmods g+rwX on every mount.
         // initdb creates PGDATA as 0700 on first boot, and the next mount
         // turns it group-writable — which PostgreSQL refuses to start on
@@ -176,6 +178,8 @@ export function buildPodTemplate(id: string, externalId: string): V1PodTemplateS
               },
             },
           ],
+          // Applications reach this directly now; there is no proxy in front.
+          ports: [{ name: POSTGRES_PORT_NAME, containerPort: POSTGRES_PORT }],
           volumeMounts: [
             { name: DATA_VOLUME, mountPath: DATA_MOUNT_PATH },
             { name: SOCKET_VOLUME, mountPath: SOCKET_MOUNT_PATH },
@@ -192,58 +196,22 @@ export function buildPodTemplate(id: string, externalId: string): V1PodTemplateS
             limits: { memory: PG_MEMORY_LIMIT },
           },
         },
-        {
-          name: "gateway",
-          image: config.gatewayImage,
-          env: [
-            { name: "DOCUMENTDB_PG_URL_FILE", value: `${CONFIG_MOUNT_PATH}/pg_url` },
-            { name: "DOCUMENTDB_TLS_STATE_DIR", value: GATEWAY_TLS_DIR },
-          ],
-          ports: [{ name: GATEWAY_PORT_NAME, containerPort: GATEWAY_PORT }],
-          volumeMounts: [
-            { name: SOCKET_VOLUME, mountPath: SOCKET_MOUNT_PATH },
-            { name: "config", mountPath: CONFIG_MOUNT_PATH, readOnly: true },
-            { name: GATEWAY_STATE_VOLUME, mountPath: GATEWAY_STATE_DIR },
-          ],
-          // Two probes, because they answer different questions and only
-          // both together mean "a client can connect".
-          //
-          // `check` verifies the backend is reachable and the extension is
-          // loaded. It says nothing about whether the gateway has bound its
-          // listener — it passes while the socket is still closed, which
-          // showed up as `connection refused` from a client the moment the
-          // pod reported Ready.
-          startupProbe: {
-            exec: { command: ["/usr/bin/documentdb-gateway", "check"] },
-            periodSeconds: 3,
-            failureThreshold: 40,
-          },
-          // Readiness is the listener actually accepting.
-          readinessProbe: {
-            tcpSocket: { port: GATEWAY_PORT_NAME },
-            periodSeconds: 3,
-            failureThreshold: 10,
-          },
-          resources: {
-            requests: { cpu: GATEWAY_CPU_REQUEST, memory: GATEWAY_MEMORY_REQUEST },
-            limits: { memory: GATEWAY_MEMORY_LIMIT },
-          },
-        },
         // Only when there is somewhere to put a backup. With no bucket
         // configured the pod is exactly what it was before, rather than
         // carrying a container that cannot do its job.
         ...(backupsEnabled()
           ? [
               {
-                // Backups run in the pod because nothing outside it can reach
-                // PostgreSQL: pg_hba admits TCP from localhost only, and the
-                // Service publishes the gateway's port. Sharing the pod means
-                // sharing the socket, which is the connection that already
-                // works and needs no new credential.
+                // Backups run in the pod so that they need no credential and
+                // no network path. The Service does now publish PostgreSQL's
+                // port, but pg_hba admits only appuser over TLS into its own
+                // database — a backup connecting that way would need a
+                // credential of its own. Over the shared socket it authenticates
+                // by peer as the pod's UID, which is the connection that already
+                // works.
                 //
-                // No data volume. pg_basebackup streams over that socket, so
-                // mounting the volume would only add a second path to the bytes
-                // being copied.
+                // No data volume. pg_dump streams over that socket, so mounting
+                // the volume would only add a second path to the same bytes.
                 name: "backup",
                 image: config.backup.image,
                 env: [
@@ -282,11 +250,10 @@ export function buildPodTemplate(id: string, externalId: string): V1PodTemplateS
       ],
       volumes: [
         { name: SOCKET_VOLUME, emptyDir: {} },
-        { name: GATEWAY_STATE_VOLUME, emptyDir: {} },
         {
           name: "config",
-          // 0640 rather than 0644: the gateway warns when its URL file is
-          // world-readable.
+          // 0640 rather than 0644: these files are read by the pod's own UID
+          // and group, and nothing else needs them.
           configMap: { name: CONFIG_MAP_NAME, defaultMode: 0o640 },
         },
       ],
@@ -369,9 +336,9 @@ export function buildService(id: string, externalId: string): V1Service {
       selector: { [DB_ID_LABEL]: id },
       ports: [
         {
-          name: GATEWAY_PORT_NAME,
-          port: MONGO_PORT,
-          targetPort: GATEWAY_PORT_NAME,
+          name: POSTGRES_PORT_NAME,
+          port: POSTGRES_PORT,
+          targetPort: POSTGRES_PORT_NAME,
           protocol: "TCP",
         },
       ],
@@ -409,7 +376,7 @@ export function buildNetworkPolicy(id: string, externalId: string): V1NetworkPol
               podSelector: { matchLabels: { [ALLOW_LABEL]: id } },
             },
           ],
-          ports: [{ protocol: "TCP", port: GATEWAY_PORT }],
+          ports: [{ protocol: "TCP", port: POSTGRES_PORT }],
         },
       ],
     },

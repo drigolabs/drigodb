@@ -2,14 +2,14 @@
 #
 # WHY THIS RUNS INSIDE THE DATABASE POD
 #
-# config/pg_hba.conf admits TCP from 127.0.0.1 and ::1 only, and the Service
-# publishes the gateway's port rather than PostgreSQL's. Nothing outside the pod
-# can reach the server. A backup Job would therefore need a pg_hba rule, a
-# NetworkPolicy hole and a credential of its own — reopening the network path to
-# PostgreSQL that the isolation model deliberately closes.
+# The Service publishes PostgreSQL's port, but config/pg_hba.conf admits only
+# appuser, over TLS, into its own database. A backup Job outside the pod would
+# therefore need its own pg_hba rule, a NetworkPolicy hole and a credential of
+# its own — reopening the network path the isolation model deliberately closes
+# (issue #29).
 #
-# As a sidecar it reaches the server over the Unix socket the gateway already
-# uses, authenticating by peer as the same UID. No new auth, no new route.
+# As a sidecar it reaches the server over a Unix socket on a shared volume,
+# authenticating by peer as the same UID. No new auth, no new route.
 #
 # WHY IT IS BUILT FROM THE POSTGRES IMAGE
 #
@@ -18,10 +18,10 @@
 # remembering to bump two versions together. It is also nearly free at runtime:
 # the pod already pulls this image for its postgres container, so every layer
 # below rclone is shared and nothing extra is downloaded onto the node.
-# The floating tag: it always names the current build of this upstream release,
-# which is the postgres image these databases actually run. CI overrides it with
-# the tag it has just published, so the two can never drift apart.
-ARG POSTGRES_IMAGE=ghcr.io/drigolabs/drigodb-postgres:18-0.116-0
+# The same image the database runs, so pg_dump can never be older than the
+# server it dumps. CNPG publish and patch it; drigodb no longer maintains a
+# postgres base of its own. See docs/leaving-documentdb.md.
+ARG POSTGRES_IMAGE=ghcr.io/cloudnative-pg/postgresql:18
 
 FROM ${POSTGRES_IMAGE}
 
@@ -46,9 +46,9 @@ RUN set -eux; \
 COPY backup.sh /usr/local/bin/drigodb-backup
 RUN chmod 0755 /usr/local/bin/drigodb-backup
 
-# The PostgreSQL server's UID. Peer auth resolves the caller's UID against the
-# server's own passwd database, so this must match or every connection fails —
-# the same constraint the gateway image documents.
+# The PostgreSQL server's UID in this image. Peer auth resolves the caller's UID
+# against the server's own passwd database, so this must match or every
+# connection fails.
 USER 26
 
 ENTRYPOINT ["/usr/local/bin/drigodb-backup"]

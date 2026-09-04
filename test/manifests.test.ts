@@ -1,5 +1,7 @@
 // Pins the contract that was expensive to discover, where every failure mode is
-// silent rather than loud. See docs/documentdb-multitenancy-spike.md.
+// silent rather than loud. See docs/leaving-documentdb.md for what changed when
+// the extension and the gateway went, and docs/documentdb-multitenancy-spike.md
+// for the isolation findings that shaped what stayed.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -8,8 +10,8 @@ import {
   DATA_VOLUME,
   DB_ID_LABEL,
   EXTERNAL_ID_LABEL,
-  GATEWAY_PORT,
-  MONGO_PORT,
+  POSTGRES_PORT,
+  RUN_AS_GROUP,
   RUN_AS_USER,
   SOCKET_MOUNT_PATH,
   SOCKET_VOLUME,
@@ -26,18 +28,32 @@ const ID = "a1b2c3d4e5f6";
 const EXT = "openvoid-app-01JQ";
 
 describe("statefulset", () => {
-  it("runs both containers as the PostgreSQL UID", () => {
-    // PostgreSQL resolves the gateway's peer UID against its own passwd
-    // database; a mismatch fails every connection.
-    expect(buildStatefulSet(ID, EXT).spec?.template.spec?.securityContext?.runAsUser).toBe(RUN_AS_USER);
+  it("runs as the image's postgres UID and GID, which are not the same number", () => {
+    // uid=26(postgres) gid=102(postgres) in CNPG's image. Carrying the old
+    // assumption that both were 26 would leave PGDATA group-owned by a group
+    // the server does not belong to.
+    const ctx = buildStatefulSet(ID, EXT).spec?.template.spec?.securityContext;
+    expect(ctx?.runAsUser).toBe(RUN_AS_USER);
+    expect(ctx?.runAsGroup).toBe(RUN_AS_GROUP);
+    expect(ctx?.fsGroup).toBe(RUN_AS_GROUP);
+    expect(RUN_AS_GROUP).not.toBe(RUN_AS_USER);
   });
 
-  it("mounts the shared socket into both containers", () => {
+  it("runs postgres alone, with no proxy in front of it", () => {
     const containers = buildStatefulSet(ID, EXT).spec?.template.spec?.containers ?? [];
-    expect(containers.map((c) => c.name).sort()).toEqual(["gateway", "postgres"]);
-    for (const c of containers) {
-      expect((c.volumeMounts ?? []).map((m) => m.mountPath)).toContain(SOCKET_MOUNT_PATH);
-    }
+    expect(containers.map((c) => c.name)).toEqual(["postgres"]);
+  });
+
+  it("keeps the shared socket, which outlived the gateway", () => {
+    // The backup sidecar reaches the server over it and authenticates by peer,
+    // which is why backups need no credential and no network path.
+    const pg = buildStatefulSet(ID, EXT).spec?.template.spec?.containers?.[0];
+    expect((pg?.volumeMounts ?? []).map((m) => m.mountPath)).toContain(SOCKET_MOUNT_PATH);
+  });
+
+  it("publishes PostgreSQL's port from the container", () => {
+    const pg = buildStatefulSet(ID, EXT).spec?.template.spec?.containers?.[0];
+    expect(pg?.ports?.[0]?.containerPort).toBe(POSTGRES_PORT);
   });
 
   it("does not let fsGroup break PostgreSQL on remount", () => {
@@ -53,28 +69,6 @@ describe("statefulset", () => {
     // The alternative silently deletes a customer's data.
     expect(spec?.persistentVolumeClaimRetentionPolicy?.whenScaled).toBe("Retain");
     expect(spec?.persistentVolumeClaimRetentionPolicy?.whenDeleted).toBe("Retain");
-  });
-
-  it("mounts the gateway's state volume over the parent directory", () => {
-    // The image ships /var/lib/documentdb-gateway as drwxrwx--- owned by its
-    // packaged user, which the pod's UID cannot traverse. fsGroup fixes a
-    // mounted volume, not the image directory above it.
-    const gw = buildStatefulSet(ID, EXT).spec?.template.spec?.containers?.find(
-      (c) => c.name === "gateway",
-    );
-    const mount = (gw?.volumeMounts ?? []).find((m) => m.name === "gateway-state");
-    expect(mount?.mountPath).toBe("/var/lib/documentdb-gateway");
-  });
-
-  it("separates 'backend works' from 'listener accepts'", () => {
-    // `check` passes while the gateway's socket is still closed, so using it
-    // for readiness reports Ready before a client can connect.
-    const gw = buildStatefulSet(ID, EXT).spec?.template.spec?.containers?.find(
-      (c) => c.name === "gateway",
-    );
-    expect(gw?.startupProbe?.exec?.command).toEqual(["/usr/bin/documentdb-gateway", "check"]);
-    expect(gw?.readinessProbe?.tcpSocket?.port).toBe("mongo");
-    expect(gw?.readinessProbe?.exec).toBeUndefined();
   });
 
   it("never inlines the password", () => {
@@ -96,17 +90,17 @@ describe("network policy", () => {
     expect(Array.isArray(rule._from)).toBe(true);
   });
 
-  it("admits only pods opted in to this database, on the gateway port", () => {
+  it("admits only pods opted in to this database, on PostgreSQL's port", () => {
     const rule = buildNetworkPolicy(ID, EXT).spec?.ingress?.[0];
     expect(rule?._from?.[0]?.podSelector?.matchLabels?.[ALLOW_LABEL]).toBe(ID);
-    expect(rule?.ports?.[0]?.port).toBe(GATEWAY_PORT);
+    expect(rule?.ports?.[0]?.port).toBe(POSTGRES_PORT);
   });
 });
 
 describe("service and identity", () => {
-  it("exposes the Mongo port and selects only this database", () => {
+  it("exposes PostgreSQL's port and selects only this database", () => {
     const svc = buildService(ID, EXT);
-    expect(svc.spec?.ports?.[0]?.port).toBe(MONGO_PORT);
+    expect(svc.spec?.ports?.[0]?.port).toBe(POSTGRES_PORT);
     expect(svc.spec?.selector).toEqual({ [DB_ID_LABEL]: ID });
   });
 
@@ -119,6 +113,16 @@ describe("service and identity", () => {
 
   it("percent-encodes the password in the connection URI", () => {
     expect(connectionUri(ID, "p@ss:w/rd")).toContain("p%40ss%3Aw%2Frd");
+  });
+
+  it("hands out a PostgreSQL URI, naming the database and requiring TLS", () => {
+    // The contract consumers hold. sslmode=require rather than verify-full,
+    // because bootstrap.sh self-signs; issue #9 is what upgrades it.
+    const uri = connectionUri(ID, "pw");
+    expect(uri.startsWith("postgres://appuser:pw@")).toBe(true);
+    expect(uri).toContain(`:${POSTGRES_PORT}/app`);
+    expect(uri).toContain("sslmode=require");
+    expect(uri).not.toContain("mongodb://");
   });
 });
 
@@ -155,7 +159,7 @@ describe("backup sidecar", () => {
 
   it("adds no sidecar when nothing is configured", () => {
     const containers = buildStatefulSet(ID, EXT).spec?.template.spec?.containers ?? [];
-    expect(containers.map((c) => c.name).sort()).toEqual(["gateway", "postgres"]);
+    expect(containers.map((c) => c.name)).toEqual(["postgres"]);
   });
 
   it("adds one when a bucket and an endpoint are set", async () => {
@@ -164,7 +168,7 @@ describe("backup sidecar", () => {
       DRIGODB_BACKUP_ENDPOINT: "https://fra1.digitaloceanspaces.com",
     });
     const containers = m.buildStatefulSet(ID, EXT).spec?.template.spec?.containers ?? [];
-    expect(containers.map((c) => c.name).sort()).toEqual(["backup", "gateway", "postgres"]);
+    expect(containers.map((c) => c.name).sort()).toEqual(["backup", "postgres"]);
   });
 
   it("stays off when only half of it is configured", async () => {

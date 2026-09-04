@@ -1,29 +1,27 @@
 #!/usr/bin/env bash
 # Back a drigodb database up to S3-compatible storage, and restore one back.
 #
-# WHY PHYSICAL AND NOT pg_dump
+# WHY LOGICAL, NOW THAT IT CAN BE
 #
-# pg_dump cannot produce a restorable backup of a DocumentDB database, and fails
-# at it silently. It never dumps the data of tables belonging to an extension
-# unless that extension marks them with pg_extension_config_dump(). DocumentDB
-# marks none: `SELECT extconfig FROM pg_extension WHERE extname='documentdb'`
-# is NULL, where pg_cron marks four tables and PostGIS marks spatial_ref_sys.
+# This used to be pg_basebackup, and not by preference. pg_dump never dumps the
+# data of tables belonging to an extension unless that extension marks them with
+# pg_extension_config_dump(), and DocumentDB marked none — so a logical restore
+# completed without error and left every collection invisible. Physical was the
+# only correct option, at a ~73 MB floor per backup and restores only into the
+# same PostgreSQL major version.
 #
-# A collection's rows live in documentdb_data.documents_<n>, which is created at
-# runtime and IS dumped. The registry that makes those rows a collection lives
-# in documentdb_api_catalog.collections, which belongs to the extension and is
-# NOT. So a logical restore completes without error and leaves every collection
-# invisible — the data is there, and nothing can find it. An explicit -t does
-# not override this; the dump comes back empty.
+# With the extension gone, pg_dump is correct again and strictly better: an
+# empty database dumps to under a kilobyte instead of 73 MB, the output restores
+# across major versions, and it can be read. Verified in issue #31 — 1000 rows
+# with a GIN and an expression index, dumped and restored intact.
 #
-# pg_basebackup copies the cluster, catalogs included, so it is correct by
-# construction. The cost is that a backup is the whole cluster — a ~73 MB floor
-# even for an empty database — and restores only into the same PostgreSQL major
-# version, which this image guarantees by deriving from the server's own image.
+# A dump is one database, not the cluster, which is also what makes restore an
+# ordinary operation: it loads into a running server rather than replacing a
+# data directory.
 #
 #   drigodb-backup once            one backup, then exit
 #   drigodb-backup run             back up whenever one is due, forever
-#   drigodb-backup restore KEY     unpack that backup into an EMPTY PGDATA
+#   drigodb-backup restore KEY     load that dump into the app database
 #   drigodb-backup latest          print the newest object key, if any
 #
 # Configuration, all from the environment:
@@ -36,7 +34,7 @@
 #   DRIGODB_BACKUP_INTERVAL  seconds between backups (default 86400)
 #   APP_DB_NAME              database to probe for readiness (default app)
 #   PGHOST                   socket directory (default /sockets)
-#   PGDATA                   restore target; must be empty (restore only)
+#   DRIGODB_RESTORE_FORCE    set to 1 to load into a non-empty database
 set -euo pipefail
 
 DB_ID="${DRIGODB_DATABASE_ID:?DRIGODB_DATABASE_ID must be set}"
@@ -76,27 +74,27 @@ wait_for_server() {
 # UTC timestamp. Missing prefix is not an error — it is a database that has
 # never been backed up.
 latest_key() {
-  rclone lsf "${PREFIX}/" 2>/dev/null | grep '\.tar\.gz$' | sort | tail -1
+  rclone lsf "${PREFIX}/" 2>/dev/null | grep '\.sql\.gz$' | sort | tail -1
 }
 
 backup() {
   local key ts
   ts="$(date -u +%Y%m%dT%H%M%SZ)"
-  key="${ts}.tar.gz"
-  log "backing up the cluster to ${DB_ID}/${key}"
+  key="${ts}.sql.gz"
+  log "backing up ${APP_DB} to ${DB_ID}/${key}"
 
-  # -D - writes a tar to stdout, which requires -Ft and rules out -X stream:
-  # streaming WAL needs a second connection and a real directory. -X fetch
-  # collects the WAL generated during the copy at the end instead, which is what
-  # makes the archive self-contained and restorable on its own.
-  #
   # Piped straight out rather than staged on disk. The volume is sized for the
   # database, not for a copy of it — on a 1Gi volume, staging a backup is how a
   # backup fills the disk it exists to protect.
   #
-  # --checkpoint=fast so this does not wait out a scheduled checkpoint; the
-  # extra I/O is cheaper than holding the backup open.
-  pg_basebackup -U postgres -D - -Ft -z -X fetch --checkpoint=fast \
+  # Plain SQL rather than -Fc: it compresses to about the same size through gzip,
+  # and it can be read and partially recovered by hand, which matters more for a
+  # backup than pg_restore's selective-restore options do.
+  #
+  # As postgres over the socket, so the dump includes objects appuser does not
+  # own and needs no credential.
+  pg_dump -U postgres -d "$APP_DB" --no-owner --no-privileges \
+    | gzip -c \
     | rclone rcat "${PREFIX}/${key}"
 
   log "wrote ${DB_ID}/${key}"
@@ -109,7 +107,7 @@ due() {
 
   now="$(date -u +%s)"
   # 20260903T101500Z -> a form date can parse.
-  age=$(( now - $(date -u -d "$(echo "${newest%.tar.gz}" | sed -E 's/^(.{4})(.{2})(.{2})T(.{2})(.{2})(.{2})Z$/\1-\2-\3 \4:\5:\6/')" +%s 2>/dev/null || echo 0) ))
+  age=$(( now - $(date -u -d "$(echo "${newest%.sql.gz}" | sed -E 's/^(.{4})(.{2})(.{2})T(.{2})(.{2})(.{2})Z$/\1-\2-\3 \4:\5:\6/')" +%s 2>/dev/null || echo 0) ))
   [ "$age" -ge "$INTERVAL" ]
 }
 
@@ -145,21 +143,24 @@ case "${1:-run}" in
     ;;
   restore)
     KEY="${2:?restore needs an object key}"
-    : "${PGDATA:?PGDATA must be set for a restore}"
-    # A physical restore replaces a data directory; it does not load into a
-    # running server. So the target must be a cluster that does not exist yet —
-    # refusing a populated PGDATA rather than unpacking over someone's data.
-    if [ -e "${PGDATA}/PG_VERSION" ]; then
-      log "refusing to restore over the existing cluster at ${PGDATA}"
+    wait_for_server
+    # A logical restore loads into a running server, so unlike the physical one
+    # it does not need an empty data directory — but it also does not replace
+    # what is there. Loading a dump over a populated database leaves a mixture of
+    # both, which is worse than either. Refuse by default.
+    if [ "$(psql -U postgres -d "$APP_DB" -tAc \
+              "select count(*) from pg_class c join pg_namespace n on n.oid=c.relnamespace \
+               where n.nspname not in ('pg_catalog','information_schema') and c.relkind='r'")" != "0" ] \
+       && [ "${DRIGODB_RESTORE_FORCE:-0}" != "1" ]; then
+      log "refusing to restore into a non-empty ${APP_DB}; set DRIGODB_RESTORE_FORCE=1 to override"
       exit 1
     fi
-    mkdir -p "$PGDATA"
-    log "unpacking ${DB_ID}/${KEY} into ${PGDATA}"
-    rclone cat "${PREFIX}/${KEY}" | tar -xzf - -C "$PGDATA"
-    # PostgreSQL refuses to start on a data directory that is group- or
-    # world-readable, and tar restores whatever modes the archive carries.
-    chmod 0700 "$PGDATA"
-    log "restored; the server will recover on its next start"
+    log "loading ${DB_ID}/${KEY} into ${APP_DB}"
+    # ON_ERROR_STOP so a half-applied dump fails loudly instead of reporting
+    # success over a database missing whatever errored.
+    rclone cat "${PREFIX}/${KEY}" | gunzip -c \
+      | psql -U postgres -d "$APP_DB" -v ON_ERROR_STOP=1 -q
+    log "restored"
     ;;
   *)
     echo "unknown command: $1" >&2
