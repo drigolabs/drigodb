@@ -46,6 +46,20 @@ spec:
               value: ghcr.io/drigolabs/drigodb-postgres:18-0.116-0-20260831-b1
             - name: DRIGODB_GATEWAY_IMAGE
               value: ghcr.io/drigolabs/drigodb-gateway:0.116-0-20260831-b1
+            - name: DRIGODB_BACKUP_IMAGE
+              value: ghcr.io/drigolabs/drigodb-backup:18-0.116-0
+            # Backups are off until a bucket and an endpoint are set. Empty
+            # here on purpose: with no destination configured no sidecar is
+            # added, and a database is exactly what it was before. Set these
+            # and create the drigodb-backup-credentials Secret to turn them on
+            # — existing databases pick the sidecar up on their next wake,
+            # through the same template reconcile that carries image updates.
+            - name: DRIGODB_BACKUP_BUCKET
+              value: ""
+            - name: DRIGODB_BACKUP_ENDPOINT
+              value: ""
+            - name: DRIGODB_BACKUP_INTERVAL
+              value: "86400"
           readinessProbe:
             httpGet: { path: /healthz, port: http }
             initialDelaySeconds: 3

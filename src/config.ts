@@ -46,7 +46,27 @@ export const config = {
 
   // The DNS suffix used to build connection endpoints. In-cluster for v0.0.1.
   endpointSuffix: envOr("DRIGODB_ENDPOINT_SUFFIX", "svc.cluster.local"),
+
+  // Backups. Off unless a bucket and an endpoint are configured — with neither,
+  // no sidecar is added and a database is exactly what it was before. That
+  // matters because a half-configured backup must not be the reason a database
+  // fails to start.
+  backup: {
+    bucket: envOr("DRIGODB_BACKUP_BUCKET", ""),
+    endpoint: envOr("DRIGODB_BACKUP_ENDPOINT", ""),
+    intervalSeconds: envOr("DRIGODB_BACKUP_INTERVAL", "86400"),
+    image: envOr("DRIGODB_BACKUP_IMAGE", "ghcr.io/drigolabs/drigodb-backup:18-0.116-0"),
+    // Holds access_key and secret_key. Cluster-wide rather than per database:
+    // one bucket, one credential, and the object prefix is what separates
+    // tenants inside it.
+    secretName: envOr("DRIGODB_BACKUP_SECRET", "drigodb-backup-credentials"),
+  },
 } as const;
+
+// Backups are configured only when there is somewhere to put them.
+export function backupsEnabled(): boolean {
+  return config.backup.bucket !== "" && config.backup.endpoint !== "";
+}
 
 // Read lazily so tests and `--help`-style invocations do not need a token.
 export function apiToken(): string {

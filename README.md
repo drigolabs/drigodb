@@ -192,6 +192,44 @@ create and approve pull requests* stays off.
 `scripts/publish-images.sh` and `scripts/deploy.sh` still work by hand — for publishing off a branch,
 bisecting a build, or bootstrapping a registry. They are the escape hatch, not the route.
 
+## Backups
+
+Off by default. Set a bucket and an endpoint and every database gains a sidecar that streams a
+physical backup to S3-compatible storage on an interval.
+
+```bash
+kubectl create secret generic drigodb-backup-credentials -n drigodb-databases \
+  --from-literal=access_key=... --from-literal=secret_key=...
+
+# then, on the control plane
+DRIGODB_BACKUP_BUCKET=my-bucket
+DRIGODB_BACKUP_ENDPOINT=https://fra1.digitaloceanspaces.com
+```
+
+Existing databases pick the sidecar up on their next wake, through the same template reconcile that
+carries image updates. With no bucket configured no sidecar is added at all — a database is exactly
+what it was before, rather than one carrying a container that cannot do its job.
+
+**Physical, not logical, and that is not a preference.** `pg_dump` cannot back up a DocumentDB
+database: it never dumps the data of tables belonging to an extension, and `documentdb` marks none of
+its catalog for dumping. A collection's rows are dumped; the registry that makes them a collection is
+not. The restore completes with no error and every collection is invisible. `pg_basebackup` copies
+the cluster, catalogs included, so it is correct by construction — at the cost of a ~73 MB floor per
+backup and restores only into the same PostgreSQL major version.
+[Full write-up](images/documentdb-backup/README.md).
+
+**A broken bucket cannot take a database offline.** The sidecar carries no probes and absorbs its own
+failures. A readiness probe would put backups on the pod's Ready condition, and a NotReady pod leaves
+its Service — so an unreachable bucket would sever a database that is working perfectly well.
+
+**A hibernated database is not backed up, and does not need to be.** No pod means no writes, so
+nothing can have changed since the last backup. The sidecar only exists while the database is awake,
+which is the only time it can have anything new to say.
+
+**Restore is not wired to the API yet.** The image can do it by hand — `drigodb-backup restore KEY`
+unpacks an archive into an empty `PGDATA`, and refuses one that already holds a cluster. Making that
+an operation is the next piece of work.
+
 ## Measured
 
 | | warm cache, single node | DigitalOcean, `s-2vcpu-4gb` |
@@ -238,8 +276,8 @@ provisioned volume size each — that is the term that grows with signups.
 Built: images, per-database topology, isolation, the control-plane API, DigitalOcean deployment.
 
 Not built: public endpoints (databases are in-cluster only), TLS from a real issuer — the gateway
-self-signs, so clients pass `tlsAllowInvalidCertificates` — accounts, quotas, billing, backups,
-credential rotation, and vertical or storage autoscaling.
+self-signs, so clients pass `tlsAllowInvalidCertificates` — accounts, quotas, billing, restore as an
+API operation, backup retention, and vertical or storage autoscaling.
 
 ## Licence
 
