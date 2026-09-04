@@ -1,19 +1,25 @@
 # drigodb
 
-MongoDB-compatible databases on PostgreSQL, provisioned through an API.
+PostgreSQL databases, provisioned through an API.
 
-Each database is a PostgreSQL instance running the [DocumentDB](https://github.com/documentdb/documentdb)
-extension behind a MongoDB wire-protocol gateway, so applications connect with an ordinary MongoDB
-driver. Databases hibernate when idle — **zero compute, storage only** — and wake in about eight
+Each database is a PostgreSQL instance with its own volume, its own credentials and its own network
+policy. Databases hibernate when idle — **zero compute, storage only** — and wake in about eight
 seconds.
 
-> **v0.0.1.** The control plane runs on Kubernetes and provisions real databases. There is no public
-> endpoint, no accounts, no quotas and no backups yet. See [Status](#status).
+> **v0.0.1, mid-migration.** What is deployed today is a PostgreSQL instance running the
+> [DocumentDB](https://github.com/documentdb/documentdb) extension behind a MongoDB wire-protocol
+> gateway, and it still hands out a `mongodb://` URI. That data plane is being replaced by plain
+> PostgreSQL: MongoDB compatibility is dropped, the gateway goes, and `connection_uri` becomes a
+> `postgres://` string. The reasoning is in [docs/leaving-documentdb.md](docs/leaving-documentdb.md).
+> Everything below describes what runs today and changes as the migration lands.
+>
+> There is no public endpoint, no accounts and no quotas. Backups exist but are off unless a bucket is
+> configured. See [Status](#status).
 
 ## Why one instance per database
 
-The obvious design — one shared instance, a database per tenant — does not work, and the reason is
-worth stating up front because everything here follows from it.
+The obvious design — one shared instance, a database per tenant — does not work *with DocumentDB*, and
+the reason is worth keeping because it is what the current topology was built around.
 
 DocumentDB's shipped roles are cluster-wide. `documentdb_readwrite_role` cannot create or read a
 collection at all, and `documentdb_admin_role`, the only role that can do useful work, owns every
@@ -25,6 +31,12 @@ hard dependency of the extension and binds to one database per cluster, so the e
 be installed once per instance.
 
 Full write-up, with the commands: [docs/documentdb-multitenancy-spike.md](docs/documentdb-multitenancy-spike.md).
+
+**This constraint is being removed.** Leaving DocumentDB makes a shared instance possible for the first
+time — many app databases in one cluster, isolated by ordinary PostgreSQL roles rather than by a
+catalog column. The migration itself does not change the topology: one instance per database stays,
+but as a choice rather than a forced move, and a shared tier becomes work that can be scheduled instead
+of work the engine forbids.
 
 ## Isolation
 
@@ -273,7 +285,13 @@ provisioned volume size each — that is the term that grows with signups.
 
 ## Status
 
-Built: images, per-database topology, isolation, the control-plane API, DigitalOcean deployment.
+**In migration.** The DocumentDB data plane is being replaced by plain PostgreSQL — decision and
+reasoning in [docs/leaving-documentdb.md](docs/leaving-documentdb.md), design in
+[docs/plans/](docs/plans/2026-09-03-postgres-document-store-migration-plan.md), tracked from #24. Until
+that lands, everything described here is the DocumentDB data plane.
+
+Built: images, per-database topology, isolation, the control-plane API, DigitalOcean deployment,
+physical backups behind a configured bucket.
 
 Not built: public endpoints (databases are in-cluster only), TLS from a real issuer — the gateway
 self-signs, so clients pass `tlsAllowInvalidCertificates` — accounts, quotas, billing, restore as an
