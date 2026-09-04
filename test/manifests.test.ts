@@ -1,21 +1,24 @@
 // Pins the contract that was expensive to discover, where every failure mode is
 // silent rather than loud. See docs/documentdb-multitenancy-spike.md.
 
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ALLOW_LABEL,
+  DATA_VOLUME,
   DB_ID_LABEL,
   EXTERNAL_ID_LABEL,
   GATEWAY_PORT,
   MONGO_PORT,
   RUN_AS_USER,
   SOCKET_MOUNT_PATH,
+  SOCKET_VOLUME,
   buildNetworkPolicy,
   buildSecret,
   buildService,
   buildStatefulSet,
   connectionUri,
+  templateHash,
 } from "../src/k8s/manifests.js";
 import { ValidationError, validateExternalId } from "../src/k8s/provisioner.js";
 
@@ -131,5 +134,81 @@ describe("external_id validation", () => {
     for (const v of ["", "-leading", "trailing-", "has space", "a".repeat(64), 42, null]) {
       expect(() => validateExternalId(v)).toThrow(ValidationError);
     }
+  });
+});
+
+// Backups are opt-in, and the shape of the opt-out matters as much as the
+// opt-in: with no destination configured a database must be exactly what it was
+// before, not a pod carrying a container that cannot do its job.
+describe("backup sidecar", () => {
+  async function withBackupEnv(env: Record<string, string>) {
+    vi.resetModules();
+    for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v);
+    const m = await import("../src/k8s/manifests.js");
+    return m;
+  }
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it("adds no sidecar when nothing is configured", () => {
+    const containers = buildStatefulSet(ID, EXT).spec?.template.spec?.containers ?? [];
+    expect(containers.map((c) => c.name).sort()).toEqual(["gateway", "postgres"]);
+  });
+
+  it("adds one when a bucket and an endpoint are set", async () => {
+    const m = await withBackupEnv({
+      DRIGODB_BACKUP_BUCKET: "drigodb-backups",
+      DRIGODB_BACKUP_ENDPOINT: "https://fra1.digitaloceanspaces.com",
+    });
+    const containers = m.buildStatefulSet(ID, EXT).spec?.template.spec?.containers ?? [];
+    expect(containers.map((c) => c.name).sort()).toEqual(["backup", "gateway", "postgres"]);
+  });
+
+  it("stays off when only half of it is configured", async () => {
+    // A bucket with nowhere to send it is a misconfiguration, and the safe
+    // reading of a misconfiguration is "backups are off", not "add a container
+    // that will fail".
+    const m = await withBackupEnv({ DRIGODB_BACKUP_BUCKET: "drigodb-backups" });
+    const containers = m.buildStatefulSet(ID, EXT).spec?.template.spec?.containers ?? [];
+    expect(containers.map((c) => c.name)).not.toContain("backup");
+  });
+
+  it("carries no probe, so a broken bucket cannot take the database offline", async () => {
+    // A readiness probe here would put backups on the pod's Ready condition,
+    // and a NotReady pod is removed from its Service. An unreachable bucket
+    // would then sever a database that is working perfectly well.
+    const m = await withBackupEnv({
+      DRIGODB_BACKUP_BUCKET: "drigodb-backups",
+      DRIGODB_BACKUP_ENDPOINT: "https://fra1.digitaloceanspaces.com",
+    });
+    const backup = (m.buildStatefulSet(ID, EXT).spec?.template.spec?.containers ?? [])
+      .find((c) => c.name === "backup");
+    expect(backup?.readinessProbe).toBeUndefined();
+    expect(backup?.livenessProbe).toBeUndefined();
+    expect(backup?.startupProbe).toBeUndefined();
+  });
+
+  it("reaches PostgreSQL by socket and never mounts the data volume", async () => {
+    const m = await withBackupEnv({
+      DRIGODB_BACKUP_BUCKET: "drigodb-backups",
+      DRIGODB_BACKUP_ENDPOINT: "https://fra1.digitaloceanspaces.com",
+    });
+    const backup = (m.buildStatefulSet(ID, EXT).spec?.template.spec?.containers ?? [])
+      .find((c) => c.name === "backup");
+    const mounts = (backup?.volumeMounts ?? []).map((v) => v.name);
+    expect(mounts).toEqual([SOCKET_VOLUME]);
+    expect(mounts).not.toContain(DATA_VOLUME);
+  });
+
+  it("changes the template hash, so existing databases gain it on their next wake", async () => {
+    const before = templateHash(ID, EXT);
+    const m = await withBackupEnv({
+      DRIGODB_BACKUP_BUCKET: "drigodb-backups",
+      DRIGODB_BACKUP_ENDPOINT: "https://fra1.digitaloceanspaces.com",
+    });
+    expect(m.templateHash(ID, EXT)).not.toBe(before);
   });
 });

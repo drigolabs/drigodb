@@ -43,6 +43,9 @@ DB_ID="${DRIGODB_DATABASE_ID:?DRIGODB_DATABASE_ID must be set}"
 BUCKET="${DRIGODB_BACKUP_BUCKET:?DRIGODB_BACKUP_BUCKET must be set}"
 APP_DB="${APP_DB_NAME:-app}"
 INTERVAL="${DRIGODB_BACKUP_INTERVAL:-86400}"
+# Waiting a whole interval to retry a server that simply had not finished
+# starting would mean a database wakes, works all day, and is never backed up.
+RETRY_SECONDS="${DRIGODB_BACKUP_RETRY:-30}"
 export PGHOST="${PGHOST:-/sockets}"
 
 log() { printf '[backup] %s\n' "$1"; }
@@ -66,7 +69,6 @@ wait_for_server() {
     pg_isready -q -d "$APP_DB" 2>/dev/null && return 0
     sleep 2
   done
-  log "PostgreSQL never became ready"
   return 1
 }
 
@@ -117,9 +119,24 @@ case "${1:-run}" in
     backup
     ;;
   run)
-    wait_for_server
+    # Nothing in this loop may exit non-zero, and that is a safety property
+    # rather than tidiness. This container has no readiness probe on purpose,
+    # but a crash loop would still leave the pod NotReady, and a NotReady pod is
+    # removed from its Service — so an unreachable bucket, a wrong key or a
+    # typo'd endpoint would sever a database that is working perfectly well.
+    # Backups must never be why a database is unreachable. Every failure here is
+    # logged and retried.
     while true; do
-      if due; then backup; else log "not due yet"; fi
+      if ! wait_for_server; then
+        log "PostgreSQL not ready yet; retrying in ${RETRY_SECONDS}s"
+        sleep "$RETRY_SECONDS"
+        continue
+      fi
+      if due; then
+        backup || log "backup failed; retrying at the next interval"
+      else
+        log "not due yet"
+      fi
       sleep "$INTERVAL"
     done
     ;;

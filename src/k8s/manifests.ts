@@ -18,7 +18,7 @@ import type {
   V1StatefulSet,
 } from "@kubernetes/client-node";
 
-import { config } from "../config.js";
+import { backupsEnabled, config } from "../config.js";
 
 export const DB_ID_LABEL = "drigodb.io/database-id";
 export const EXTERNAL_ID_LABEL = "drigodb.io/external-id";
@@ -66,6 +66,9 @@ export const MONGO_PORT = 27017;
 export const GATEWAY_PORT = 10260;
 export const GATEWAY_PORT_NAME = "mongo";
 
+export const BACKUP_KEY_SECRET_KEY = "access_key";
+export const BACKUP_SECRET_SECRET_KEY = "secret_key";
+
 export const DB_USER = "appuser";
 export const DB_NAME = "app";
 export const PASSWORD_SECRET_KEY = "password";
@@ -79,6 +82,12 @@ const PG_MEMORY_LIMIT = "1Gi";
 const GATEWAY_CPU_REQUEST = "50m";
 const GATEWAY_MEMORY_REQUEST = "32Mi";
 const GATEWAY_MEMORY_LIMIT = "256Mi";
+// Idle almost all the time; it streams a backup out on an interval and holds
+// nothing between them. Requests are what the scheduler reserves, so keeping
+// them small is what stops backups halving how many databases fit on a node.
+const BACKUP_CPU_REQUEST = "10m";
+const BACKUP_MEMORY_REQUEST = "32Mi";
+const BACKUP_MEMORY_LIMIT = "256Mi";
 
 export function statefulSetName(id: string): string {
   return `db-${id}`;
@@ -220,6 +229,56 @@ export function buildPodTemplate(id: string, externalId: string): V1PodTemplateS
             limits: { memory: GATEWAY_MEMORY_LIMIT },
           },
         },
+        // Only when there is somewhere to put a backup. With no bucket
+        // configured the pod is exactly what it was before, rather than
+        // carrying a container that cannot do its job.
+        ...(backupsEnabled()
+          ? [
+              {
+                // Backups run in the pod because nothing outside it can reach
+                // PostgreSQL: pg_hba admits TCP from localhost only, and the
+                // Service publishes the gateway's port. Sharing the pod means
+                // sharing the socket, which is the connection that already
+                // works and needs no new credential.
+                //
+                // No data volume. pg_basebackup streams over that socket, so
+                // mounting the volume would only add a second path to the bytes
+                // being copied.
+                name: "backup",
+                image: config.backup.image,
+                env: [
+                  { name: "DRIGODB_DATABASE_ID", value: id },
+                  { name: "DRIGODB_BACKUP_BUCKET", value: config.backup.bucket },
+                  { name: "DRIGODB_BACKUP_ENDPOINT", value: config.backup.endpoint },
+                  { name: "DRIGODB_BACKUP_INTERVAL", value: config.backup.intervalSeconds },
+                  { name: "PGHOST", value: SOCKET_MOUNT_PATH },
+                  { name: "APP_DB_NAME", value: DB_NAME },
+                  {
+                    name: "DRIGODB_BACKUP_KEY",
+                    valueFrom: {
+                      secretKeyRef: { name: config.backup.secretName, key: BACKUP_KEY_SECRET_KEY },
+                    },
+                  },
+                  {
+                    name: "DRIGODB_BACKUP_SECRET",
+                    valueFrom: {
+                      secretKeyRef: { name: config.backup.secretName, key: BACKUP_SECRET_SECRET_KEY },
+                    },
+                  },
+                ],
+                volumeMounts: [{ name: SOCKET_VOLUME, mountPath: SOCKET_MOUNT_PATH }],
+                // Deliberately no probes. A readiness probe here would put
+                // backups on the pod's Ready condition, and an unreachable
+                // bucket would then take a working database out of its Service.
+                // Backups must never be why a database is unreachable — the
+                // container absorbs its own failures and logs them instead.
+                resources: {
+                  requests: { cpu: BACKUP_CPU_REQUEST, memory: BACKUP_MEMORY_REQUEST },
+                  limits: { memory: BACKUP_MEMORY_LIMIT },
+                },
+              },
+            ]
+          : []),
       ],
       volumes: [
         { name: SOCKET_VOLUME, emptyDir: {} },
