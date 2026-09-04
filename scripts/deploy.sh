@@ -38,9 +38,7 @@ step "Database configuration"
 k create configmap drigodb-config -n drigodb-databases \
   --from-file="${ROOT}/config/postgresql.conf" \
   --from-file="${ROOT}/config/pg_hba.conf" \
-  --from-file="${ROOT}/config/pg_ident.conf" \
   --from-file="${ROOT}/config/bootstrap.sh" \
-  --from-file="${ROOT}/config/pg_url" \
   --dry-run=client -o yaml | k apply -f - >/dev/null
 ok "drigodb-config applied"
 

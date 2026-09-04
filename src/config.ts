@@ -29,8 +29,9 @@ export const config = {
   // elsewhere; this is the blast radius of its RBAC.
   databaseNamespace: envOr("DRIGODB_DATABASE_NAMESPACE", "drigodb-databases"),
 
-  pgImage: envOr("DRIGODB_PG_IMAGE", "ghcr.io/drigolabs/drigodb-postgres:18-0.116-0"),
-  gatewayImage: envOr("DRIGODB_GATEWAY_IMAGE", "ghcr.io/drigolabs/drigodb-gateway:0.116-0"),
+  // CNPG's official image, not one of ours. Upstream rebuilds it; drigodb no
+  // longer patches a base it never wanted. See docs/leaving-documentdb.md.
+  pgImage: envOr("DRIGODB_PG_IMAGE", "ghcr.io/cloudnative-pg/postgresql:18"),
 
   storageClass: envOr("DRIGODB_STORAGE_CLASS", "do-block-storage"),
   // 1Gi, against a measured floor of 73 MB and 365 bytes per document — about
@@ -55,7 +56,10 @@ export const config = {
     bucket: envOr("DRIGODB_BACKUP_BUCKET", ""),
     endpoint: envOr("DRIGODB_BACKUP_ENDPOINT", ""),
     intervalSeconds: envOr("DRIGODB_BACKUP_INTERVAL", "86400"),
-    image: envOr("DRIGODB_BACKUP_IMAGE", "ghcr.io/drigolabs/drigodb-backup:18-0.116-0"),
+    // Tagged by PostgreSQL major alone: the data plane no longer carries an
+    // upstream extension version. pg_dump must not be older than the server, so
+    // this image derives from the same postgres image the database runs.
+    image: envOr("DRIGODB_BACKUP_IMAGE", "ghcr.io/drigolabs/drigodb-backup:18"),
     // Holds access_key and secret_key. Cluster-wide rather than per database:
     // one bucket, one credential, and the object prefix is what separates
     // tenants inside it.

@@ -35,19 +35,21 @@ spec:
               value: do-block-storage
             # The data-plane images every provisioned database runs. Pinned here
             # rather than left to the API's compiled-in defaults so the images in
-            # production are the images recorded in git. The scheduled rebuild in
-            # .github/workflows/images.yml reports new tags as an issue carrying
-            # the diff for these two lines; a human moves them.
+            # production are the images recorded in git.
             #
-            # Dated build tags, not the floating 18-0.116-0: a rebuild against a
-            # patched base is a different image under the same upstream version,
-            # and a node caching the floating tag would never notice.
+            # The postgres image is CNPG's own and is no longer built here, so
+            # there is no weekly rebuild and no standing issue moving these
+            # lines. Bumping it is an ordinary edit against upstream's tags.
             - name: DRIGODB_PG_IMAGE
-              value: ghcr.io/drigolabs/drigodb-postgres:18-0.116-0-20260831-b1
-            - name: DRIGODB_GATEWAY_IMAGE
-              value: ghcr.io/drigolabs/drigodb-gateway:0.116-0-20260831-b1
+              value: ghcr.io/cloudnative-pg/postgresql:18
+            # Floating for now because no pinned build of this image exists
+            # yet — the first images.yml run publishes 18 and 18-<date>-bN and
+            # files the standing issue carrying the diff that moves this line
+            # onto the pinned one. Pinned is the steady state: a rebuild against
+            # a patched base is a different image under the same major, and a
+            # node caching the floating tag would never notice.
             - name: DRIGODB_BACKUP_IMAGE
-              value: ghcr.io/drigolabs/drigodb-backup:18-0.116-0
+              value: ghcr.io/drigolabs/drigodb-backup:18
             # Backups are off until a bucket and an endpoint are set. Empty
             # here on purpose: with no destination configured no sidecar is
             # added, and a database is exactly what it was before. Set these

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Entrypoint for the PostgreSQL container of a per-app database pod.
 #
-# The postgres-documentdb image is a bare operand — it has no entrypoint that
+# CNPG's postgresql image is a bare operand — it declares no entrypoint that
 # initialises a cluster — so this script owns first-start initialisation and
 # then hands off to the postmaster.
 #
@@ -38,45 +38,55 @@ if [ ! -s "${PGDATA}/PG_VERSION" ]; then
   # on the next restart instead of being frozen into PGDATA at init time.
   printf "\ninclude = '%s/postgresql.conf'\n" "${CONF_SRC}" >> "${PGDATA}/postgresql.conf"
 
-  cp "${CONF_SRC}/pg_hba.conf" "${CONF_SRC}/pg_ident.conf" "${PGDATA}/"
-  chmod 0600 "${PGDATA}/pg_hba.conf" "${PGDATA}/pg_ident.conf"
+  cp "${CONF_SRC}/pg_hba.conf" "${PGDATA}/"
+  chmod 0600 "${PGDATA}/pg_hba.conf"
+
+  # A self-signed certificate, into PGDATA where postgres already owns
+  # everything. The image ships Debian's snakeoil pair, but its key is
+  # root:ssl-cert 0640 and Kubernetes does not grant a pod the image's group
+  # memberships — so relying on it would mean pinning supplementalGroups to an
+  # image-specific gid. Generating our own costs one openssl call at first start
+  # and nothing afterwards.
+  log "generating a self-signed certificate"
+  openssl req -new -x509 -days 3650 -nodes -text \
+    -out "${PGDATA}/server.crt" -keyout "${PGDATA}/server.key" \
+    -subj "/CN=drigodb" >/dev/null 2>&1
+  chmod 0600 "${PGDATA}/server.key"
 
   log "creating database ${APP_DB_NAME} and role ${APP_DB_USER}"
   pg_ctl -D "${PGDATA}" -w start >/dev/null
-  createdb -U postgres "${APP_DB_NAME}"
 
-  # documentdb_admin_role is the only role that can actually do work — the
-  # lesser documentdb_readwrite_role cannot create or read a collection. That is
-  # safe here only because nothing is shared: this cluster holds one app.
-  # See docs/documentdb-multitenancy-spike.md F3.
+  # The app role owns its database outright — "admin within its own database
+  # only", which under DocumentDB took a cluster-wide grant that reached every
+  # other tenant's data (spike F3) and here is just ownership.
+  #
   # Fed on stdin rather than with -c: psql performs variable interpolation on
   # file/stdin input but NOT on -c strings, where `:"role"` reaches the server
   # verbatim and fails with a syntax error. Interpolation also keeps the
   # password out of the command line and quotes it correctly.
-  psql -U postgres -d "${APP_DB_NAME}" -v ON_ERROR_STOP=1 -q \
+  psql -U postgres -d postgres -v ON_ERROR_STOP=1 -q \
     -v role="${APP_DB_USER}" -v pw="${APP_DB_PASSWORD}" -f - <<'SQL'
-CREATE EXTENSION IF NOT EXISTS documentdb CASCADE;
 CREATE ROLE :"role" LOGIN PASSWORD :'pw';
-GRANT documentdb_admin_role TO :"role";
 SQL
+  createdb -U postgres -O "${APP_DB_USER}" "${APP_DB_NAME}"
 
   record_credential
 
   pg_ctl -D "${PGDATA}" -m fast -w stop >/dev/null
   log "initialisation complete"
 else
-  # pg_hba and pg_ident are ours to own; refresh them so a config change ships
-  # with a restart.
+  # pg_hba is ours to own; refresh it so a config change ships with a restart.
   log "existing cluster, refreshing auth files"
-  cp "${CONF_SRC}/pg_hba.conf" "${CONF_SRC}/pg_ident.conf" "${PGDATA}/"
-  chmod 0600 "${PGDATA}/pg_hba.conf" "${PGDATA}/pg_ident.conf"
+  cp "${CONF_SRC}/pg_hba.conf" "${PGDATA}/"
+  chmod 0600 "${PGDATA}/pg_hba.conf"
 
   # Rotation lands here rather than in the control plane, because the control
-  # plane cannot reach this server: pg_hba admits TCP from 127.0.0.1 and ::1
-  # only, and the Service exposes the gateway's port, not PostgreSQL's. Giving
-  # the API a route in would mean a Service port, a NetworkPolicy hole and a
-  # superuser credential per database — the connection the isolation model
-  # exists to prevent.
+  # plane has no route to this server. The Service now does publish PostgreSQL's
+  # port — that is how applications connect — but pg_hba admits only appuser,
+  # over TLS, into its own database. Giving the API a way in would mean a
+  # pg_hba rule, a NetworkPolicy hole and a DDL-capable credential per database
+  # that the control plane holds and can use. It already holds every credential;
+  # the point is that it cannot use one from where it runs. See issue #29.
   #
   # ALTER ROLE needs a running server, so this pays a start/stop cycle. It is
   # paid ONLY when the credential has actually changed, which is what the
