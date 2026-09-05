@@ -129,8 +129,17 @@ build the run just made.
 
 Nothing in the pipeline writes to `main`. It creates a tag, and a tag is not a branch, so `main` stays
 protected against everyone. That tag is the record of what shipped: `scripts/next-version.sh` computes
-the next version from it, and `scripts/deploy.sh` deploys the newest one by default, so a hand-run
-deploy tracks the latest release without anyone editing a manifest.
+the next version from it.
+
+**A release does not deploy itself.** `deploy/20-api.yaml` is what is deployed, read as written — the
+commit being released cannot name the image the release is about to build. So publishing and shipping
+are two merges: CI publishes, then rewrites a standing issue carrying the one-line diff that moves the
+pin, and merging that is what ships it. The alternative is a pipeline pushing to `main`, and a `main`
+no one can push to is worth more than the bookkeeping.
+
+This used to resolve the newest tag at apply time instead, which made the manifest a decoy: two
+clusters applying the same commit a week apart ran different images. The pin had sat stale at `0.0.1`
+for seven releases without anyone noticing, because nothing read it.
 
 A merge of only `docs:` or `chore:` commits releases nothing. That is the intended amount of ceremony
 for a README fix.

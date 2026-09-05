@@ -20,9 +20,13 @@ spec:
         - name: api
           # Immutable: CI mints one version tag per release and never moves it,
           # so a cached layer under this tag is the build this tag names.
-          # scripts/deploy.sh rewrites this line when DRIGODB_API_IMAGE is set,
-          # which is how the release pipeline deploys what it just built.
-          image: ghcr.io/drigolabs/drigodb-api:0.0.1
+          #
+          # THIS LINE IS WHAT IS DEPLOYED. Nothing resolves a newer version at
+          # apply time any more, which means a release cannot ship itself — the
+          # commit being released does not yet name the image it is about to
+          # build. CI publishes and then rewrites a standing issue carrying the
+          # diff that moves this line; merging it is what deploys.
+          image: ghcr.io/drigolabs/drigodb-api:0.7.2
           imagePullPolicy: IfNotPresent
           ports:
             - name: http
