@@ -9,6 +9,10 @@ related:
 
 # GitOps for the control plane, and not for the data plane
 
+**"Reconciler" below means a Kubernetes controller — Flux or Argo CD — running inside the cluster,
+pulling desired state from this repository and applying it. The OpenGitOps principles call it a
+"software agent"; that word has since been taken.**
+
 **Decision:** adopt pull-based reconciliation for the control plane, with **manual pin promotion** and
 **no image automation writing to the repository**. The data plane stays API-provisioned, because it
 cannot be anything else.
@@ -29,7 +33,7 @@ The promotion path is GitOps-shaped too. CI publishes a build, files a standing 
 diff, and a human merges the pin. That is the promotion model with an issue standing in for a bot pull
 request.
 
-What is missing is not the idea. It is that the loop runs inside the API process rather than an agent,
+What is missing is not the idea. It is that the loop runs inside the API process rather than a reconciler,
 fires on wake rather than continuously, and covers the data plane rather than the control plane.
 
 ## The contradiction shipping today
@@ -54,30 +58,30 @@ So the end state has two reconcilers with two sources of truth:
 
 | | Desired state lives in | Reconciled by |
 |---|---|---|
-| Control plane (`drigodb-system`) | Git | a pull agent |
+| Control plane (`drigodb-system`) | Git | a reconciler in the cluster |
 | Hosted databases (`drigodb-databases`) | the cluster, by design | the control plane, on wake |
 
 That is coherent, and it is worth stating plainly because it looks like an inconsistency until you ask
 where a database's existence could otherwise be recorded.
 
-It also caps the payoff honestly: the agent would manage one Deployment, one Service, two ConfigMaps and
+It also caps the payoff honestly: the reconciler would manage one Deployment, one Service, two ConfigMaps and
 some RBAC, while the component managing hundreds of objects stays imperative because it must.
 
 ## Why adopt it anyway
 
-**The push credential disappears.** An agent pulling from inside the cluster holds no credential outside
+**The push credential disappears.** A reconciler pulling from inside the cluster holds no credential outside
 it. That is strictly better than the scoped ServiceAccount token in
 [docs/diagrams/deploy-flow.md](../diagrams/deploy-flow.md), which is itself a large improvement on the
 account-owner kubeconfig it replaced. The direction of travel is the same one twice.
 
 **Cluster recreation gets simpler, not harder.** Today `doks-up.sh` creates a cluster, mints a
-ServiceAccount, pushes three repository secrets, and then someone runs `deploy.sh`. With an agent it
-installs the agent and stops; the control plane arrives from Git. Fewer moving parts, and no secrets to
+ServiceAccount, pushes three repository secrets, and then someone runs `deploy.sh`. With a reconciler it
+installs that and stops; the control plane arrives from Git. Fewer moving parts, and no secrets to
 go stale when the cluster is deleted.
 
 **Local verification stops being a parallel path.** The intended development loop ends with a local
 cluster pulling published images "as it would remotely". Today that means running `deploy.sh` locally
-and trusting it matches what CI does — two code paths pretending to be one. Under a pull agent, a kind
+and trusting it matches what CI does — two code paths pretending to be one. Under a reconciler, a kind
 cluster reconciles the same repository with the same controller, and "as it would remotely" becomes true
 rather than approximate.
 
@@ -97,22 +101,57 @@ against everything including itself. Trading that for automatic tag bumps is a b
 Manual promotion keeps both properties: Git describes the deployment, and nothing pushes to `main`. The
 cost is one merge per release — which the data-plane images already pay, through the standing issue.
 
+## Packaging: a Helm chart, because drigodb is software other people install
+
+Amended 2026-09-05. This originally said `kustomize`, on the grounds that it keeps `deploy/*.yaml` as
+valid manifests anyone can read, diff and `kubectl apply -f` by hand — the property the `sed` approach
+was written to preserve.
+
+That reasoning holds and is now outweighed. **drigodb is intended to be installed by others on their own
+clusters**, and a chart is what people expect to install. `kustomize` overlays are for composing
+manifests you own; Helm is for distributing an application you do not run.
+
+The cost is real and worth naming: **templates are not valid YAML until rendered**, so the
+read-diff-apply-by-hand property goes. `helm template` recovers most of it, but not the ability to point
+`kubectl` at a file in the repository.
+
+What it buys beyond distribution is that **drigodb's own deployment becomes the chart with drigodb's own
+values**. One artefact rather than two, and no risk of the packaging others use drifting from the
+packaging that is actually exercised — which is the same class of problem as a stand-down check that
+never used the credential it was checking.
+
+It also fits the reconciler better than the overlay would have. Flux and Argo CD both reconcile a
+`HelmRelease` natively, so per-environment values replace per-environment overlays.
+
+Things that stop being defaults and become values someone must set:
+
+- `DRIGODB_STORAGE_CLASS`, which defaults to `do-block-storage` and is meaningless anywhere else
+- the namespace names, currently hardcoded in `deploy/10-rbac.yaml`
+- the image pins, the backup destination, and the API token
+
+`src/config.ts` is already thirteen environment variables with fallbacks, so the configurable surface
+exists — this exposes it rather than inventing it.
+
+**Not decided here:** whether the published images are public. Nobody can install a chart whose images
+they cannot pull, so that is a prerequisite to distribution rather than a consequence of it.
+
 ## Prerequisites
 
-An agent cannot reconcile a shell script, so `deploy.sh`'s imperative parts have to go first. That work
+Nothing can reconcile a shell script, so `deploy.sh`'s imperative parts have to go first. That work
 is worth doing on its own merits and does not commit anyone to this decision:
 
 - the API image pinned in Git, not resolved from the newest tag at apply time
-- `kustomize` overlays instead of `sed` substitution
+- a Helm chart instead of `sed` substitution — see below
 - the API token as a Secret that already exists, rather than one generated from `/dev/urandom` at deploy
   time — a reconciler would fight a token that is regenerated on every apply
 - ConfigMaps as manifests rather than `kubectl create --dry-run | apply`
 
 ## What this does not decide
 
-Which agent. Flux's source and kustomize controllers are the smaller fit — Argo CD brings a UI and an
+Which reconciler. Flux's source and helm controllers are the smaller fit — Argo CD brings a UI and an
 account model that one operator and one consumer do not need — but that comparison should be made
-against a prerequisite branch that actually exists, not in the abstract.
+against a prerequisite branch that actually exists, not in the abstract. Both handle Helm natively, so
+the packaging decision below does not constrain it.
 
 **And it does not decide when.** The measured constraint from
 [0001](0001-instance-per-database-over-a-shared-cluster.md) applies: a `s-1vcpu-2gb` node fits two

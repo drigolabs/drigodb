@@ -13,8 +13,9 @@ means arguing with the reasoning rather than guessing at it.
 `leaving-documentdb.md` predates this folder and stays where it is: the README, several issues and a
 merged pull request link to it by path. Worth consolidating the next time something else moves.
 
-[deploy-flow.md](../diagrams/deploy-flow.md) documents what the second of those decisions produced — how a merge
-reaches a cluster, and which credential each step holds.
+[deploy-flow.md](../diagrams/deploy-flow.md) draws where the second of those decisions leads — how a merge
+should reach a cluster, and which credential each step holds. It is a target, and it names the issues
+that close the gap.
 
 Supporting material lives alongside rather than inside: [the multitenancy
 spike](../documentdb-multitenancy-spike.md) is the evidence both records rest on, and
