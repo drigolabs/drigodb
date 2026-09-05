@@ -170,11 +170,22 @@ one — and the DocumentDB era proved that exactly: a dump that exits zero and r
 
 The pipeline needs three things arranged once:
 
-1. **`DIGITALOCEAN_ACCESS_TOKEN`** as a repository secret. `kubernetes: read` is the whole scope it
-   needs — the pipeline fetches a kubeconfig and nothing more, because creating the cluster starts
-   billing and stays a deliberate `doks-up.sh`. Without the secret the pipeline still builds and
-   publishes; it just reports the deploy as skipped. Set the repository variable
-   `DRIGODB_DO_CLUSTER` too if the cluster is not named `drigodb`.
+1. **`DIGITALOCEAN_ACCESS_TOKEN`** as a repository secret, with **write** scope on `kubernetes` — not
+   read.
+
+   This said `kubernetes: read` until 2026-09-05, and it was wrong. A read-scoped token can
+   `doctl kubernetes cluster get` perfectly well, which is what made the mistake survive: the pipeline's
+   own check for whether there is anywhere to deploy to passed, and the very next call —
+   `doctl kubernetes cluster kubeconfig save` — returned `403 You are not authorized to perform this
+   operation`. A kubeconfig carries cluster-admin credentials, so DigitalOcean does not hand one to a
+   read-only token.
+
+   Seven releases reported the deploy as successful before this surfaced, every one of them by standing
+   down because no cluster was running. See [#15](https://github.com/drigolabs/drigodb/issues/15).
+
+   Creating the cluster still stays a deliberate `doks-up.sh`, because that starts billing. Without the
+   secret the pipeline still builds and publishes; it just reports the deploy as skipped. Set the
+   repository variable `DRIGODB_DO_CLUSTER` too if the cluster is not named `drigodb`.
 2. **Write access from this repo to the GHCR packages.** The three packages were first pushed by hand
    with a personal token, so they are not yet linked to the repository. On each package's page →
    *Package settings* → *Manage Actions access* → add `drigolabs/drigodb` with **Write**, or the
