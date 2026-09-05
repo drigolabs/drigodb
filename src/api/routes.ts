@@ -1,8 +1,9 @@
-// HTTP surface. Six operations, designed against one real consumer.
+// HTTP surface. Seven operations, designed against one real consumer.
 
 import { Hono } from "hono";
 
 import {
+  BackupsDisabledError,
   NotFoundError,
   Provisioner,
   ValidationError,
@@ -52,6 +53,19 @@ export function buildRoutes(provisioner: Provisioner): Hono {
     return c.json({ ...database, connection_uri: uri });
   });
 
+  // Keys and sizes, never a credential — and an empty list for a database that
+  // has never been backed up, which is an answer rather than an error.
+  //
+  // Answers for a hibernated database too, which is the point: that is when
+  // "what can I restore?" gets asked, and it is exactly when there is no pod to
+  // ask. See issue #39.
+  app.get("/v1/databases/:id/backups", async (c) => {
+    const backups = await provisioner.listBackups(c.req.param("id"));
+    return c.json({
+      backups: backups.map((b) => ({ key: b.key, size: b.size, created_at: b.lastModified })),
+    });
+  });
+
   app.delete("/v1/databases/:id", async (c) => {
     await provisioner.delete(c.req.param("id"));
     return c.body(null, 204);
@@ -60,6 +74,11 @@ export function buildRoutes(provisioner: Provisioner): Hono {
   app.onError((err, c) => {
     if (err instanceof NotFoundError) return c.json({ error: err.message }, 404);
     if (err instanceof ValidationError) return c.json({ error: err.message }, 400);
+    // 409, not 404 or an empty list: "backups are off for this installation" is
+    // a different fact from "this database has none", and a caller that
+    // conflated them would conclude its data was unprotected when it is, or
+    // that it is protected when it is not.
+    if (err instanceof BackupsDisabledError) return c.json({ error: err.message }, 409);
     console.error("[drigodb] unhandled error:", err);
     return c.json({ error: "internal error" }, 500);
   });
