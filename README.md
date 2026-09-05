@@ -10,9 +10,9 @@ seconds.
 > MongoDB gateway, and a `postgres://` connection URI. The reasoning is in
 > [docs/leaving-documentdb.md](docs/leaving-documentdb.md).
 >
-> Still outstanding: the old image sources are not yet deleted (#27), nothing installs schema into a
-> provisioned database yet (#30), and the figures under [Measured](#measured) still describe the
-> DocumentDB data plane until they are taken again on a cluster (#32).
+> Still outstanding: nothing installs schema into a provisioned database yet (#30), and the figures
+> under [Measured](#measured) still describe the DocumentDB data plane until they are taken again on a
+> cluster (#32).
 >
 > There is no public endpoint, no accounts and no quotas. Backups exist but are off unless a bucket is
 > configured. See [Status](#status).
@@ -165,10 +165,6 @@ Nothing is published until it has been proved to run. For the backup image that 
 standing in for Spaces, restore into a *second, running* instance, and read the rows and the expression
 index back. A rebuild that merely *builds* would sail past the failure that matters, which is a runtime
 one — and the DocumentDB era proved that exactly: a dump that exits zero and restores nothing.
-
-The old `drigodb-postgres` and `drigodb-gateway` image sources are still in `images/` and are deleted
-in [#27](https://github.com/drigolabs/drigodb/issues/27), along with the workflow's rebuild schedule
-and its standing-issue writer.
 
 ### Setting it up
 

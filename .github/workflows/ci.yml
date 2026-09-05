@@ -64,11 +64,10 @@ jobs:
         # and versions.env is commented.
         run: grep -E '^[A-Z_]+=' images/versions.env >> "$GITHUB_ENV"
 
-      # Only the backup image is ours now. The postgres and gateway images are
-      # gone from the data plane — databases run CNPG's postgresql directly, so
-      # there is nothing here to smoke-test for a loaded extension and no
-      # wire-protocol gateway to drive a MongoDB driver against. Their sources
-      # are deleted in #27. See docs/leaving-documentdb.md.
+      # Only the backup image is ours. The postgres and gateway images are gone
+      # — databases run CNPG's postgresql directly, so there is nothing here to
+      # smoke-test for a loaded extension and no wire-protocol gateway to drive
+      # a MongoDB driver against. See docs/leaving-documentdb.md.
       #
       # Built from the PUBLISHED base rather than a locally loaded one:
       # setup-buildx-action uses a container driver, which cannot see images in
