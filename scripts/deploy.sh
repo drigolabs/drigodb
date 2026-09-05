@@ -42,6 +42,17 @@ k create configmap drigodb-config -n drigodb-databases \
   --dry-run=client -o yaml | k apply -f - >/dev/null
 ok "drigodb-config applied"
 
+step "Database migrations"
+# Its own ConfigMap, not more keys on drigodb-config: --from-file flattens a
+# directory, so migrations would otherwise land beside postgresql.conf. Built by
+# globbing rather than listing, so adding 002 needs no edit here.
+MIG_ARGS=()
+for f in "${ROOT}"/config/migrations/*.sql; do MIG_ARGS+=(--from-file="$f"); done
+k create configmap drigodb-migrations -n drigodb-databases \
+  "${MIG_ARGS[@]}" \
+  --dry-run=client -o yaml | k apply -f - >/dev/null
+ok "drigodb-migrations applied (${#MIG_ARGS[@]} migration(s))"
+
 step "API token"
 if k get secret drigodb-api-token -n drigodb-system >/dev/null 2>&1; then
   note "token already exists; leaving it alone"

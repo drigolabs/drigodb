@@ -43,6 +43,18 @@ export const TEMPLATE_HASH_ANNOTATION = "drigodb.io/template-hash";
 export const CONFIG_MAP_NAME = "drigodb-config";
 export const CONFIG_MOUNT_PATH = "/drigodb-config";
 
+// Schema, separate from configuration and on its own ConfigMap deliberately:
+// `kubectl create configmap --from-file=<dir>` flattens a directory into keys,
+// so migrations sharing drigodb-config would land beside postgresql.conf with
+// nothing but a naming convention keeping them apart.
+//
+// Adding a migration changes this template's hash, so an existing database
+// picks it up on its next wake through the same reconcile that carries an image
+// update — which is the whole reason schema ships this way rather than from the
+// control plane. See issue #29.
+export const MIGRATIONS_CONFIG_MAP_NAME = "drigodb-migrations";
+export const MIGRATIONS_MOUNT_PATH = "/drigodb-migrations";
+
 // PostgreSQL's UID and GID in CNPG's image: `uid=26(postgres) gid=102(postgres)`.
 //
 // The GID is not 26. It was under our own image, and carrying that assumption
@@ -171,6 +183,7 @@ export function buildPodTemplate(id: string, externalId: string): V1PodTemplateS
             { name: "APP_DB_NAME", value: DB_NAME },
             { name: "APP_DB_USER", value: DB_USER },
             { name: "APP_DB_CONF_DIR", value: CONFIG_MOUNT_PATH },
+            { name: "APP_DB_MIGRATIONS_DIR", value: MIGRATIONS_MOUNT_PATH },
             {
               name: "APP_DB_PASSWORD",
               valueFrom: {
@@ -184,6 +197,7 @@ export function buildPodTemplate(id: string, externalId: string): V1PodTemplateS
             { name: DATA_VOLUME, mountPath: DATA_MOUNT_PATH },
             { name: SOCKET_VOLUME, mountPath: SOCKET_MOUNT_PATH },
             { name: "config", mountPath: CONFIG_MOUNT_PATH, readOnly: true },
+            { name: "migrations", mountPath: MIGRATIONS_MOUNT_PATH, readOnly: true },
           ],
           readinessProbe: {
             exec: { command: ["pg_isready", "-U", "postgres", "-d", DB_NAME] },
@@ -255,6 +269,10 @@ export function buildPodTemplate(id: string, externalId: string): V1PodTemplateS
           // 0640 rather than 0644: these files are read by the pod's own UID
           // and group, and nothing else needs them.
           configMap: { name: CONFIG_MAP_NAME, defaultMode: 0o640 },
+        },
+        {
+          name: "migrations",
+          configMap: { name: MIGRATIONS_CONFIG_MAP_NAME, defaultMode: 0o640 },
         },
       ],
     },

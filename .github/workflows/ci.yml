@@ -94,3 +94,17 @@ jobs:
           bash images/postgres-backup/integration-test.sh \
             drigolabs/drigodb-backup:ci \
             ghcr.io/cloudnative-pg/postgresql:${{ env.PG_MAJOR }}
+
+      # Lives in this job rather than a new one because branch protection on
+      # main requires three checks by name, and a test this consequential must
+      # be one of them — a separate job could fail without blocking a merge.
+      # It is why the job's name is now broader than it reads.
+      #
+      # Runs the real bootstrap.sh against the real image. The assertion that
+      # earns its place is the last one: an edited migration must stop a server
+      # from starting, and that has to be caught here rather than on a fleet
+      # where it would stop every database from waking.
+      - name: In-database migrations test
+        run: |
+          bash config/migrations-test.sh \
+            ghcr.io/cloudnative-pg/postgresql:${{ env.PG_MAJOR }}

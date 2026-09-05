@@ -8,7 +8,9 @@ change on its next start — which is also its next wake.
 |---|---|
 | `postgresql.conf` | Listen address, the two socket directories, TLS, and WAL sized against the volume |
 | `pg_hba.conf` | Who may connect and how. **Order-sensitive**: pg_hba is first-match |
-| `bootstrap.sh` | The postgres container's entrypoint. Owns first-start initialisation, credential rotation, and the hand-off to the postmaster |
+| `bootstrap.sh` | The postgres container's entrypoint. Owns first-start initialisation, credential rotation, running migrations, and the hand-off to the postmaster |
+| `migrations/` | SQL applied inside every database, in order, once each. Its own ConfigMap — see [migrations/README.md](migrations/README.md) |
+| `migrations-test.sh` | Runs the real `bootstrap.sh` against the real image and asserts what the runner promises |
 
 ## What is load-bearing
 
@@ -35,9 +37,14 @@ reasoning is in issue #29.
 at init time rather than copying settings into it, so a later config change takes effect on restart
 instead of being frozen into `PGDATA` on the day the database was created.
 
-**The credential fingerprint.** Rotation needs a running server, so it costs a start/stop cycle. The
-fingerprint in `PGDATA` is what makes that cost apply only when the password actually changed — an
-ordinary wake execs straight into the postmaster.
+**The two markers.** Rotation and migrations both need a running server, and an ordinary wake needs
+neither. `.drigodb-credential` and `.drigodb-migrations` in `PGDATA` are what make that cost apply only
+when something actually changed, and when both are due they share one start/stop cycle rather than
+paying two.
+
+The migrations marker is only a gate on whether starting is worth it. `_drigodb.schema_migrations`
+inside the database is the source of truth for what actually ran, which is what keeps a restored volume
+or a hand-edited marker from mattering.
 
 ## History
 

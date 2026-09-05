@@ -10,6 +10,8 @@ import {
   DATA_VOLUME,
   DB_ID_LABEL,
   EXTERNAL_ID_LABEL,
+  MIGRATIONS_CONFIG_MAP_NAME,
+  MIGRATIONS_MOUNT_PATH,
   POSTGRES_PORT,
   RUN_AS_GROUP,
   RUN_AS_USER,
@@ -49,6 +51,17 @@ describe("statefulset", () => {
     // which is why backups need no credential and no network path.
     const pg = buildStatefulSet(ID, EXT).spec?.template.spec?.containers?.[0];
     expect((pg?.volumeMounts ?? []).map((m) => m.mountPath)).toContain(SOCKET_MOUNT_PATH);
+  });
+
+  it("mounts the migrations ConfigMap and tells bootstrap.sh where it is", () => {
+    // Separate from drigodb-config because --from-file flattens a directory,
+    // so migrations sharing it would sit beside postgresql.conf.
+    const spec = buildStatefulSet(ID, EXT).spec?.template.spec;
+    const pg = spec?.containers?.[0];
+    expect((pg?.volumeMounts ?? []).find((m) => m.mountPath === MIGRATIONS_MOUNT_PATH)?.readOnly).toBe(true);
+    expect(pg?.env?.find((e) => e.name === "APP_DB_MIGRATIONS_DIR")?.value).toBe(MIGRATIONS_MOUNT_PATH);
+    expect((spec?.volumes ?? []).find((v) => v.name === "migrations")?.configMap?.name)
+      .toBe(MIGRATIONS_CONFIG_MAP_NAME);
   });
 
   it("publishes PostgreSQL's port from the container", () => {
@@ -205,6 +218,14 @@ describe("backup sidecar", () => {
     const mounts = (backup?.volumeMounts ?? []).map((v) => v.name);
     expect(mounts).toEqual([SOCKET_VOLUME]);
     expect(mounts).not.toContain(DATA_VOLUME);
+  });
+
+  it("carries migrations in the template, so a new one reaches existing databases on wake", () => {
+    // The whole reason schema ships through the pod rather than from the
+    // control plane: the template hash moves, and the existing reconcile
+    // carries it. See issue #29.
+    const pg = buildStatefulSet(ID, EXT).spec?.template.spec?.containers?.[0];
+    expect((pg?.volumeMounts ?? []).map((m) => m.name)).toContain("migrations");
   });
 
   it("changes the template hash, so existing databases gain it on their next wake", async () => {

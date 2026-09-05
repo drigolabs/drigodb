@@ -10,9 +10,8 @@ seconds.
 > MongoDB gateway, and a `postgres://` connection URI. The reasoning is in
 > [docs/leaving-documentdb.md](docs/leaving-documentdb.md).
 >
-> Still outstanding: nothing installs schema into a provisioned database yet (#30), and the figures
-> under [Measured](#measured) still describe the DocumentDB data plane until they are taken again on a
-> cluster (#32).
+> Still outstanding: the figures under [Measured](#measured) still describe the DocumentDB data plane
+> until they are taken again on a cluster (#32).
 >
 > There is no public endpoint, no accounts and no quotas. Backups exist but are off unless a bucket is
 > configured. See [Status](#status).
@@ -229,6 +228,33 @@ loads a dump into the app database, and refuses a database that already holds ta
 [#22](https://github.com/drigolabs/drigodb/issues/22), which gets substantially simpler now that a
 restore loads into a running server rather than replacing a data directory.
 
+## Schema inside a database
+
+A provisioned database carries a `_drigodb` schema, applied from
+[`config/migrations/`](config/migrations/) in filename order, exactly once each and recorded in
+`_drigodb.schema_migrations`. `SELECT _drigodb.version()` says where a database is up to.
+
+`config/bootstrap.sh` runs them, over the local socket, as `postgres`. **The control plane never
+connects to a database** — it holds every credential but has no route to use one, and giving it a way in
+would mean a `pg_hba` rule, a NetworkPolicy hole and a DDL-capable credential per database. Shipping
+schema through the pod instead means a new migration reaches an existing database on its next wake,
+through the same template reconcile that carries an image update.
+
+An ordinary wake still costs nothing: a marker in `PGDATA` records which set of files the cluster has
+seen, so the server is only started early when there is actually work — the same trick the credential
+fingerprint uses, and they share one start/stop cycle when both are due.
+
+**Migrations are forward-only.** The runner records a checksum per file, and an edited migration that
+has already been applied stops the server from starting rather than letting a schema drift from the file
+claiming to describe it. That failure is fleet-wide by design, so it has to be caught before it ships —
+`config/migrations-test.sh` runs the real `bootstrap.sh` against the real image on every CI run and
+asserts exactly that.
+
+What is deliberately *not* in there: no patch log, no manifest tables, no `apply_patch`. Those belong to
+the document-framework proposal in [docs/plans/](docs/plans/), which is a separate bet. This is the
+mechanism that would deliver them, and is worth having either way — without it nothing can change a
+provisioned database after it is created.
+
 ## Measured
 
 | | warm cache, single node | DigitalOcean, `s-2vcpu-4gb` |
@@ -288,8 +314,7 @@ backups behind a configured bucket.
 
 Not built: public endpoints (databases are in-cluster only), TLS from a real issuer — the server
 self-signs, so clients pass `sslmode=require` rather than `verify-full` — accounts, quotas, billing,
-restore as an API operation, backup retention, and vertical or storage autoscaling. Nothing installs
-schema into a provisioned database yet ([#30](https://github.com/drigolabs/drigodb/issues/30)).
+restore as an API operation, backup retention, and vertical or storage autoscaling.
 
 ## Licence
 
