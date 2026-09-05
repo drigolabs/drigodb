@@ -90,11 +90,21 @@ export const DB_USER = "appuser";
 export const DB_NAME = "app";
 export const PASSWORD_SECRET_KEY = "password";
 
-// Sized from measurement on an idle, freshly initialised database: PostgreSQL
-// settled at 110 MiB. Requests keep headroom because that workload was empty.
-// Re-measurement after the migration is issue #32.
+// The request is what the scheduler reserves, so it — not usage — decides how
+// many databases fit on a node.
+//
+// Measured on DigitalOcean 2026-09-05 (#32): an idle database holds 102 MiB
+// resident, of which 30 MiB is unshared. At 256Mi the scheduler was reserving
+// ~2.5x that, and a 1500 MiB node fit two databases beside the control plane
+// while a third would not schedule at all. The block-volume ceiling is 15 per
+// node, so memory was binding at two — nowhere near it.
+//
+// 192Mi is measured idle plus ~90 MiB of headroom, and it moves the same node
+// from two databases to three. The LIMIT is unchanged at 1Gi: this changes what
+// is reserved for a database, never what it is allowed to use, so a busy one
+// has exactly the room it had before.
 const PG_CPU_REQUEST = "100m";
-const PG_MEMORY_REQUEST = "256Mi";
+const PG_MEMORY_REQUEST = "192Mi";
 const PG_MEMORY_LIMIT = "1Gi";
 // Idle almost all the time; it streams a backup out on an interval and holds
 // nothing between them. Requests are what the scheduler reserves, so keeping

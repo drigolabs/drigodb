@@ -99,14 +99,27 @@ tracks concurrent ones.
 
 ## The risk this decision carries
 
-**Volumes attachable per node is a hard ceiling that the cost curve does not predict.** Kubernetes
-defaults to 110 pods per node, but cloud providers cap attached block volumes per node well below that,
-and DigitalOcean's limit is believed to be single-digit per droplet. If that is right, a small cluster
-tops out at a couple of dozen databases regardless of how much RAM is provisioned, and no amount of node
-sizing fixes it.
+**Measured 2026-09-05, and the answer is not the one this section originally predicted.**
 
-**This is unverified and should be measured before the dedicated model is trusted to scale.** It is the
-kind of limit that is invisible until it is a wall, and it would move the trigger below substantially.
+The volume ceiling is real: `dobs.csi.digitalocean.com` reports **15** attachable volumes per node. That
+is higher than the single-digit figure feared here, and it is not what binds.
+
+**Memory requests bind first, by a wide margin.** On a `s-1vcpu-2gb` node — 1500 MiB allocatable — two
+databases plus the control plane requested 1222 MiB (83%), and a third would not schedule at all. Two
+databases per node against a ceiling of fifteen.
+
+And it is the *request* that binds, not the usage. An idle database holds 102 MiB resident; it was
+requesting 256Mi. That gap is a scheduling decision rather than a fact about PostgreSQL, and lowering
+the request to 192Mi moves the same node from two databases to three without changing what a database
+is allowed to use.
+
+So the ceiling is soft and adjustable where this section assumed it was hard and fixed. The dedicated
+model scales further than feared, and the lever is the memory request rather than the node count.
+
+**One thing measurement did surface that this record did not anticipate:** a hibernated database is not
+a reservation. Its memory is returned when it hibernates, and databases provisioned since can take it —
+so a wake can fail on a full node. Hibernation makes idle databases free, and that is exactly what makes
+waking them contended.
 
 ## When to revisit
 
