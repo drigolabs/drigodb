@@ -257,9 +257,9 @@ jobs:
             echo
             echo "Merging this diff is what ships it."
             echo
-            echo '\`\`\`diff'
+            echo '```diff'
             cat /tmp/pin.patch
-            echo '\`\`\`'
+            echo '```'
             echo
             echo "Run: ${RUN_URL}"
             echo
