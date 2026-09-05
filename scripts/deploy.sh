@@ -43,6 +43,11 @@ if [ -n "${DRIGODB_API_IMAGE:-}" ]; then
   HELM_ARGS+=(--set "image.repository=${DRIGODB_API_IMAGE%:*}" --set "image.tag=${DRIGODB_API_IMAGE##*:}")
   note "overriding the pinned image with ${DRIGODB_API_IMAGE}"
 fi
+if [ -n "${DRIGODB_IMAGE_PULL_POLICY:-}" ]; then
+  # Never, for an image loaded straight into a kind node: it exists nowhere else,
+  # so a kubelet that goes looking for it will fail to pull a tag no registry has.
+  HELM_ARGS+=(--set "image.pullPolicy=${DRIGODB_IMAGE_PULL_POLICY}")
+fi
 if [ -n "${DRIGODB_STORAGE_CLASS:-}" ]; then
   HELM_ARGS+=(--set "database.storageClass=${DRIGODB_STORAGE_CLASS}")
 fi

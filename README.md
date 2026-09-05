@@ -91,17 +91,18 @@ StatefulSet, and the caller's identifier lives on it as a label.
 
 ## Running it
 
-drigodb installs with Helm, on any cluster:
+drigodb installs with Helm, on any cluster — including one on your laptop:
 
 ```bash
-kind create cluster
-helm install drigodb ./charts/drigodb --namespace drigodb-system --create-namespace
+bash scripts/kind-up.sh                              # kind cluster + drigodb, free
+KUBE_CONTEXT=kind-drigodb bash scripts/smoke.sh      # provision, connect, hibernate, rotate
 ```
 
-That works on a laptop with no cloud account. Verified: a database provisions in
-about 20 seconds, binds kind's default StorageClass, runs its migrations, accepts a TLS connection,
-and survives hibernate and wake. See [charts/drigodb/README.md](charts/drigodb/README.md) for the
-values that matter and the two things kind cannot test.
+`smoke.sh` is the same script that runs against DigitalOcean, so "it works locally" and "it works
+remotely" are one claim rather than two similar ones. See
+[docs/local-development.md](docs/local-development.md) for the inner loop, backups against MinIO, and
+the four things a laptop cannot tell you — and [charts/drigodb/README.md](charts/drigodb/README.md)
+for the chart's values.
 
 On DigitalOcean:
 
@@ -306,7 +307,7 @@ corruption wants and it is genuinely destructive, so it waits for someone to hav
 ## Schema inside a database
 
 A provisioned database carries a `_drigodb` schema, applied from
-[`config/migrations/`](config/migrations/) in filename order, exactly once each and recorded in
+[`config/migrations/`](charts/drigodb/files/migrations/) in filename order, exactly once each and recorded in
 `_drigodb.schema_migrations`. `SELECT _drigodb.version()` says where a database is up to.
 
 `config/bootstrap.sh` runs them, over the local socket, as `postgres`. **The control plane never

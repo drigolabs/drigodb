@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Drive a deployed drigodb through its whole lifecycle and connect a real
-# MongoDB client to what it provisions.
+# PostgreSQL client to what it provisions.
 #
 # Proves the thing that matters: the API hands back a connection string, and
 # that connection string works.
+#
+# Runs against whatever kubectl points at — a kind cluster or DOKS. The point of
+# it working on both is that it is the SAME script, so "it works locally" and
+# "it works remotely" are the same claim rather than two similar ones.
 #
 #   scripts/smoke.sh [external-id]
 set -euo pipefail
@@ -11,7 +15,7 @@ set -euo pipefail
 CTX="${KUBE_CONTEXT:-$(kubectl config current-context)}"
 EXTERNAL_ID="${1:-smoke-$(date +%s)}"
 API_PORT="${API_PORT:-18080}"
-DB_PORT="${DB_PORT:-17017}"
+DB_PORT="${DB_PORT:-15432}"
 
 if [ -t 1 ]; then GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; BOLD='\033[1m'; RESET='\033[0m'; else GREEN=''; RED=''; YELLOW=''; BLUE=''; BOLD=''; RESET=''; fi
 step() { printf "${BOLD}${BLUE}▸${RESET} ${BOLD}%s${RESET}\n" "$1"; }
@@ -26,6 +30,22 @@ cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" >/dev/null 2>&1 || true; done;
 trap cleanup EXIT
 
 jqf() { python3 -c "import json,sys; d=json.load(sys.stdin); print(d$1)"; }
+
+# Runs psql inside the cluster, against the connection URI EXACTLY as the API
+# issued it. The previous version tunnelled a port to the laptop and rewrote the
+# URI's host to match, which meant the string being tested was never the string
+# the API handed out. This needs no psql on the host either.
+#
+# The pod carries drigodb.io/allow-database, which is how a consumer opts through
+# the database's NetworkPolicy. On kind that policy is unenforced, but carrying
+# the label keeps this honest about what a real consumer must do — and on DOKS it
+# is the difference between connecting and not.
+psql_in_cluster() { # uri sql
+  k run "smoke-psql-$RANDOM" -n drigodb-databases --rm -i --restart=Never --quiet \
+    --image="${SMOKE_PG_IMAGE:-ghcr.io/cloudnative-pg/postgresql:18}" \
+    --labels="drigodb.io/allow-database=${DB_ID}" \
+    --env="PGURI=$1" --command -- psql "$1" -tAc "$2" 2>&1
+}
 
 start_pf() { # resource local remote logfile
   k port-forward -n "$3" "$1" "$2:$4" >"$5" 2>&1 &
@@ -61,18 +81,22 @@ done
 [ "$STATUS" = "ready" ] || { fail "never became ready (last: ${STATUS})"; exit 1; }
 ok "ready in $(( $(date +%s) - t0 ))s"
 
-step "Connecting a MongoDB client to what it gave us"
-start_pf "svc/db-${DB_ID}" "$DB_PORT" drigodb-databases 27017 /tmp/drigodb-smoke-db.log || exit 1
-# The URI addresses the in-cluster Service; rewrite the host for the tunnel.
-LOCAL_URI="$(echo "$URI" | sed -E "s#@[^/]+/#@localhost:${DB_PORT}/#")"
-OUT="$(npx --yes mongosh@latest "$LOCAL_URI" --quiet --eval '
-  const d = db.getSiblingDB("smoke");
-  d.docs.insertOne({_id:"s1", proof:"provisioned-by-api"});
-  print(JSON.stringify(d.docs.find().toArray()));
-' 2>&1 | tail -2)" || true
+step "Connecting a PostgreSQL client to what it gave us"
+OUT="$(psql_in_cluster "$URI" "
+  CREATE TABLE IF NOT EXISTS smoke (id text PRIMARY KEY, proof text NOT NULL);
+  INSERT INTO smoke VALUES ('s1','provisioned-by-api') ON CONFLICT DO NOTHING;
+  SELECT proof FROM smoke;")" || true
 case "$OUT" in
-  *provisioned-by-api*) ok "wrote and read a document" ;;
+  *provisioned-by-api*) ok "wrote and read a row, over TLS, with the URI as issued" ;;
   *) fail "client could not use the database"; echo "$OUT"; exit 1 ;;
+esac
+
+# The schema drigodb installs into every database, which nothing else asserts
+# outside its own integration test.
+VER="$(psql_in_cluster "$URI" "SELECT _drigodb.version()")" || true
+case "$VER" in
+  *.sql*) ok "migrations applied, at $(echo "$VER" | tr -d '\r' | head -1)" ;;
+  *) fail "_drigodb.version() did not answer (${VER})"; exit 1 ;;
 esac
 
 step "Hibernate and wake"
@@ -127,21 +151,13 @@ ok "new credential issued"
 
 # The pod was replaced to apply it, so the old tunnel is pointing at a pod that
 # no longer exists.
-DB_PORT2=$((DB_PORT + 1))
-start_pf "svc/db-${DB_ID}" "$DB_PORT2" drigodb-databases 27017 /tmp/drigodb-smoke-db2.log || exit 1
-
-NEW_LOCAL="$(echo "$NEW_URI" | sed -E "s#@[^/]+/#@localhost:${DB_PORT2}/#")"
-OUT="$(npx --yes mongosh@latest "$NEW_LOCAL" --quiet --eval '
-  print(JSON.stringify(db.getSiblingDB("smoke").docs.find().toArray()));
-' 2>&1 | tail -2)" || true
+OUT="$(psql_in_cluster "$NEW_URI" "SELECT proof FROM smoke")" || true
 case "$OUT" in
   *provisioned-by-api*) ok "new credential reads the same data" ;;
   *) fail "new credential could not use the database"; echo "$OUT"; exit 1 ;;
 esac
 
-OLD_LOCAL="$(echo "$URI" | sed -E "s#@[^/]+/#@localhost:${DB_PORT2}/#")"
-OUT="$(npx --yes mongosh@latest "$OLD_LOCAL" --quiet \
-  --eval 'db.getSiblingDB("smoke").docs.find().toArray()' 2>&1 | tail -3)" || true
+OUT="$(psql_in_cluster "$URI" "SELECT proof FROM smoke")" || true
 case "$OUT" in
   *provisioned-by-api*) fail "the OLD credential still works — rotation did not take"; exit 1 ;;
   *) ok "old credential rejected" ;;
