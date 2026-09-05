@@ -23,6 +23,7 @@
 #   DRIGODB_DO_NODE_SIZE=s-2vcpu-4gb bash scripts/doks-up.sh
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLUSTER="${DRIGODB_DO_CLUSTER:-drigodb}"
 REGION="${DRIGODB_DO_REGION:-fra1}"
 NODE_SIZE="${DRIGODB_DO_NODE_SIZE:-s-1vcpu-2gb}"
@@ -65,6 +66,47 @@ ok "kubeconfig saved"
 
 kubectl --context "do-${REGION}-${CLUSTER}" wait --for=condition=Ready node --all --timeout=300s >/dev/null
 ok "nodes Ready"
+
+step "Deploy credential for CI"
+# CI used to fetch a kubeconfig from DigitalOcean at deploy time. That
+# kubeconfig authenticates as the account owner and is cluster-admin, because
+# DigitalOcean has no lesser one to issue — so a repository secret reached the
+# whole account rather than one deployment.
+#
+# The credential is minted here instead. This script already runs as an
+# administrator, because creating a cluster requires one; that is the right
+# place for the privileged step, and it leaves CI holding a token scoped to what
+# it actually does. It dies with the cluster.
+if ! command -v gh >/dev/null 2>&1; then
+  warn "gh not found — skipping. CI cannot deploy until the secrets are set."
+elif ! gh auth status >/dev/null 2>&1; then
+  warn "gh not authenticated — skipping. CI cannot deploy until the secrets are set."
+else
+  KCTX="do-${REGION}-${CLUSTER}"
+  kubectl --context "$KCTX" apply -f "${ROOT}/deploy/00-namespaces.yaml" >/dev/null
+  kubectl --context "$KCTX" apply -f "${ROOT}/deploy/05-deployer-rbac.yaml" >/dev/null
+  ok "drigodb-deployer created"
+
+  # The controller populates a manually-created token Secret asynchronously.
+  for _ in $(seq 1 30); do
+    TOKEN="$(kubectl --context "$KCTX" -n drigodb-system get secret drigodb-deployer-token \
+      -o jsonpath='{.data.token}' 2>/dev/null | base64 -d || true)"
+    [ -n "${TOKEN:-}" ] && break
+    sleep 2
+  done
+  if [ -z "${TOKEN:-}" ]; then
+    warn "the deployer token was never populated — CI cannot deploy"
+  else
+    SERVER="$(kubectl --context "$KCTX" config view --minify --raw \
+      -o jsonpath='{.clusters[0].cluster.server}')"
+    CA="$(kubectl --context "$KCTX" config view --minify --raw \
+      -o jsonpath='{.clusters[0].cluster.certificate-authority-data}')"
+    printf '%s' "$TOKEN"  | gh secret set DRIGODB_DEPLOY_TOKEN  >/dev/null
+    printf '%s' "$SERVER" | gh secret set DRIGODB_CLUSTER_SERVER >/dev/null
+    printf '%s' "$CA"     | gh secret set DRIGODB_CLUSTER_CA     >/dev/null
+    ok "pushed DRIGODB_DEPLOY_TOKEN, DRIGODB_CLUSTER_SERVER, DRIGODB_CLUSTER_CA"
+  fi
+fi
 
 echo
 printf "${GREEN}${BOLD}Cluster up.${RESET}  context: ${BOLD}do-${REGION}-${CLUSTER}${RESET}\n"
