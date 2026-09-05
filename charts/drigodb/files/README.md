@@ -51,6 +51,6 @@ or a hand-edited marker from mattering.
 This directory used to carry DocumentDB's required settings — preload libraries, `cron.database_name`,
 the internal-connection redirects, and a `pg_ident.conf` mapping the gateway's OS user onto the
 `documentdb_*` role groups. All of it is gone with the extension and the gateway; see
-[docs/leaving-documentdb.md](../docs/leaving-documentdb.md) for why, and
-[docs/documentdb-multitenancy-spike.md](../docs/documentdb-multitenancy-spike.md) for the isolation
+[docs/leaving-documentdb.md](../../../docs/leaving-documentdb.md) for why, and
+[docs/documentdb-multitenancy-spike.md](../../../docs/documentdb-multitenancy-spike.md) for the isolation
 findings that forced the original design.
