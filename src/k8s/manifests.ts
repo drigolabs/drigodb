@@ -431,7 +431,13 @@ export function buildStatefulSet(id: string, externalId: string): V1StatefulSet 
           metadata: { name: DATA_VOLUME, labels },
           spec: {
             accessModes: ["ReadWriteOnce"],
-            storageClassName: config.storageClass,
+            // Omitted when unset, never sent as "". Those mean opposite things:
+            // an empty string tells Kubernetes to use NO storage class and bind
+            // a pre-provisioned volume, while an absent field means "use the
+            // cluster's default". Portability depends on the second — kind,
+            // EKS and GKE each have their own default, and drigodb should not
+            // need to know which.
+            ...(config.storageClass ? { storageClassName: config.storageClass } : {}),
             resources: { requests: { storage: config.storageSize } },
           },
         },

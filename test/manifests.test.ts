@@ -288,3 +288,29 @@ describe("restore job", () => {
     expect(job.spec?.backoffLimit).toBeLessThanOrEqual(5);
   });
 });
+
+describe("storage class portability", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it("omits storageClassName when none is set, rather than sending an empty string", async () => {
+    // "" and absent mean opposite things to Kubernetes: the first says use NO
+    // storage class and bind a pre-provisioned volume, the second says use the
+    // cluster's default. Only the second installs on kind, EKS or GKE without
+    // being told which.
+    vi.resetModules();
+    const m = await import("../src/k8s/manifests.js");
+    const claim = m.buildStatefulSet(ID, EXT).spec?.volumeClaimTemplates?.[0];
+    expect(claim?.spec).not.toHaveProperty("storageClassName");
+  });
+
+  it("sets it when someone names one", async () => {
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_STORAGE_CLASS", "do-block-storage");
+    const m = await import("../src/k8s/manifests.js");
+    const claim = m.buildStatefulSet(ID, EXT).spec?.volumeClaimTemplates?.[0];
+    expect(claim?.spec?.storageClassName).toBe("do-block-storage");
+  });
+});

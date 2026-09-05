@@ -1,0 +1,41 @@
+{{/*
+The PostgreSQL config every hosted database mounts, straight from files/ so the
+shipped config is the deployed config. Kept as files rather than inlined in
+values: they carry the reasoning for every setting, and a values file is the
+wrong place for a paragraph explaining why max_wal_size is 256MB.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: drigodb-config
+  namespace: {{ .Values.databaseNamespace }}
+  labels:
+    {{- include "drigodb.labels" . | nindent 4 }}
+data:
+{{- range $path, $_ := .Files.Glob "files/*.conf" }}
+  {{ base $path }}: |
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}
+  bootstrap.sh: |
+{{ .Files.Get "files/bootstrap.sh" | indent 4 }}
+---
+{{/*
+Schema, on its own ConfigMap. Not more keys on drigodb-config: these are applied
+in filename order by bootstrap.sh, and mixing them with postgresql.conf would
+leave only a naming convention keeping them apart.
+
+Adding a migration changes this ConfigMap, which changes the pod template hash,
+which is how an existing database picks it up on its next wake.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: drigodb-migrations
+  namespace: {{ .Values.databaseNamespace }}
+  labels:
+    {{- include "drigodb.labels" . | nindent 4 }}
+data:
+{{- range $path, $_ := .Files.Glob "files/migrations/*.sql" }}
+  {{ base $path }}: |
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}

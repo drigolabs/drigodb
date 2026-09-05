@@ -1,0 +1,11 @@
+{{/*
+The namespace hosted databases live in. The release namespace is Helm's to
+create (--create-namespace); this one is the chart's, because the API's RBAC is
+scoped to it and the two are meaningless apart.
+*/}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.databaseNamespace }}
+  labels:
+    {{- include "drigodb.labels" . | nindent 4 }}

@@ -1,0 +1,27 @@
+drigodb {{ .Values.image.tag | default .Chart.AppVersion }} is installed as {{ .Release.Name }}.
+
+Read the API token — it is returned here and nowhere else:
+
+  kubectl -n {{ .Release.Namespace }} get secret {{ include "drigodb.fullname" . }}-token \
+    -o jsonpath='{.data.token}' | base64 -d
+
+Reach the API:
+
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "drigodb.fullname" . }} 8080:80
+
+Provision a database:
+
+  curl -XPOST localhost:8080/v1/databases \
+    -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+    -d '{"external_id":"my-app"}'
+
+{{ if not .Values.database.storageClass -}}
+Databases will use this cluster's DEFAULT StorageClass. If it has none, they
+will sit Pending — set database.storageClass.
+{{- else -}}
+Databases will use the {{ .Values.database.storageClass }} StorageClass.
+{{- end }}
+{{ if not .Values.backup.bucket -}}
+Backups are OFF. Set backup.bucket and backup.endpoint, and create the
+{{ .Values.backup.credentialsSecret }} Secret in {{ .Values.databaseNamespace }}.
+{{- end }}

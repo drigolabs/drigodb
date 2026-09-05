@@ -33,7 +33,10 @@ export const config = {
   // longer patches a base it never wanted. See docs/leaving-documentdb.md.
   pgImage: envOr("DRIGODB_PG_IMAGE", "ghcr.io/cloudnative-pg/postgresql:18"),
 
-  storageClass: envOr("DRIGODB_STORAGE_CLASS", "do-block-storage"),
+  // Empty means "the cluster's default StorageClass", which is what makes this
+  // installable somewhere that is not DigitalOcean. The chart sets it only when
+  // someone names one.
+  storageClass: envOr("DRIGODB_STORAGE_CLASS", ""),
   // 1Gi, against a measured floor of 73 MB and 365 bytes per document — about
   // two million documents once config/postgresql.conf bounds the WAL. 2Gi was
   // an unexamined default, and half of it was reserved for write-ahead log

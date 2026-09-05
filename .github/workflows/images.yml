@@ -204,7 +204,8 @@ jobs:
           BK_PINNED: ${{ needs.plan.outputs.backup_pinned }}
         run: |
           BK_REF="ghcr.io/${OWNER}/drigodb-backup:${BK_PINNED}"
-          sed -i -E "s#^( *value: ).*drigodb-backup:.*#\1${BK_REF}#" deploy/20-api.yaml
+          # The backup image pin lives in the chart's values now.
+          sed -i -E "s#^(  image: ).*drigodb-backup:.*#\1${BK_REF}#" charts/drigodb/values.yaml
 
           if git diff --quiet; then
             echo "::notice::Pin already current — nothing to report."
@@ -236,7 +237,7 @@ jobs:
             echo "|---|---|"
             echo "| backup | \`${BK_PINNED}\` |"
             echo
-            echo "To ship it, move the pin in \`deploy/20-api.yaml\` and merge as a"
+            echo "To ship it, move the pin in \`charts/drigodb/values.yaml\` and merge as a"
             echo "\`fix:\` — the release pipeline versions and deploys it from there."
             echo
             echo '```diff'

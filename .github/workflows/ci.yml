@@ -106,5 +106,5 @@ jobs:
       # where it would stop every database from waking.
       - name: In-database migrations test
         run: |
-          bash config/migrations-test.sh \
+          bash scripts/migrations-test.sh \
             ghcr.io/cloudnative-pg/postgresql:${{ env.PG_MAJOR }}
