@@ -287,47 +287,81 @@ provisioned database after it is created.
 
 ## Measured
 
-| | warm cache, single node | DigitalOcean, `s-2vcpu-4gb` |
+Taken on DigitalOcean 2026-09-05, against the plain-PostgreSQL data plane, with
+[`scripts/measure.sh`](scripts/measure.sh) — a script rather than a list of commands because every
+figure here was previously a single observation, and a table that has already been wrong once by 3.5×
+should be cheap to take again.
+
+Cluster: 1× `s-1vcpu-2gb` in `fra1`, which is what `doks-up.sh` creates.
+
+| | warm cache, single node | DigitalOcean, `s-1vcpu-2gb` |
 |---|---|---|
-| Provision from nothing | ~12s (includes `initdb` and `CREATE EXTENSION`) | **27s** warm, **50s** on a node that has never pulled the images |
-| Wake from hibernation | ~8s | **18s** |
+| Provision from nothing | ~12s | **19–20s** warm (n=2), **45s** on a node that has never pulled the image |
+| Wake from hibernation | ~8s | **9–11s** (n=2) |
 | Hibernated | 0 pods; storage only | same |
 
-**These figures predate the migration and describe the DocumentDB data plane.** They are kept until
-they can be taken again on a cluster ([#32](https://github.com/drigolabs/drigodb/issues/32)). An early
-Docker measurement of the replacement puts a fresh database at ~64 MB rather than 73 MB — the saving is
-the catalog term only, since the ~33 MB WAL floor is set by `min_wal_size` and does not care which
-extension is installed.
-
-Storage, measured on DigitalOcean 2026-09-01:
+Storage, freshly provisioned:
 
 | | |
 |---|---|
-| A freshly provisioned database | **73 MB** |
-| — catalogs and extensions | 41 MB, of which PostGIS is 7.1 MB |
+| A freshly provisioned database | **64 MB** |
+| — catalogs | 31 MB (one extension, `plpgsql`) |
 | — write-ahead log | 33 MB |
-| One ~220-byte document | **365 bytes** — consistent at 20k and 100k |
-| Default volume | 1Gi, so roughly **2 million documents** once WAL is bounded |
+| One ~200-byte row | **308 bytes** at 20k, **318** at 100k |
+| Default volume | 1Gi, so roughly **3 million rows** once WAL is bounded |
+
+Leaving DocumentDB took 73 MB to 64 MB. The saving is the catalog term alone — PostGIS and the
+extension's own catalogs — because the 33 MB write-ahead log floor is set by `min_wal_size` and does not
+care which extension is installed. The migration plan predicted ~40 MB; that was too optimistic, and
+this is the corrected figure.
+
+Active memory, three samples, all identical:
+
+| | |
+|---|---|
+| Resident set size, summed over the container's processes | **102 MiB** |
+| Proportional set size, the same pages divided by their sharers | **30 MiB** |
+| cgroup `memory.current` | 153 MiB |
+
+Those are three different quantities and the difference is the point. `memory.current` includes page
+cache, which is why the earlier attempt at this table refused to substitute it. Summed RSS
+double-counts PostgreSQL's shared buffers across its processes. PSS divides shared pages by the number
+of processes mapping them, and is the only one of the three that answers "what does this instance
+actually cost". The container's true footprint is between the two: 102 MiB is what it holds resident,
+30 MiB is what is not shared with itself.
 
 The volume is deliberately at the small end. A PVC can be expanded in place and can never be
 shrunk, and a StatefulSet's `volumeClaimTemplates` is immutable — so the default is permanent for
 every database created under it. Too small is a patch; too large is forever.
 
 `config/postgresql.conf` caps `max_wal_size` at 256MB for the same reason. Left at the PostgreSQL
-default of 1GB, the write-ahead log alone can claim more than a 1Gi volume before a single document
-is stored.
+default of 1GB, the write-ahead log alone can claim more than a 1Gi volume before a single row is
+stored.
 
-Growing a database past its tier is expansion in place, not a migration — design in
-[docs/storage-tiers.md](docs/storage-tiers.md). Not built yet.
+**Volume expansion is online.** Patching a PVC from 1Gi to 2Gi grew the filesystem from 974M to 2.0G
+with the database still running, no restart, and no `FileSystemResizePending` condition — so a resize
+is invisible to a tenant rather than costing them a pod cycle. That settles the open question in
+[docs/storage-tiers.md](docs/storage-tiers.md) and removes a required step from
+[#10](https://github.com/drigolabs/drigodb/issues/10).
 
-**Active memory is not currently comparable across the two columns.** The `~114 MiB` (PostgreSQL 110,
-gateway 4) is resident set size. The DigitalOcean cluster had no metrics-server, so the only reading
-available was the cgroup's `memory.current` — 167 MiB and 3 MiB — which includes page cache and is
-not the same quantity. It needs a proper measurement rather than a substituted one.
+### How many databases fit on a node
 
-An earlier run of this table recorded 176s to provision on DigitalOcean. A second cluster of the same
-size in the same region did it in 50s, so that figure was not representative and has been replaced.
-Every DigitalOcean number here is still a single observation.
+Two, on this one — and the limit is not what was expected.
+
+| | |
+|---|---|
+| Node allocatable | 1500 MiB memory, 920m CPU |
+| Requested with 2 databases + the control plane | 1222 MiB (83%), 762m CPU (82%) |
+| A third database | **would not schedule** — `Insufficient memory` |
+| Block volumes attachable per node (`dobs.csi.digitalocean.com`) | **15** |
+
+The volume ceiling is real but far away; memory requests bind first, by a wide margin. And the request
+is what binds, not the usage: a database *requests* 256Mi and *holds* 102 MiB, so the scheduler
+reserves roughly 2.5× what an idle database uses.
+
+**A hibernated database is not a reservation.** Waking one on a full node can fail: its memory was
+returned when it hibernated, and databases provisioned since may hold it. That happened during this
+measurement run and is why the wake figure is n=2 rather than n=3.
 
 Compute therefore tracks *concurrent* databases, not total ones. Storage tracks total, at the
 provisioned volume size each — that is the term that grows with signups.
