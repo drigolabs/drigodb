@@ -214,31 +214,34 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    env:
-      CLUSTER: ${{ vars.DRIGODB_DO_CLUSTER || 'drigodb' }}
     steps:
       # The merged commit, which is also what the tag now points at.
       - uses: actions/checkout@v5
 
+      # No doctl, and no DigitalOcean token. CI holds a ServiceAccount token
+      # scoped to what deploying actually does, minted by scripts/doks-up.sh —
+      # which already runs as an administrator, because creating the cluster
+      # requires one.
+      #
+      # What this replaces: a kubeconfig fetched from DigitalOcean at deploy
+      # time, which authenticates as the account owner and is cluster-admin,
+      # because DigitalOcean has no lesser kubeconfig to issue. A leaked
+      # repository secret reached the whole account rather than one deployment.
       - name: Is there anywhere to deploy to?
         id: target
         env:
-          DO_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          DEPLOY_TOKEN: ${{ secrets.DRIGODB_DEPLOY_TOKEN }}
+          SERVER: ${{ secrets.DRIGODB_CLUSTER_SERVER }}
         run: |
-          if [ -z "$DO_TOKEN" ]; then
-            echo "::notice::DIGITALOCEAN_ACCESS_TOKEN is not set — image published, deploy skipped."
+          if [ -z "$DEPLOY_TOKEN" ] || [ -z "$SERVER" ]; then
+            echo "::notice::No deploy credential — image ${{ needs.version.outputs.version }} is published, deploy skipped. Run scripts/doks-up.sh to mint one."
             echo "go=false" >> "$GITHUB_OUTPUT"
           else
             echo "go=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: digitalocean/action-doctl@v2
-        if: steps.target.outputs.go == 'true'
-        with:
-          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
-
-      # doctl writes a kubeconfig but does not bring a kubectl. The hosted
-      # runner ships one; this is the guard for the day it does not.
+      # The hosted runner ships a kubectl; this is the guard for the day it
+      # does not.
       - name: Ensure kubectl
         if: steps.target.outputs.go == 'true'
         run: |
@@ -249,18 +252,31 @@ jobs:
           fi
           kubectl version --client
 
-      - name: Fetch kubeconfig, or stand down
+      - name: Can the cluster be reached, or stand down?
         id: cluster
         if: steps.target.outputs.go == 'true'
+        env:
+          DEPLOY_TOKEN: ${{ secrets.DRIGODB_DEPLOY_TOKEN }}
+          SERVER: ${{ secrets.DRIGODB_CLUSTER_SERVER }}
+          CA: ${{ secrets.DRIGODB_CLUSTER_CA }}
         run: |
-          # The cluster is torn down between sessions to stop billing. Its
-          # absence is a normal state of the world, not a broken pipeline.
-          if ! doctl kubernetes cluster get "$CLUSTER" >/dev/null 2>&1; then
-            echo "::notice::DOKS cluster '${CLUSTER}' is not running — image ${{ needs.version.outputs.version }} is published and will deploy on the next \`scripts/doks-up.sh && scripts/deploy.sh\`."
+          printf '%s' "$CA" | base64 -d > /tmp/ca.crt
+          kubectl config set-cluster drigodb --server="$SERVER" --certificate-authority=/tmp/ca.crt --embed-certs=true >/dev/null
+          kubectl config set-credentials deployer --token="$DEPLOY_TOKEN" >/dev/null
+          kubectl config set-context drigodb --cluster=drigodb --user=deployer >/dev/null
+          kubectl config use-context drigodb >/dev/null
+
+          # Asking whether the cluster ANSWERS, rather than whether a provider
+          # API says it exists. The old check asked DigitalOcean, which a
+          # read-scoped token could do — so it passed while the very next call
+          # failed 403, and seven releases reported success without ever
+          # deploying. A check that does not use the credential it is checking
+          # is not a check. See issue #15.
+          if ! kubectl --request-timeout=20s get namespace drigodb-system >/dev/null 2>&1; then
+            echo "::notice::Cluster unreachable — image ${{ needs.version.outputs.version }} is published and will deploy on the next \`scripts/doks-up.sh && scripts/deploy.sh\`."
             echo "up=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          doctl kubernetes cluster kubeconfig save "$CLUSTER" >/dev/null
           echo "up=true" >> "$GITHUB_OUTPUT"
 
       - name: Deploy

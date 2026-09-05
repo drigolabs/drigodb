@@ -150,6 +150,12 @@ scripts/next-version.sh --why
 torn down between sessions. A merge with no cluster running publishes the image, says so, and stops —
 `scripts/doks-up.sh && scripts/deploy.sh` picks it up later.
 
+The pipeline decides that by **asking whether the cluster answers**, using the credential it is about
+to deploy with. It used to ask DigitalOcean whether the cluster existed, which a read-scoped token
+could do — so the check passed while the very next call failed `403`, and seven releases reported a
+successful deploy without ever deploying. A check that does not exercise the credential it is checking
+is not a check. See [#15](https://github.com/drigolabs/drigodb/issues/15).
+
 ### The data-plane image
 
 `drigodb-backup` carries the PostgreSQL major it is built against, not this repo's version, so it is
@@ -168,13 +174,26 @@ one — and the DocumentDB era proved that exactly: a dump that exits zero and r
 
 ### Setting it up
 
-The pipeline needs three things arranged once:
+The pipeline needs two things arranged once, and neither is a token you create by hand:
 
-1. **`DIGITALOCEAN_ACCESS_TOKEN`** as a repository secret. `kubernetes: read` is the whole scope it
-   needs — the pipeline fetches a kubeconfig and nothing more, because creating the cluster starts
-   billing and stays a deliberate `doks-up.sh`. Without the secret the pipeline still builds and
-   publishes; it just reports the deploy as skipped. Set the repository variable
-   `DRIGODB_DO_CLUSTER` too if the cluster is not named `drigodb`.
+1. **Nothing, for the deploy credential.** `scripts/doks-up.sh` mints it and pushes it to the
+   repository itself, because that script already runs as an administrator — creating a cluster
+   requires one — and that is the right place for the privileged step.
+
+   It creates a `drigodb-deployer` ServiceAccount scoped to what deploying actually does, and sets
+   `DRIGODB_DEPLOY_TOKEN`, `DRIGODB_CLUSTER_SERVER` and `DRIGODB_CLUSTER_CA`. CI never calls the
+   DigitalOcean API. The credential dies with the cluster, which is the point: one that outlives what
+   it grants access to is one nobody remembers to revoke.
+
+   This replaces a `DIGITALOCEAN_ACCESS_TOKEN` that the pipeline used to exchange for a kubeconfig at
+   deploy time. That kubeconfig authenticates as the **account owner** and is cluster-admin — verified,
+   it can delete nodes and read every Secret in the cluster — because DigitalOcean has no lesser
+   kubeconfig to issue. A leaked repository secret reached the whole account rather than one
+   deployment. **If `DIGITALOCEAN_ACCESS_TOKEN` is still set on the repository, delete it**; nothing
+   reads it any more.
+
+   Without the secrets the pipeline still builds and publishes; it just reports the deploy as skipped.
+
 2. **Write access from this repo to the GHCR packages.** The three packages were first pushed by hand
    with a personal token, so they are not yet linked to the repository. On each package's page →
    *Package settings* → *Manage Actions access* → add `drigolabs/drigodb` with **Write**, or the

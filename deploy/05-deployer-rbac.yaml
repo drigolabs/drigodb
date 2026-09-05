@@ -1,0 +1,166 @@
+# The identity CI deploys with.
+#
+# WHY THIS EXISTS
+#
+# The pipeline used to fetch a kubeconfig from DigitalOcean at deploy time. That
+# kubeconfig authenticates as the ACCOUNT OWNER and is cluster-admin — it can
+# delete nodes and read every Secret in the cluster — because DigitalOcean has
+# no lesser kubeconfig to issue. So CI held a credential vastly stronger than
+# the job it does, and a leaked repository secret reached the whole account
+# rather than one deployment.
+#
+# This is the credential that job actually needs. It is created by
+# scripts/doks-up.sh, which already runs as an administrator because creating
+# the cluster requires one, and its token is pushed to the repository secret
+# from there. CI never calls the DigitalOcean API at all.
+#
+# It dies with the cluster, which is the point: the cluster is deliberately
+# ephemeral, and a credential that outlives what it grants access to is a
+# credential nobody remembers to revoke.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: drigodb-deployer
+  namespace: drigodb-system
+---
+# The only thing the deployer needs cluster-wide. `apply` reads before it
+# writes, so get and patch are required alongside create.
+#
+# Deliberately NOT a ClusterRole over the workload resources: secrets, in
+# particular, are granted in two namespaces below rather than everywhere. Read
+# access to every Secret in a cluster is most of what cluster-admin is worth in
+# practice, and it is the specific thing this change exists to take away.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: drigodb-deployer
+rules:
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["create", "get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: drigodb-deployer
+subjects:
+  - kind: ServiceAccount
+    name: drigodb-deployer
+    namespace: drigodb-system
+roleRef:
+  kind: ClusterRole
+  name: drigodb-deployer
+  apiGroup: rbac.authorization.k8s.io
+---
+# The control plane's own namespace: its Deployment, Service, token Secret, and
+# the port-forward the release workflow reads /healthz through.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: drigodb-deployer
+  namespace: drigodb-system
+rules:
+  # watch, because `kubectl rollout status` opens one. Without it the command
+  # still finishes — it falls back to polling — but prints a stream of
+  # "Failed to watch ... forbidden" that reads like a broken deploy.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "get", "list", "watch", "patch", "update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/status"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["services", "secrets", "serviceaccounts", "configmaps"]
+    verbs: ["create", "get", "list", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  # `kubectl port-forward`, which is how the release workflow proves the version
+  # it just published is the version being served.
+  - apiGroups: [""]
+    resources: ["pods/portforward"]
+    verbs: ["create"]
+---
+# The database namespace: the config and migration ConfigMaps, plus the API's
+# own Role and RoleBinding.
+#
+# A subject cannot grant permissions it does not itself hold, so the rules below
+# repeat what deploy/10-rbac.yaml gives the API. The alternative is the
+# `escalate` verb, which lets a subject write any Role it likes — a strictly
+# larger privilege than the one it is trying to grant, and the wrong trade for
+# saving a dozen lines.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: drigodb-deployer
+  namespace: drigodb-databases
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["create", "get", "list", "patch", "update"]
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["roles", "rolebindings"]
+    verbs: ["create", "get", "list", "patch", "update", "bind"]
+  # Mirrors deploy/10-rbac.yaml. Held so the API's Role can be granted, not
+  # because the deployer provisions databases itself.
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["create", "get", "list", "watch", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets/scale"]
+    verbs: ["get", "update", "patch"]
+  - apiGroups: [""]
+    resources: ["services", "secrets", "persistentvolumeclaims"]
+    verbs: ["create", "get", "list", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["create", "get", "list", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["create", "get", "list", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: drigodb-deployer
+  namespace: drigodb-system
+subjects:
+  - kind: ServiceAccount
+    name: drigodb-deployer
+    namespace: drigodb-system
+roleRef:
+  kind: Role
+  name: drigodb-deployer
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: drigodb-deployer
+  namespace: drigodb-databases
+subjects:
+  - kind: ServiceAccount
+    name: drigodb-deployer
+    namespace: drigodb-system
+roleRef:
+  kind: Role
+  name: drigodb-deployer
+  apiGroup: rbac.authorization.k8s.io
+---
+# A non-expiring token, deliberately.
+#
+# `kubectl create token` mints a bounded one, and a token that expires while the
+# cluster still exists would fail a deploy for a reason nobody would connect to
+# a clock. This one is revoked by deleting the ServiceAccount, and dies with the
+# cluster regardless.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: drigodb-deployer-token
+  namespace: drigodb-system
+  annotations:
+    kubernetes.io/service-account.name: drigodb-deployer
+type: kubernetes.io/service-account-token
