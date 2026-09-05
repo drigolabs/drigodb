@@ -15,6 +15,10 @@ token; [decision 0002](../decisions/0002-gitops-for-the-control-plane.md) chose 
 reconciliation instead, and issues #48–#51 are the distance between the two. The transition table at
 the end says which piece moves when.
 
+**"Reconciler" throughout means a Kubernetes controller — Flux or Argo CD — running inside the cluster,
+pulling desired state from this repository and applying it.** The OpenGitOps principles call it a
+"software agent", which was unambiguous when they were written and is not any more.
+
 The shape it is aiming at: **CI never touches the cluster.** It publishes an image and says so. A
 reconciler inside the cluster converges on what Git declares. The only credential that ever leaves a
 laptop is one that can write to GHCR.
@@ -46,7 +50,7 @@ sequenceDiagram
     Note right of K8s: Created once, never regenerated.<br/>A manifest that MINTS a token would<br/>rotate every consumer's credential<br/>on each sync. See #49.
 
     K8s->>Repo: read (deploy key, or a public repo)
-    Note over K8s,Repo: The agent pulls. Nothing is pushed to it,<br/>so no credential for this cluster exists<br/>anywhere outside it.
+    Note over K8s,Repo: The reconciler pulls. Nothing is pushed to it,<br/>so no credential for this cluster exists<br/>anywhere outside it.
 ```
 
 No ServiceAccount minted for CI, no repository secrets pushed, and nothing to go stale when the cluster
@@ -85,20 +89,20 @@ sequenceDiagram
     autonumber
     actor Dev as Developer
     participant Repo as Git repository
-    participant Agent as Reconciler (in cluster)
+    participant Recon as Reconciler (in cluster)
     participant K8s as Cluster
     participant API as drigodb-api
 
     Dev->>Repo: merge the pin bump (one line in the overlay)
     loop every sync interval
-        Agent->>Repo: pull
-        Agent->>Agent: render the kustomize overlay
-        Agent->>K8s: apply what differs
+        Recon->>Repo: pull
+        Recon->>Recon: render the kustomize overlay
+        Recon->>K8s: apply what differs
     end
     K8s->>API: roll the Deployment onto the new image
     API-->>K8s: Ready
 
-    Note over Agent,K8s: Drift is corrected the same way.<br/>A hand-edited Deployment is reverted<br/>on the next sync rather than surviving<br/>until someone notices.
+    Note over Recon,K8s: Drift is corrected the same way.<br/>A hand-edited Deployment is reverted<br/>on the next sync rather than surviving<br/>until someone notices.
 ```
 
 A local `kind` cluster reconciling the same repository runs **this same loop with the same controller**
@@ -128,7 +132,7 @@ sequenceDiagram
 
 The data plane is **not** reconciled from Git and cannot be: a hosted database is created at runtime by
 a customer's API call, and representing it in Git would mean a commit per signup. So there are two
-reconcilers — the agent converging the control plane on Git, and the control plane converging databases
+reconcilers — the reconciler converging the control plane on Git, and the control plane converging databases
 on its own compiled-in template. 0002 explains why that is coherent rather than inconsistent.
 
 ## Which credential does what
@@ -138,7 +142,7 @@ on its own compiled-in template. 0002 explains why that is coherent rather than 
 | DigitalOcean personal token | the laptop, via `doctl auth` | the whole account | creating and deleting the cluster |
 | DO-issued kubeconfig | the laptop, transiently | cluster-admin | installing the reconciler |
 | `GITHUB_TOKEN` | GitHub Actions | GHCR packages, the repo's tags | publishing images, tagging |
-| the agent's repository read | inside the cluster | one repository, read-only | pulling desired state |
+| the reconciler's repository read | inside the cluster | one repository, read-only | pulling desired state |
 
 **Nothing outside the cluster can write to the cluster.** That is the whole point, and it is the third
 step in the same direction: an account-owner kubeconfig became a two-namespace ServiceAccount token in
@@ -151,7 +155,7 @@ step in the same direction: an account-owner kubeconfig became a two-namespace S
 | API image pinned in Git, not resolved from the newest tag at apply time | [#48](https://github.com/drigolabs/drigodb/issues/48) |
 | `deploy.sh`'s `sed`, generated token and `--dry-run \| apply` become manifests | [#49](https://github.com/drigolabs/drigodb/issues/49) |
 | Flux or Argo CD chosen, measured on a real node | [#50](https://github.com/drigolabs/drigodb/issues/50) |
-| Agent installed by `doks-up.sh`; deploy job and its three secrets deleted | [#51](https://github.com/drigolabs/drigodb/issues/51) |
+| Reconciler installed by `doks-up.sh`; deploy job and its three secrets deleted | [#51](https://github.com/drigolabs/drigodb/issues/51) |
 | A local cluster runs the same loop | [#52](https://github.com/drigolabs/drigodb/issues/52) |
 
 Until #51, the flow that actually runs is a push from CI holding

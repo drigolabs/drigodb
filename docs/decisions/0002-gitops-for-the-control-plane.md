@@ -9,6 +9,10 @@ related:
 
 # GitOps for the control plane, and not for the data plane
 
+**"Reconciler" below means a Kubernetes controller — Flux or Argo CD — running inside the cluster,
+pulling desired state from this repository and applying it. The OpenGitOps principles call it a
+"software agent"; that word has since been taken.**
+
 **Decision:** adopt pull-based reconciliation for the control plane, with **manual pin promotion** and
 **no image automation writing to the repository**. The data plane stays API-provisioned, because it
 cannot be anything else.
@@ -29,7 +33,7 @@ The promotion path is GitOps-shaped too. CI publishes a build, files a standing 
 diff, and a human merges the pin. That is the promotion model with an issue standing in for a bot pull
 request.
 
-What is missing is not the idea. It is that the loop runs inside the API process rather than an agent,
+What is missing is not the idea. It is that the loop runs inside the API process rather than a reconciler,
 fires on wake rather than continuously, and covers the data plane rather than the control plane.
 
 ## The contradiction shipping today
@@ -54,30 +58,30 @@ So the end state has two reconcilers with two sources of truth:
 
 | | Desired state lives in | Reconciled by |
 |---|---|---|
-| Control plane (`drigodb-system`) | Git | a pull agent |
+| Control plane (`drigodb-system`) | Git | a reconciler in the cluster |
 | Hosted databases (`drigodb-databases`) | the cluster, by design | the control plane, on wake |
 
 That is coherent, and it is worth stating plainly because it looks like an inconsistency until you ask
 where a database's existence could otherwise be recorded.
 
-It also caps the payoff honestly: the agent would manage one Deployment, one Service, two ConfigMaps and
+It also caps the payoff honestly: the reconciler would manage one Deployment, one Service, two ConfigMaps and
 some RBAC, while the component managing hundreds of objects stays imperative because it must.
 
 ## Why adopt it anyway
 
-**The push credential disappears.** An agent pulling from inside the cluster holds no credential outside
+**The push credential disappears.** A reconciler pulling from inside the cluster holds no credential outside
 it. That is strictly better than the scoped ServiceAccount token in
 [docs/diagrams/deploy-flow.md](../diagrams/deploy-flow.md), which is itself a large improvement on the
 account-owner kubeconfig it replaced. The direction of travel is the same one twice.
 
 **Cluster recreation gets simpler, not harder.** Today `doks-up.sh` creates a cluster, mints a
-ServiceAccount, pushes three repository secrets, and then someone runs `deploy.sh`. With an agent it
-installs the agent and stops; the control plane arrives from Git. Fewer moving parts, and no secrets to
+ServiceAccount, pushes three repository secrets, and then someone runs `deploy.sh`. With a reconciler it
+installs that and stops; the control plane arrives from Git. Fewer moving parts, and no secrets to
 go stale when the cluster is deleted.
 
 **Local verification stops being a parallel path.** The intended development loop ends with a local
 cluster pulling published images "as it would remotely". Today that means running `deploy.sh` locally
-and trusting it matches what CI does — two code paths pretending to be one. Under a pull agent, a kind
+and trusting it matches what CI does — two code paths pretending to be one. Under a reconciler, a kind
 cluster reconciles the same repository with the same controller, and "as it would remotely" becomes true
 rather than approximate.
 
@@ -99,7 +103,7 @@ cost is one merge per release — which the data-plane images already pay, throu
 
 ## Prerequisites
 
-An agent cannot reconcile a shell script, so `deploy.sh`'s imperative parts have to go first. That work
+Nothing can reconcile a shell script, so `deploy.sh`'s imperative parts have to go first. That work
 is worth doing on its own merits and does not commit anyone to this decision:
 
 - the API image pinned in Git, not resolved from the newest tag at apply time
@@ -110,7 +114,7 @@ is worth doing on its own merits and does not commit anyone to this decision:
 
 ## What this does not decide
 
-Which agent. Flux's source and kustomize controllers are the smaller fit — Argo CD brings a UI and an
+Which reconciler. Flux's source and kustomize controllers are the smaller fit — Argo CD brings a UI and an
 account model that one operator and one consumer do not need — but that comparison should be made
 against a prerequisite branch that actually exists, not in the abstract.
 
