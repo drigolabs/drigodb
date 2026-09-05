@@ -9,6 +9,7 @@ means arguing with the reasoning rather than guessing at it.
 | [Leaving DocumentDB](../leaving-documentdb.md) | Drop MongoDB wire-protocol compatibility, the extension and the gateway; applications speak PostgreSQL |
 | [0001 — Instance per database over a shared cluster](0001-instance-per-database-over-a-shared-cluster.md) | Keep one PostgreSQL instance per hosted database; the shared tier is possible but not built |
 | [0002 — GitOps for the control plane](0002-gitops-for-the-control-plane.md) | Pull-based reconciliation for the control plane, manual pin promotion, nothing writing to `main`; the data plane stays API-provisioned |
+| [0003 — Flux over Argo CD](0003-flux-over-argo-cd.md) | Argo CD regenerates the API token on every refresh while reporting Synced; Flux preserves it, and costs a third as much |
 
 `leaving-documentdb.md` predates this folder and stays where it is: the README, several issues and a
 merged pull request link to it by path. Worth consolidating the next time something else moves.
