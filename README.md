@@ -118,7 +118,8 @@ at first start, so a client can encrypt but cannot verify it. A real issuer is
 
 ## Continuous delivery
 
-Merging to `main` is the whole release process. `.github/workflows/release.yml` reads the
+Merging to `main` is the whole release process. The flow end to end, and which credential each step
+holds, is in [docs/diagrams/deploy-flow.md](docs/diagrams/deploy-flow.md). `.github/workflows/release.yml` reads the
 Conventional Commit subjects since the last tag, and if they earned a version it builds the API image
 for both architectures, publishes it under an immutable tag, tags the merged commit, cuts a GitHub
 release, and rolls it out to DOKS — then reads `/healthz` back to confirm the cluster is serving the
