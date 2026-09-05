@@ -72,26 +72,19 @@ else
 fi
 
 step "Control plane"
-# Substitution is anchored on the image name rather than a placeholder, so
-# deploy/20-api.yaml stays a valid manifest you can read, diff, and apply by
-# hand. Only the overrides that are actually set become sed expressions —
-# an empty one would blank the line rather than leave the pinned value alone.
-# Nothing writes the released version back into deploy/20-api.yaml any more —
-# that would mean a pipeline pushing to main, and a main no one can push to is
-# worth more than the bookkeeping. The newest v-tag is the record of what was
-# released, so a hand-run deploy tracks the latest release without anyone
-# editing a manifest. Falls back to whatever the manifest pins if there are no
-# tags yet.
-if [ -z "${DRIGODB_API_IMAGE:-}" ]; then
-  # Best-effort: the tag is created by CI, so a local clone may not have it yet.
-  git -C "$ROOT" fetch --tags --quiet >/dev/null 2>&1 || true
-  LATEST="$(git -C "$ROOT" tag --list 'v[0-9]*' --sort=-v:refname 2>/dev/null | head -1)"
-  if [ -n "$LATEST" ]; then
-    DRIGODB_API_IMAGE="${DRIGODB_REGISTRY:-ghcr.io/drigolabs}/drigodb-api:${LATEST#v}"
-    note "deploying the newest release, ${LATEST}"
-  fi
-fi
-
+# deploy/20-api.yaml is the record of what is deployed, and it is read as
+# written. This used to resolve the newest v-tag here instead, which was
+# convenient and made the manifest a decoy: two clusters applying the same
+# commit a week apart ran different images, so a commit did not describe a
+# deployment. The pin had also been stale at 0.0.1 for seven releases without
+# anyone noticing, because nothing ever read it.
+#
+# Moving the pin is now a merge. CI publishes an image and rewrites a standing
+# issue carrying the one-line diff; a human merges it. That is deliberately not
+# a pipeline pushing to main — see the release workflow.
+#
+# The overrides below remain for deploying something other than what is pinned:
+# a branch build, a bisect, a local image on kind.
 SED_ARGS=()
 if [ -n "${DRIGODB_API_IMAGE:-}" ]; then
   SED_ARGS+=(-e "s#^\( *image: \).*drigodb-api:.*#\1${DRIGODB_API_IMAGE}#")

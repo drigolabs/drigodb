@@ -208,6 +208,73 @@ jobs:
             --title "v${{ needs.version.outputs.version }}" \
             --generate-notes
 
+  # A release publishes an image and stops. This is what says so — the one-line
+  # diff that would ship it, in an issue rewritten by each release rather than
+  # duplicated per version.
+  #
+  # Deliberately not a pull request opened by Actions. That needs the repository
+  # setting granting workflows permission to create AND approve pull requests,
+  # and a workflow that can approve its own can satisfy a required review by
+  # itself. So CI reports and a human opens the pull request — the same trade
+  # images.yml makes, for the same reason.
+  notify:
+    name: report the pin
+    needs: [version, manifest, tag]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Work out whether the pin moved
+        id: diff
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          IMG: ${{ env.IMAGE }}
+        run: |
+          sed -i -E "s#^( *image: ).*drigodb-api:.*#\1${IMG}:${VERSION}#" deploy/20-api.yaml
+          if git diff --quiet; then
+            echo "::notice::deploy/20-api.yaml already pins ${VERSION}."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          git diff > /tmp/pin.patch
+
+      - name: Open or update the standing release issue
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TITLE: "A newer release is ready to pin"
+        run: |
+          {
+            echo "\`v${VERSION}\` is published. It is **not** deployed: \`deploy/20-api.yaml\` is what"
+            echo "is deployed, and a release cannot pin itself — the commit being released does not"
+            echo "yet name the image it is about to build."
+            echo
+            echo "Merging this diff is what ships it."
+            echo
+            echo '\`\`\`diff'
+            cat /tmp/pin.patch
+            echo '\`\`\`'
+            echo
+            echo "Run: ${RUN_URL}"
+            echo
+            echo "_Rewritten by each release rather than duplicated. Close it once the pin is merged._"
+          } > /tmp/issue-body
+
+          EXISTING="$(gh issue list --state open --limit 100 --json number,title \
+            --jq "map(select(.title == \"${TITLE}\")) | .[0].number // empty")"
+          if [ -n "$EXISTING" ]; then
+            gh issue edit "$EXISTING" --body-file /tmp/issue-body
+            echo "::notice::Updated issue #${EXISTING} with the ${VERSION} pin."
+          else
+            gh issue create --title "$TITLE" --body-file /tmp/issue-body
+          fi
+
   deploy:
     name: deploy to DOKS
     needs: [version, manifest, tag]
@@ -279,23 +346,30 @@ jobs:
           fi
           echo "up=true" >> "$GITHUB_OUTPUT"
 
-      - name: Deploy
+      # Deploys what deploy/20-api.yaml pins, which is NOT what this run just
+      # built. The commit being released cannot name the image the release is
+      # about to produce, so a release publishes and the pin moves in a separate
+      # merge. Ordinarily this is a no-op that reconciles anything else that
+      # changed in the same merge — config, RBAC, migrations.
+      - name: Deploy what is pinned
         if: steps.cluster.outputs.up == 'true'
-        env:
-          DRIGODB_API_IMAGE: ${{ env.IMAGE }}:${{ needs.version.outputs.version }}
         run: bash scripts/deploy.sh
 
-      # Proves the rollout served the build this run produced, rather than
-      # trusting that a Ready pod is the new pod.
+      # Asserts the cluster serves what the manifest pins. It used to assert it
+      # served the version this run produced, which was only true because the
+      # deploy step overrode the pin with it.
       - name: Verify the running version
         if: steps.cluster.outputs.up == 'true'
         run: |
+          PINNED="$(sed -nE 's#^ *image: .*drigodb-api:(.*)$#\1#p' deploy/20-api.yaml | head -1)"
+          echo "manifest pins ${PINNED}"
+
           kubectl -n drigodb-system port-forward svc/drigodb-api 8080:80 >/tmp/pf.log 2>&1 &
           for _ in $(seq 1 30); do grep -q "Forwarding from" /tmp/pf.log && break; sleep 1; done
 
           GOT="$(curl -fsS --retry 5 --retry-delay 2 localhost:8080/healthz)"
           echo "$GOT"
           case "$GOT" in
-            *'"version":"${{ needs.version.outputs.version }}"'*) echo "::notice::${{ needs.version.outputs.version }} is live." ;;
-            *) echo "::error::/healthz reports something other than ${{ needs.version.outputs.version }}"; exit 1 ;;
+            *"\"version\":\"${PINNED}\""*) echo "::notice::${PINNED} is live, as pinned." ;;
+            *) echo "::error::/healthz reports something other than the pinned ${PINNED}"; exit 1 ;;
           esac
