@@ -12,6 +12,7 @@
 import { createHash } from "node:crypto";
 
 import type {
+  V1Job,
   V1NetworkPolicy,
   V1PodTemplateSpec,
   V1Secret,
@@ -112,6 +113,10 @@ export function serviceName(id: string): string {
 
 export function secretName(id: string): string {
   return `db-${id}-credentials`;
+}
+
+export function restoreJobName(id: string): string {
+  return `restore-${id}`;
 }
 
 export function labelsFor(id: string, externalId: string): Record<string, string> {
@@ -275,6 +280,91 @@ export function buildPodTemplate(id: string, externalId: string): V1PodTemplateS
           configMap: { name: MIGRATIONS_CONFIG_MAP_NAME, defaultMode: 0o640 },
         },
       ],
+    },
+  };
+}
+
+// Loads a dump into a freshly provisioned database.
+//
+// A Job, and an ORDINARY CONSUMER of the database rather than a privileged path
+// into it. It connects over TCP to the Service with the app's own credentials,
+// carrying the same `drigodb.io/allow-database` label any consumer opts in
+// with, and holds nothing the isolation model does not already hand out. There
+// is no socket to share — a Job is its own pod — and that is the point: a
+// logical restore is a client executing SQL, so it should look like one.
+//
+// The alternative, running it inside the database pod, would mean the restore
+// path needed the pod template to carry a one-shot instruction that every later
+// wake would have to reason about. This leaves the template alone.
+//
+// ttlSecondsAfterFinished so a succeeded Job removes itself. A failed one stays
+// until the database is deleted, because its logs are the only account of why a
+// restore did not happen.
+export function buildRestoreJob(
+  id: string,
+  externalId: string,
+  source: string,
+): V1Job {
+  const labels = {
+    ...labelsFor(id, externalId),
+    // Opts this pod through the database's own NetworkPolicy — the same way a
+    // consumer does, rather than by widening the policy for restores.
+    [ALLOW_LABEL]: id,
+  };
+  return {
+    apiVersion: "batch/v1",
+    kind: "Job",
+    metadata: { name: restoreJobName(id), namespace: config.databaseNamespace, labels },
+    spec: {
+      backoffLimit: 3,
+      ttlSecondsAfterFinished: 3600,
+      template: {
+        metadata: { labels },
+        spec: {
+          restartPolicy: "OnFailure",
+          automountServiceAccountToken: false,
+          containers: [
+            {
+              name: "restore",
+              image: config.backup.image,
+              args: ["restore-remote"],
+              env: [
+                { name: "DRIGODB_DATABASE_ID", value: id },
+                { name: "DRIGODB_RESTORE_SOURCE", value: source },
+                { name: "DRIGODB_BACKUP_BUCKET", value: config.backup.bucket },
+                { name: "DRIGODB_BACKUP_ENDPOINT", value: config.backup.endpoint },
+                { name: "PGHOST", value: endpointHost(id) },
+                { name: "PGPORT", value: String(POSTGRES_PORT) },
+                { name: "PGUSER", value: DB_USER },
+                { name: "PGDATABASE", value: DB_NAME },
+                // require, not verify-full: the server self-signs, exactly as
+                // it does for any other client. Issue #9 changes both together.
+                { name: "PGSSLMODE", value: "require" },
+                {
+                  name: "PGPASSWORD",
+                  valueFrom: { secretKeyRef: { name: secretName(id), key: PASSWORD_SECRET_KEY } },
+                },
+                {
+                  name: "DRIGODB_BACKUP_KEY",
+                  valueFrom: {
+                    secretKeyRef: { name: config.backup.secretName, key: BACKUP_KEY_SECRET_KEY },
+                  },
+                },
+                {
+                  name: "DRIGODB_BACKUP_SECRET",
+                  valueFrom: {
+                    secretKeyRef: { name: config.backup.secretName, key: BACKUP_SECRET_SECRET_KEY },
+                  },
+                },
+              ],
+              resources: {
+                requests: { cpu: BACKUP_CPU_REQUEST, memory: BACKUP_MEMORY_REQUEST },
+                limits: { memory: BACKUP_MEMORY_LIMIT },
+              },
+            },
+          ],
+        },
+      },
     },
   };
 }

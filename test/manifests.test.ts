@@ -237,3 +237,54 @@ describe("backup sidecar", () => {
     expect(m.templateHash(ID, EXT)).not.toBe(before);
   });
 });
+
+// Restoring into a new database. The Job is deliberately unprivileged: it holds
+// the app's own credential and reaches the database the way any consumer does.
+describe("restore job", () => {
+  async function withBackups() {
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_BACKUP_BUCKET", "drigodb-backups");
+    vi.stubEnv("DRIGODB_BACKUP_ENDPOINT", "https://fra1.digitaloceanspaces.com");
+    return await import("../src/k8s/manifests.js");
+  }
+
+  it("opts through the database's own NetworkPolicy rather than widening it", async () => {
+    const m = await withBackups();
+    const job = m.buildRestoreJob(ID, EXT, "src123/20260905T040000Z.sql.gz");
+    expect(job.metadata?.labels?.[m.ALLOW_LABEL]).toBe(ID);
+    expect(job.spec?.template.metadata?.labels?.[m.ALLOW_LABEL]).toBe(ID);
+  });
+
+  it("connects as the app, over TLS, and never inlines the password", async () => {
+    const m = await withBackups();
+    const job = m.buildRestoreJob(ID, EXT, "src123/20260905T040000Z.sql.gz");
+    const env = job.spec?.template.spec?.containers?.[0]?.env ?? [];
+    const val = (n: string) => env.find((e) => e.name === n)?.value;
+
+    expect(val("PGUSER")).toBe("appuser");
+    expect(val("PGSSLMODE")).toBe("require");
+    expect(val("PGHOST")).toBe(m.endpointHost(ID));
+    expect(val("DRIGODB_RESTORE_SOURCE")).toBe("src123/20260905T040000Z.sql.gz");
+
+    const pw = env.find((e) => e.name === "PGPASSWORD");
+    expect(pw?.value).toBeUndefined();
+    expect(pw?.valueFrom?.secretKeyRef?.name).toBe(`db-${ID}-credentials`);
+  });
+
+  it("carries no service account token", async () => {
+    // It talks to PostgreSQL and to object storage. It has no business with the
+    // Kubernetes API, and a token in a pod that does not need one is a
+    // credential waiting to be misused.
+    const m = await withBackups();
+    const job = m.buildRestoreJob(ID, EXT, "src123/20260905T040000Z.sql.gz");
+    expect(job.spec?.template.spec?.automountServiceAccountToken).toBe(false);
+  });
+
+  it("cleans up after itself when it succeeds", async () => {
+    const m = await withBackups();
+    const job = m.buildRestoreJob(ID, EXT, "src123/20260905T040000Z.sql.gz");
+    expect(job.spec?.ttlSecondsAfterFinished).toBeGreaterThan(0);
+    // Bounded retries: a restore that cannot work should stop, not loop.
+    expect(job.spec?.backoffLimit).toBeLessThanOrEqual(5);
+  });
+});
