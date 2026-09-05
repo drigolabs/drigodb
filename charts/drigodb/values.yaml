@@ -56,7 +56,7 @@ backup:
   # the hostname, and most S3-compatible servers accept us-east-1.
   region: ""
   intervalSeconds: 86400
-  image: ghcr.io/drigolabs/drigodb-backup:18-20260905-b7
+  image: ghcr.io/drigolabs/drigodb-backup:18-20260905-b11
   # Holds access_key and secret_key, in the database namespace. Cluster-wide
   # rather than per database: one bucket, one credential, and the object prefix
   # is what separates tenants inside it. Created outside this chart, because a
