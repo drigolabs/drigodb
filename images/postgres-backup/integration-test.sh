@@ -22,7 +22,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-APP_DB_CONF="${REPO_ROOT}/config"
+APP_DB_CONF="${REPO_ROOT}/charts/drigodb/files"
 
 BK_IMAGE="${1:-drigolabs/drigodb-backup:test}"
 PG_IMAGE="${2:-ghcr.io/cloudnative-pg/postgresql:18}"

@@ -24,7 +24,7 @@ deploy path is touched, and because one thing shipping today quietly contradicts
 
 Half of what people mean by GitOps is in place, and it is worth naming before deciding to "adopt" it.
 
-`deploy/20-api.yaml` pins the data-plane images in Git. The control plane reads them and stamps them
+The chart pins the data-plane images in Git. The control plane reads them and stamps them
 into every StatefulSet it renders, so provisioning or waking a database pulls the image Git names. The
 template-hash reconcile in `src/k8s/provisioner.ts` converges *existing* databases onto it at their next
 wake. Desired state in Git, observed state in the cluster, a loop closing the gap.
@@ -126,7 +126,7 @@ It also fits the reconciler better than the overlay would have. Flux and Argo CD
 Things that stop being defaults and become values someone must set:
 
 - `DRIGODB_STORAGE_CLASS`, which defaults to `do-block-storage` and is meaningless anywhere else
-- the namespace names, currently hardcoded in `deploy/10-rbac.yaml`
+- the namespace names, which were hardcoded in the manifests the chart replaced
 - the image pins, the backup destination, and the API token
 
 `src/config.ts` is already thirteen environment variables with fallbacks, so the configurable surface

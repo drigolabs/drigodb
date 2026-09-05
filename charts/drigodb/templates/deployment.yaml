@@ -1,0 +1,70 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "drigodb.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "drigodb.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.api.replicas }}
+  selector:
+    matchLabels:
+      {{- include "drigodb.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "drigodb.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Rolls the API when the data-plane config changes, so a database
+        # provisioned after an upgrade gets the config the upgrade shipped.
+        checksum/config: {{ include (print $.Template.BasePath "/configmaps.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "drigodb.fullname" . }}
+      containers:
+        - name: api
+          image: {{ include "drigodb.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: DRIGODB_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "drigodb.fullname" . }}-token
+                  key: token
+            - name: DRIGODB_DATABASE_NAMESPACE
+              value: {{ .Values.databaseNamespace | quote }}
+            - name: DRIGODB_STORAGE_CLASS
+              # Empty means the cluster's default. The provisioner omits the
+              # field entirely rather than sending "", which would mean
+              # something else — no storage class at all.
+              value: {{ .Values.database.storageClass | quote }}
+            - name: DRIGODB_STORAGE_SIZE
+              value: {{ .Values.database.storageSize | quote }}
+            - name: DRIGODB_PG_IMAGE
+              value: {{ .Values.database.image | quote }}
+            - name: DRIGODB_ENDPOINT_SUFFIX
+              value: {{ .Values.database.endpointSuffix | quote }}
+            - name: DRIGODB_BACKUP_IMAGE
+              value: {{ .Values.backup.image | quote }}
+            # Backups are off until a bucket AND an endpoint are set. Empty here
+            # on purpose: with no destination configured no sidecar is added,
+            # and a half-configured backup must not be the reason a database
+            # fails to start.
+            - name: DRIGODB_BACKUP_BUCKET
+              value: {{ .Values.backup.bucket | quote }}
+            - name: DRIGODB_BACKUP_ENDPOINT
+              value: {{ .Values.backup.endpoint | quote }}
+            - name: DRIGODB_BACKUP_REGION
+              value: {{ .Values.backup.region | quote }}
+            - name: DRIGODB_BACKUP_INTERVAL
+              value: {{ .Values.backup.intervalSeconds | quote }}
+            - name: DRIGODB_BACKUP_SECRET
+              value: {{ .Values.backup.credentialsSecret | quote }}
+          readinessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}

@@ -1,0 +1,67 @@
+# drigodb — PostgreSQL databases, provisioned through an API.
+#
+# The only value most installations need to think about is
+# `database.storageClass`, and only if the cluster has no default.
+
+image:
+  repository: ghcr.io/drigolabs/drigodb-api
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+api:
+  replicas: 1
+  # The bearer token every API call carries. Left empty, one is generated on
+  # first install and PRESERVED across upgrades — see templates/secret-api-token.yaml
+  # for why that has to be deliberate rather than incidental.
+  token: ""
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits: { memory: 256Mi }
+
+# The namespace hosted databases are provisioned into. Separate from the
+# release namespace on purpose: it is the blast radius of the API's RBAC, and
+# the two are worth being able to reason about apart.
+databaseNamespace: drigodb-databases
+
+database:
+  # Empty means the cluster's default StorageClass. That is what makes this
+  # installable on kind, EKS or GKE without being told which — set it only if
+  # the cluster has no default, or the default is the wrong one.
+  #
+  #   DigitalOcean  do-block-storage
+  #   kind          standard
+  storageClass: ""
+
+  # Deliberately at the small end. A PVC can be expanded in place and can never
+  # be shrunk, and a StatefulSet's volumeClaimTemplates is immutable — so this
+  # value is permanent for every database created under it. Too small is a
+  # patch; too large is forever.
+  storageSize: 1Gi
+
+  # The PostgreSQL a hosted database runs. CNPG's official image; drigodb does
+  # not build one.
+  image: ghcr.io/cloudnative-pg/postgresql:18
+
+  # The DNS suffix used to build connection endpoints.
+  endpointSuffix: svc.cluster.local
+
+# Off unless a bucket and an endpoint are set. With neither, no sidecar is added
+# at all — a database is exactly what it was before, rather than one carrying a
+# container that cannot do its job.
+backup:
+  bucket: ""
+  endpoint: ""
+  # Derived from the endpoint when empty: DigitalOcean Spaces puts the region in
+  # the hostname, and most S3-compatible servers accept us-east-1.
+  region: ""
+  intervalSeconds: 86400
+  image: ghcr.io/drigolabs/drigodb-backup:18-20260905-b7
+  # Holds access_key and secret_key, in the database namespace. Cluster-wide
+  # rather than per database: one bucket, one credential, and the object prefix
+  # is what separates tenants inside it. Created outside this chart, because a
+  # chart that generated it would rotate it on every sync.
+  credentialsSecret: drigodb-backup-credentials
+
+nameOverride: ""
+fullnameOverride: ""

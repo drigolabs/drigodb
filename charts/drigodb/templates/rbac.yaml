@@ -1,22 +1,28 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: drigodb-api
-  namespace: drigodb-system
+  name: {{ include "drigodb.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "drigodb.labels" . | nindent 4 }}
 ---
-# Deliberately a Role, not a ClusterRole: the API can act only inside
-# drigodb-databases. It cannot read a Secret anywhere else in the cluster.
+{{/*
+Deliberately a Role, not a ClusterRole: the API can act only inside the database
+namespace. It cannot read a Secret anywhere else in the cluster.
+*/}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: drigodb-api
-  namespace: drigodb-databases
+  name: {{ include "drigodb.fullname" . }}
+  namespace: {{ .Values.databaseNamespace }}
+  labels:
+    {{- include "drigodb.labels" . | nindent 4 }}
 rules:
   - apiGroups: ["apps"]
     resources: ["statefulsets"]
     # patch, so wake can rewrite a hibernated database's pod template onto the
-    # images and probes this build renders. Not update: the whole-object verb
-    # is not needed, and a StatefulSet's selector, serviceName and
+    # images and probes this build renders. Not update: the whole-object verb is
+    # not needed, and a StatefulSet's selector, serviceName and
     # volumeClaimTemplates are immutable anyway.
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
   - apiGroups: ["apps"]
@@ -34,11 +40,7 @@ rules:
   - apiGroups: ["batch"]
     resources: ["jobs"]
     # Restoring into a new database runs as a Job, which connects to the
-    # database over TCP as an ordinary consumer rather than through any path the
-    # isolation model does not already hand out. get, so a restore in progress
-    # can be reported as a status rather than a database that merely looks
-    # empty; delete, because a failed Job outlives its TTL on purpose and DELETE
-    # is what finally removes it.
+    # database over TCP as an ordinary consumer.
     verbs: ["create", "get", "list", "delete"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
@@ -47,13 +49,15 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: drigodb-api
-  namespace: drigodb-databases
+  name: {{ include "drigodb.fullname" . }}
+  namespace: {{ .Values.databaseNamespace }}
+  labels:
+    {{- include "drigodb.labels" . | nindent 4 }}
 subjects:
   - kind: ServiceAccount
-    name: drigodb-api
-    namespace: drigodb-system
+    name: {{ include "drigodb.fullname" . }}
+    namespace: {{ .Release.Namespace }}
 roleRef:
   kind: Role
-  name: drigodb-api
+  name: {{ include "drigodb.fullname" . }}
   apiGroup: rbac.authorization.k8s.io

@@ -12,6 +12,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+FILES="${REPO_ROOT}/charts/drigodb/files"
 PG_IMAGE="${1:-ghcr.io/cloudnative-pg/postgresql:18}"
 
 SFX="$$"
@@ -32,12 +33,11 @@ trap cleanup EXIT
 
 fail() { echo "==> FAIL: $1"; docker logs "$C" 2>&1 | tail -25; exit 1; }
 
-# A private copy of config/ and config/migrations/, so the test can add and edit
-# migrations without touching the repository.
-cp "${REPO_ROOT}/config/postgresql.conf" "${REPO_ROOT}/config/pg_hba.conf" \
-   "${REPO_ROOT}/config/bootstrap.sh" "$WORK/"
+# A private copy of the chart's files/, so the test can add and edit migrations
+# without touching the repository.
+cp "${FILES}/postgresql.conf" "${FILES}/pg_hba.conf" "${FILES}/bootstrap.sh" "$WORK/"
 mkdir -p "$WORK/migrations"
-cp "${REPO_ROOT}"/config/migrations/*.sql "$WORK/migrations/"
+cp "${FILES}"/migrations/*.sql "$WORK/migrations/"
 
 # The container runs as uid 26 and mktemp -d is 0700 owned by whoever ran this,
 # so without this the bind mount is unreadable and bootstrap.sh fails with

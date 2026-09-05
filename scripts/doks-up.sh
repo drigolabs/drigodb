@@ -83,7 +83,13 @@ elif ! gh auth status >/dev/null 2>&1; then
   warn "gh not authenticated — skipping. CI cannot deploy until the secrets are set."
 else
   KCTX="do-${REGION}-${CLUSTER}"
-  kubectl --context "$KCTX" apply -f "${ROOT}/deploy/00-namespaces.yaml" >/dev/null
+  # The namespaces come from the chart, but the deployer's Roles live in them and
+  # this runs before anything is installed. Created here rather than depending on
+  # an install that has not happened yet.
+  for ns in drigodb-system drigodb-databases; do
+    kubectl --context "$KCTX" create namespace "$ns" --dry-run=client -o yaml \
+      | kubectl --context "$KCTX" apply -f - >/dev/null
+  done
   kubectl --context "$KCTX" apply -f "${ROOT}/deploy/05-deployer-rbac.yaml" >/dev/null
   ok "drigodb-deployer created"
 

@@ -221,7 +221,7 @@ SQL
       log "migration set has changed; running it"
       # No `|| true`. A checksum mismatch must stop the pod rather than serve a
       # database whose schema has diverged from the migrations in git — and
-      # config/migrations-test.sh asserts exactly that in CI, which is where a
+      # scripts/migrations-test.sh asserts exactly that in CI, which is where a
       # bad edit is meant to be caught rather than on a live fleet.
       if ! run_migrations; then
         pg_ctl -D "${PGDATA}" -m fast -w stop >/dev/null || true

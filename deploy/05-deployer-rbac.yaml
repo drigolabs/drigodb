@@ -85,7 +85,7 @@ rules:
 # own Role and RoleBinding.
 #
 # A subject cannot grant permissions it does not itself hold, so the rules below
-# repeat what deploy/10-rbac.yaml gives the API. The alternative is the
+# repeat what the chart gives the API. The alternative is the
 # `escalate` verb, which lets a subject write any Role it likes — a strictly
 # larger privilege than the one it is trying to grant, and the wrong trade for
 # saving a dozen lines.
@@ -101,7 +101,8 @@ rules:
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings"]
     verbs: ["create", "get", "list", "patch", "update", "bind"]
-  # Mirrors deploy/10-rbac.yaml. Held so the API's Role can be granted, not
+  # Mirrors the Role in charts/drigodb/templates/rbac.yaml. Held so the API's
+  # Role can be granted, not
   # because the deployer provisions databases itself.
   - apiGroups: ["apps"]
     resources: ["statefulsets"]

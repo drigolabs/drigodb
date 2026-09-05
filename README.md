@@ -91,10 +91,24 @@ StatefulSet, and the caller's identifier lives on it as a label.
 
 ## Running it
 
+drigodb installs with Helm, on any cluster:
+
+```bash
+kind create cluster
+helm install drigodb ./charts/drigodb --namespace drigodb-system --create-namespace
+```
+
+That works on a laptop with no cloud account. Verified: a database provisions in
+about 20 seconds, binds kind's default StorageClass, runs its migrations, accepts a TLS connection,
+and survives hibernate and wake. See [charts/drigodb/README.md](charts/drigodb/README.md) for the
+values that matter and the two things kind cannot test.
+
+On DigitalOcean:
+
 ```bash
 bash scripts/publish-images.sh   # multi-arch to GHCR (needs gh auth refresh -s write:packages)
 bash scripts/doks-up.sh          # DigitalOcean cluster — starts billing
-bash scripts/deploy.sh           # control plane; prints the API token once
+bash scripts/deploy.sh           # helm upgrade --install, against the current context
 bash scripts/doks-down.sh        # stop billing
 ```
 
@@ -131,7 +145,7 @@ Nothing in the pipeline writes to `main`. It creates a tag, and a tag is not a b
 protected against everyone. That tag is the record of what shipped: `scripts/next-version.sh` computes
 the next version from it.
 
-**A release does not deploy itself.** `deploy/20-api.yaml` is what is deployed, read as written — the
+**A release does not deploy itself.** The chart's `appVersion` is what is deployed, read as written — the
 commit being released cannot name the image the release is about to build. So publishing and shipping
 are two merges: CI publishes, then rewrites a standing issue carrying the one-line diff that moves the
 pin, and merging that is what ships it. The alternative is a pipeline pushing to `main`, and a `main`

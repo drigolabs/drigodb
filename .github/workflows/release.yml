@@ -182,7 +182,7 @@ jobs:
       # A tag on the commit that was merged, and nothing else.
       #
       # An earlier version of this also committed the version into package.json
-      # and rewrote the image in deploy/20-api.yaml. Both were dropped: the
+      # and rewrote the image pin. Both were dropped: the
       # commit had to be pushed to main, and a branch no one may push to is
       # worth more than a bookkeeping commit. Neither was load-bearing —
       # scripts/next-version.sh reads tags, the image takes its version from a
@@ -233,9 +233,12 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
           IMG: ${{ env.IMAGE }}
         run: |
-          sed -i -E "s#^( *image: ).*drigodb-api:.*#\1${IMG}:${VERSION}#" deploy/20-api.yaml
+          # The pin lives in the chart's appVersion now: it is the chart's
+          # declaration of which drigodb it installs, and Helm defaults the
+          # image tag to it.
+          sed -i -E "s#^appVersion: .*#appVersion: \"${VERSION}\"#" charts/drigodb/Chart.yaml
           if git diff --quiet; then
-            echo "::notice::deploy/20-api.yaml already pins ${VERSION}."
+            echo "::notice::the chart already pins ${VERSION}."
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
@@ -251,7 +254,7 @@ jobs:
           TITLE: "A newer release is ready to pin"
         run: |
           {
-            echo "\`v${VERSION}\` is published. It is **not** deployed: \`deploy/20-api.yaml\` is what"
+            echo "\`v${VERSION}\` is published. It is **not** deployed: the chart's \`appVersion\` is what"
             echo "is deployed, and a release cannot pin itself — the commit being released does not"
             echo "yet name the image it is about to build."
             echo
@@ -346,7 +349,7 @@ jobs:
           fi
           echo "up=true" >> "$GITHUB_OUTPUT"
 
-      # Deploys what deploy/20-api.yaml pins, which is NOT what this run just
+      # Deploys what the chart pins, which is NOT what this run just
       # built. The commit being released cannot name the image the release is
       # about to produce, so a release publishes and the pin moves in a separate
       # merge. Ordinarily this is a no-op that reconciles anything else that
@@ -361,8 +364,8 @@ jobs:
       - name: Verify the running version
         if: steps.cluster.outputs.up == 'true'
         run: |
-          PINNED="$(sed -nE 's#^ *image: .*drigodb-api:(.*)$#\1#p' deploy/20-api.yaml | head -1)"
-          echo "manifest pins ${PINNED}"
+          PINNED="$(sed -nE 's#^appVersion: "?([^"]*)"?#\1#p' charts/drigodb/Chart.yaml | head -1)"
+          echo "the chart pins ${PINNED}"
 
           kubectl -n drigodb-system port-forward svc/drigodb-api 8080:80 >/tmp/pf.log 2>&1 &
           for _ in $(seq 1 30); do grep -q "Forwarding from" /tmp/pf.log && break; sleep 1; done
