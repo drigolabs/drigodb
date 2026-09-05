@@ -31,7 +31,7 @@ spec:
             - name: DRIGODB_API_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "drigodb.fullname" . }}-token
+                  name: {{ include "drigodb.tokenSecret" . }}
                   key: token
             - name: DRIGODB_DATABASE_NAMESPACE
               value: {{ .Values.databaseNamespace | quote }}

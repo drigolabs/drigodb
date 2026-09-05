@@ -104,6 +104,12 @@ jobs:
       # earns its place is the last one: an edited migration must stop a server
       # from starting, and that has to be caught here rather than on a fleet
       # where it would stop every database from waking.
+      # No cluster, a second to run, and it is what stops a template reaching for
+      # a cluster or a clock again. The last one rotated every consumer's bearer
+      # token on every Argo sync while reporting Synced.
+      - name: The chart renders the same bytes every time
+        run: bash scripts/chart-determinism-test.sh
+
       - name: In-database migrations test
         run: |
           bash scripts/migrations-test.sh \
