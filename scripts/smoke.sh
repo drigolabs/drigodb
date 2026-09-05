@@ -40,11 +40,33 @@ jqf() { python3 -c "import json,sys; d=json.load(sys.stdin); print(d$1)"; }
 # the database's NetworkPolicy. On kind that policy is unenforced, but carrying
 # the label keeps this honest about what a real consumer must do — and on DOKS it
 # is the difference between connecting and not.
+PSQL_RUN=0
 psql_in_cluster() { # uri sql
-  k run "smoke-psql-$RANDOM" -n drigodb-databases --rm -i --restart=Never --quiet \
+  local name out phase
+  PSQL_RUN=$((PSQL_RUN + 1))
+  name="smoke-psql-$$-${PSQL_RUN}"
+
+  # Reads the pod's LOGS rather than attaching to it.
+  #
+  # `kubectl run --rm -i` attaches a stream, and a container that finishes before
+  # the attach connects loses its output entirely. That race gets MORE likely
+  # over time, not less: the first run of this test pulls the image and is slow
+  # enough to win, and every run afterwards has it cached and is not. It failed
+  # exactly that way — passing on a fresh cluster, then returning empty strings
+  # that read as failed assertions.
+  k run "$name" -n drigodb-databases --restart=Never --quiet \
     --image="${SMOKE_PG_IMAGE:-ghcr.io/cloudnative-pg/postgresql:18}" \
     --labels="drigodb.io/allow-database=${DB_ID}" \
-    --env="PGURI=$1" --command -- psql "$1" -tAc "$2" 2>&1
+    --command -- psql "$1" -tAc "$2" >/dev/null 2>&1
+
+  for _ in $(seq 1 60); do
+    phase="$(k get pod "$name" -n drigodb-databases -o jsonpath='{.status.phase}' 2>/dev/null)"
+    case "$phase" in Succeeded|Failed) break ;; esac
+    sleep 2
+  done
+  out="$(k logs "$name" -n drigodb-databases 2>&1)"
+  k delete pod "$name" -n drigodb-databases --wait=false >/dev/null 2>&1 || true
+  printf '%s' "$out"
 }
 
 start_pf() { # resource local remote logfile
