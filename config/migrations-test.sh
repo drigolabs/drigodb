@@ -39,6 +39,12 @@ cp "${REPO_ROOT}/config/postgresql.conf" "${REPO_ROOT}/config/pg_hba.conf" \
 mkdir -p "$WORK/migrations"
 cp "${REPO_ROOT}"/config/migrations/*.sql "$WORK/migrations/"
 
+# The container runs as uid 26 and mktemp -d is 0700 owned by whoever ran this,
+# so without this the bind mount is unreadable and bootstrap.sh fails with
+# "Permission denied" before it does anything. Docker Desktop on macOS remaps
+# ownership and hides the problem; a Linux runner does not.
+chmod -R a+rX "$WORK"
+
 docker volume create "$VOL" >/dev/null
 # postgresql.conf lists /sockets in unix_socket_directories — it is the volume
 # the backup sidecar shares in production — and the server refuses to start if
