@@ -64,6 +64,7 @@ GET    /v1/databases/{id}       status and endpoint
 POST   /v1/databases/{id}/wake       → 202
 POST   /v1/databases/{id}/hibernate  → 202
 POST   /v1/databases/{id}/credentials  → 200 + a new connection_uri
+GET    /v1/databases/{id}/backups      what can be restored
 DELETE /v1/databases/{id}       destroys the data
 ```
 
@@ -221,6 +222,15 @@ its Service — so an unreachable bucket would sever a database that is working 
 **A hibernated database is not backed up, and does not need to be.** No pod means no writes, so
 nothing can have changed since the last backup. The sidecar only exists while the database is awake,
 which is the only time it can have anything new to say.
+
+**`GET /v1/databases/{id}/backups` lists what can be restored** — keys, sizes and timestamps, newest
+first, never a credential. It answers for a **hibernated** database, which is the point: that is when
+the question gets asked, and it is exactly when there is no pod to ask. The control plane lists the
+bucket itself for that reason; the alternative, `kubectl exec` into the database pod, needs `pods/exec`
+RBAC, and a control plane that can exec into any pod can read every tenant's data.
+
+An empty list means a database that has never been backed up. A `409` means backups are off for the
+installation, which is a different fact and one a caller must not confuse with the first.
 
 **Restore is not wired to the API yet.** The image can do it by hand — `drigodb-backup restore KEY`
 loads a dump into the app database, and refuses a database that already holds tables unless

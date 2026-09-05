@@ -144,6 +144,15 @@ echo "    target ready, holding an empty app database"
 bk "$VOL2" restore "$KEY" || { echo "    restore failed"; exit 1; }
 echo "    dump loaded"
 
+echo "==> list names every backup, latest names one"
+bk "$VOL1" once >/dev/null 2>&1 || true
+LIST_N="$(bk "$VOL1" list | wc -l | tr -d ' ')"
+LATEST_N="$(bk "$VOL1" latest | wc -l | tr -d ' ')"
+[ "$LATEST_N" = "1" ] || { echo "==> FAIL: latest printed ${LATEST_N} keys"; exit 1; }
+[ "$LIST_N" -ge 1 ] || { echo "==> FAIL: list printed nothing"; exit 1; }
+bk "$VOL1" list | grep -q "$(bk "$VOL1" latest)" || { echo "==> FAIL: latest is not in list"; exit 1; }
+echo "    list=${LIST_N} latest=${LATEST_N}"
+
 echo "==> reading the rows back"
 AFTER="$(psql2 "SELECT doc::text FROM orders WHERE id='o7';" 2>&1 || true)"
 echo "    ${AFTER}"

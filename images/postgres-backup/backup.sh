@@ -22,6 +22,7 @@
 #   drigodb-backup once            one backup, then exit
 #   drigodb-backup run             back up whenever one is due, forever
 #   drigodb-backup restore KEY     load that dump into the app database
+#   drigodb-backup list            print every object key, oldest first
 #   drigodb-backup latest          print the newest object key, if any
 #
 # Configuration, all from the environment:
@@ -73,8 +74,12 @@ wait_for_server() {
 # Newest first by name, which is chronological because the key is an ISO-8601
 # UTC timestamp. Missing prefix is not an error — it is a database that has
 # never been backed up.
+list_keys() {
+  rclone lsf "${PREFIX}/" 2>/dev/null | grep '\.sql\.gz$' | sort
+}
+
 latest_key() {
-  rclone lsf "${PREFIX}/" 2>/dev/null | grep '\.sql\.gz$' | sort | tail -1
+  list_keys | tail -1
 }
 
 backup() {
@@ -137,6 +142,9 @@ case "${1:-run}" in
       fi
       sleep "$INTERVAL"
     done
+    ;;
+  list)
+    list_keys
     ;;
   latest)
     latest_key

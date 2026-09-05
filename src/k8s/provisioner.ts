@@ -16,8 +16,12 @@ import {
 } from "@kubernetes/client-node";
 import type { V1StatefulSet } from "@kubernetes/client-node";
 
-import { config } from "../config.js";
+import { backupsEnabled, config } from "../config.js";
+import type { BackupObject } from "../backups/s3.js";
+import { BackupStorageError, listObjects, regionFromEndpoint } from "../backups/s3.js";
 import {
+  BACKUP_KEY_SECRET_KEY,
+  BACKUP_SECRET_SECRET_KEY,
   DB_ID_LABEL,
   EXTERNAL_ID_LABEL,
   MANAGED_BY_LABEL,
@@ -54,6 +58,9 @@ const EXTERNAL_ID_RE = /^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$/;
 
 export class ValidationError extends Error {}
 export class NotFoundError extends Error {}
+// "Backups are off" is a different answer from "there are none", and a caller
+// acting on the second when the first is true would be wrong.
+export class BackupsDisabledError extends Error {}
 
 export function validateExternalId(value: unknown): string {
   if (typeof value !== "string" || !EXTERNAL_ID_RE.test(value)) {
@@ -411,5 +418,50 @@ export class Provisioner {
         );
       }
     }
+  }
+
+  // Every backup this database has, newest first.
+  //
+  // Answered from the control plane rather than from the pod, because the pod
+  // is exactly what is missing when the question matters: a hibernated database
+  // has no container to exec into, and "what can I restore?" is a question
+  // people ask about idle databases. Reaching `drigodb-backup latest` instead
+  // would need pods/exec RBAC, and a control plane that can exec into any
+  // database pod can read every tenant's data — strictly worse than listing a
+  // bucket, and still unable to answer while hibernated. See issue #39.
+  async listBackups(id: string): Promise<BackupObject[]> {
+    // 404 before 409: a database that does not exist is not a database whose
+    // backups are disabled.
+    const sts = await this.statefulSetFor(id);
+    if (!sts) throw new NotFoundError(`no database with id ${id}`);
+    if (!backupsEnabled()) {
+      throw new BackupsDisabledError("backups are not configured for this installation");
+    }
+
+    const secret = await this.core.readNamespacedSecret({
+      name: config.backup.secretName,
+      namespace: config.databaseNamespace,
+    });
+    const read = (k: string): string => {
+      const v = secret.data?.[k];
+      if (!v) throw new BackupStorageError(`${config.backup.secretName} has no ${k}`);
+      return Buffer.from(v, "base64").toString("utf8");
+    };
+
+    const objects = await listObjects({
+      endpoint: config.backup.endpoint,
+      bucket: config.backup.bucket,
+      // The trailing slash matters: without it the prefix for "a1" would also
+      // match "a1b2", which is another tenant's backups.
+      prefix: `${id}/`,
+      accessKeyId: read(BACKUP_KEY_SECRET_KEY),
+      secretAccessKey: read(BACKUP_SECRET_SECRET_KEY),
+      region: config.backup.region || regionFromEndpoint(config.backup.endpoint),
+    });
+
+    // Keys are ISO-8601 UTC timestamps, so this is chronological — but sorted
+    // on lastModified rather than the name, because the name is what the writer
+    // chose and the timestamp is what the store observed.
+    return objects.sort((a, b) => (a.lastModified < b.lastModified ? 1 : -1));
   }
 }

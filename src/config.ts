@@ -64,6 +64,11 @@ export const config = {
     // one bucket, one credential, and the object prefix is what separates
     // tenants inside it.
     secretName: envOr("DRIGODB_BACKUP_SECRET", "drigodb-backup-credentials"),
+    // SigV4 needs a region string and the server checks it, so a wrong guess
+    // fails the signature rather than being ignored. Derived from the endpoint
+    // by default — Spaces puts it in the hostname, MinIO has none — and
+    // overridable for anything that does neither.
+    region: envOr("DRIGODB_BACKUP_REGION", ""),
   },
 } as const;
 
