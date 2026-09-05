@@ -30,15 +30,19 @@ PG_IMAGE="${2:-ghcr.io/cloudnative-pg/postgresql:18}"
 SFX="$$"
 NET="bk-it-${SFX}"
 MINIO="bk-it-minio-${SFX}"; PG1="bk-it-pg1-${SFX}"; PG2="bk-it-pg2-${SFX}"
-VOL1="bk-it-sock1-${SFX}"; VOL2="bk-it-sock2-${SFX}"
+VOL1="bk-it-sock1-${SFX}"; VOL2="bk-it-sock2-${SFX}"; VOL3="bk-it-sock3-${SFX}"
+PG3="bk-it-pg3-${SFX}"
 BUCKET="drigodb-test"; DB_ID="testdb01"
+# The app credential, as production would issue it. The restore Job uses this
+# and nothing else: no socket, no superuser.
+APP_PW="restoretest123"
 AK="minioadmin"; SK="minioadmin"
 PG_UID=26
 
 cleanup() {
-  docker rm -f "$MINIO" "$PG1" "$PG2" >/dev/null 2>&1 || true
+  docker rm -f "$MINIO" "$PG1" "$PG2" "$PG3" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
-  docker volume rm "$VOL1" "$VOL2" >/dev/null 2>&1 || true
+  docker volume rm "$VOL1" "$VOL2" "$VOL3" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -58,6 +62,20 @@ bk() { # volume, then the command for the image
     "$BK_IMAGE" "$@"
 }
 
+# How the restore Job runs: its own pod, over TCP, with the app's credentials.
+bk_remote() { # target-container, then the command
+  local target="$1"; shift
+  docker run --rm --network "$NET" --user "$PG_UID" \
+    -e DRIGODB_DATABASE_ID="$DB_ID" \
+    -e DRIGODB_BACKUP_BUCKET="$BUCKET" \
+    -e DRIGODB_BACKUP_ENDPOINT="http://${MINIO}:9000" \
+    -e DRIGODB_BACKUP_KEY="$AK" -e DRIGODB_BACKUP_SECRET="$SK" \
+    -e DRIGODB_RESTORE_SOURCE="${DB_ID}/${KEY}" \
+    -e PGHOST="$target" -e PGPORT=5432 -e PGUSER=appuser \
+    -e PGDATABASE=app -e PGPASSWORD="$APP_PW" -e PGSSLMODE=require \
+    "$BK_IMAGE" "$@"
+}
+
 start_pg() { # container volume
   local name="$1" vol="$2"
   docker volume create "$vol" >/dev/null
@@ -68,13 +86,21 @@ start_pg() { # container volume
     bash -euo pipefail -c "
     export PGDATA=/tmp/pgdata
     initdb -D \"\$PGDATA\" -U postgres --auth-local=peer >/dev/null
-    # ssl is on in the shipped config and bootstrap.sh generates its certificate;
-    # this test does not run bootstrap.sh and connects over the socket, so drop
-    # the TLS lines rather than mint a certificate nothing here would present.
-    grep -v '^ssl' /app-db/postgresql.conf >> \"\$PGDATA/postgresql.conf\"
+    # The shipped config verbatim, TLS included, and a certificate generated the
+    # way bootstrap.sh does. Stripping ssl would be simpler and would make this
+    # test unable to reach the server the way production does: pg_hba admits
+    # appuser over hostssl only, so a restore Job connecting without TLS is
+    # rejected — which is exactly the failure worth catching here.
+    cat /app-db/postgresql.conf >> \"\$PGDATA/postgresql.conf\"
     cp /app-db/pg_hba.conf \"\$PGDATA/\"
+    openssl req -new -x509 -days 3650 -nodes -text \
+      -out \"\$PGDATA/server.crt\" -keyout \"\$PGDATA/server.key\" \
+      -subj /CN=drigodb >/dev/null 2>&1
+    chmod 0600 \"\$PGDATA/server.key\"
     pg_ctl -D \"\$PGDATA\" -l /tmp/pg.log -w start >/dev/null
-    createdb -h /sockets -U postgres app
+    psql -h /sockets -U postgres -d postgres -v ON_ERROR_STOP=1 -q \
+      -c \"CREATE ROLE appuser LOGIN PASSWORD '${APP_PW}'\"
+    createdb -h /sockets -U postgres -O appuser app
     echo PG_READY
     sleep infinity
   " >/dev/null
@@ -177,5 +203,21 @@ if bk "$VOL2" restore "$KEY" >/dev/null 2>&1; then
   echo "==> FAIL: a second restore into a populated database should have been refused"; exit 1
 fi
 echo "    a second restore is refused"
+
+echo "==> a restore Job loads over TCP, as an ordinary consumer"
+start_pg "$PG3" "$VOL3" || exit 1
+bk_remote "$PG3" restore-remote || { echo "==> FAIL: restore-remote did not succeed"; exit 1; }
+R3="$(docker exec "$PG3" psql -h /sockets -U postgres -d app -At -c 'SELECT count(*) FROM orders')"
+[ "$R3" = "50" ] || { echo "==> FAIL: restore-remote loaded ${R3} rows, expected 50"; exit 1; }
+echo "    50 rows over TCP with sslmode=require, as appuser"
+
+echo "==> running it again skips rather than double-loading"
+# Kubernetes retries a Job. A restore that already succeeded must not make the
+# next attempt look like a failure, nor load a second copy over the first.
+bk_remote "$PG3" restore-remote 2>&1 | grep -q "already holds tables" \
+  || { echo "==> FAIL: a repeat restore-remote did not skip"; exit 1; }
+R3B="$(docker exec "$PG3" psql -h /sockets -U postgres -d app -At -c 'SELECT count(*) FROM orders')"
+[ "$R3B" = "50" ] || { echo "==> FAIL: a repeat restore changed the data (${R3B} rows)"; exit 1; }
+echo "    skipped, still 50 rows"
 
 echo "==> PASS"

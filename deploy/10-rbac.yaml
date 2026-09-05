@@ -31,6 +31,15 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    # Restoring into a new database runs as a Job, which connects to the
+    # database over TCP as an ordinary consumer rather than through any path the
+    # isolation model does not already hand out. get, so a restore in progress
+    # can be reported as a status rather than a database that merely looks
+    # empty; delete, because a failed Job outlives its TTL on purpose and DELETE
+    # is what finally removes it.
+    verbs: ["create", "get", "list", "delete"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get", "list", "delete"]

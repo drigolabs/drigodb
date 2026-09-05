@@ -8,13 +8,14 @@
 import { randomBytes } from "node:crypto";
 import {
   AppsV1Api,
+  BatchV1Api,
   CoreV1Api,
   KubeConfig,
   NetworkingV1Api,
   PatchStrategy,
   setHeaderOptions,
 } from "@kubernetes/client-node";
-import type { V1StatefulSet } from "@kubernetes/client-node";
+import type { V1Job, V1StatefulSet } from "@kubernetes/client-node";
 
 import { backupsEnabled, config } from "../config.js";
 import type { BackupObject } from "../backups/s3.js";
@@ -30,18 +31,29 @@ import {
   TEMPLATE_HASH_ANNOTATION,
   buildNetworkPolicy,
   buildPodTemplate,
+  buildRestoreJob,
   buildSecret,
   buildService,
   buildStatefulSet,
   connectionUri,
   endpointHost,
+  restoreJobName,
   secretName,
   serviceName,
   statefulSetName,
   templateHash,
 } from "./manifests.js";
 
-export type DatabaseStatus = "provisioning" | "ready" | "hibernated" | "failed";
+// "restoring" is deliberately NOT "ready". A restored database answers on its
+// port before its data has landed, and a caller that connected then would see
+// an empty database — and any write it made would leave the restore to find a
+// non-empty target and skip. The status is what stops that race.
+export type DatabaseStatus =
+  | "provisioning"
+  | "restoring"
+  | "ready"
+  | "hibernated"
+  | "failed";
 
 export type Database = {
   id: string;
@@ -61,6 +73,30 @@ export class NotFoundError extends Error {}
 // "Backups are off" is a different answer from "there are none", and a caller
 // acting on the second when the first is true would be wrong.
 export class BackupsDisabledError extends Error {}
+
+// Object keys are written by this service, so anything that is not one of ours
+// is a caller mistake or an attempt to read another prefix. Both are 400s.
+const RESTORE_KEY_RE = /^\d{8}T\d{6}Z\.sql\.gz$/;
+const DB_ID_RE = /^[0-9a-f]{12}$/;
+
+export function validateRestoreFrom(
+  value: unknown,
+): { databaseId: string; key: string } | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object") throw new ValidationError("restore_from must be an object");
+  const { database_id: dbId, key } = value as { database_id?: unknown; key?: unknown };
+
+  if (typeof dbId !== "string" || !DB_ID_RE.test(dbId)) {
+    throw new ValidationError("restore_from.database_id must be a database id");
+  }
+  // A key is joined onto a bucket prefix, so a traversal here would read
+  // another database's backups. Matching the exact shape this service writes is
+  // a tighter check than rejecting "..", and needs no reasoning about encoding.
+  if (typeof key !== "string" || !RESTORE_KEY_RE.test(key)) {
+    throw new ValidationError("restore_from.key must be a backup key, e.g. 20260905T040000Z.sql.gz");
+  }
+  return { databaseId: dbId, key };
+}
 
 export function validateExternalId(value: unknown): string {
   if (typeof value !== "string" || !EXTERNAL_ID_RE.test(value)) {
@@ -91,6 +127,7 @@ export class Provisioner {
     private readonly apps: AppsV1Api,
     private readonly core: CoreV1Api,
     private readonly net: NetworkingV1Api,
+    private readonly batch: BatchV1Api,
   ) {}
 
   static fromCluster(): Provisioner {
@@ -115,6 +152,7 @@ export class Provisioner {
       kc.makeApiClient(AppsV1Api),
       kc.makeApiClient(CoreV1Api),
       kc.makeApiClient(NetworkingV1Api),
+      kc.makeApiClient(BatchV1Api),
     );
   }
 
@@ -132,6 +170,16 @@ export class Provisioner {
 
   private async statusOf(id: string, desiredReplicas: number, ready: number): Promise<DatabaseStatus> {
     if (desiredReplicas === 0) return "hibernated";
+
+    // Before the ready check, not after: a restoring database has a ready pod
+    // and is not usable, which is the whole reason this status exists.
+    const restore = await this.restoreJobFor(id);
+    if (restore) {
+      if ((restore.status?.succeeded ?? 0) > 0) return ready > 0 ? "ready" : "provisioning";
+      if ((restore.status?.failed ?? 0) > 0) return "failed";
+      return "restoring";
+    }
+
     if (ready > 0) return "ready";
 
     // Distinguish "still starting" from "stuck". A pod that cannot pull its
@@ -166,6 +214,20 @@ export class Provisioner {
     };
   }
 
+  // Missing is the ordinary case: most databases were never restored into, and
+  // a succeeded Job removes itself after an hour.
+  private async restoreJobFor(id: string): Promise<V1Job | undefined> {
+    try {
+      return await this.batch.readNamespacedJob({
+        name: restoreJobName(id),
+        namespace: config.databaseNamespace,
+      });
+    } catch (err) {
+      if (isNotFound(err)) return undefined;
+      throw err;
+    }
+  }
+
   async findByExternalId(externalId: string): Promise<Database | undefined> {
     const list = await this.apps.listNamespacedStatefulSet({
       namespace: config.databaseNamespace,
@@ -192,7 +254,10 @@ export class Provisioner {
   // Returns the database and its connection URI. The URI is returned here and
   // on rotation only — never from a plain GET — so a leaked read token does not
   // leak database credentials.
-  async create(externalId: string): Promise<{ database: Database; uri: string; created: boolean }> {
+  async create(
+    externalId: string,
+    restoreFrom?: { databaseId: string; key: string },
+  ): Promise<{ database: Database; uri: string; created: boolean }> {
     const existing = await this.findByExternalId(externalId);
     if (existing) {
       // Idempotent: a retry must not create a second database and split the
@@ -214,6 +279,16 @@ export class Provisioner {
     // its reconcile, which lands on the no-op branch because the StatefulSet
     // was just built from the template it is about to be compared against.
     await this.wake(id);
+
+    // After the wake, because the Job connects over TCP to a server that has to
+    // be listening — and creating it earlier would only mean it crash-looped
+    // through its backoff while the database initialised.
+    if (restoreFrom) {
+      await this.batch.createNamespacedJob({
+        namespace: ns,
+        body: buildRestoreJob(id, externalId, `${restoreFrom.databaseId}/${restoreFrom.key}`),
+      });
+    }
 
     return { database: await this.get(id), uri: connectionUri(id, password), created: true };
   }
@@ -402,6 +477,15 @@ export class Provisioner {
       this.net.deleteNamespacedNetworkPolicy({ name: statefulSetName(id), namespace: ns }),
     );
     await ignoreMissing(() => this.core.deleteNamespacedSecret({ name: secretName(id), namespace: ns }));
+    // A failed restore Job outlives its TTL on purpose, so DELETE is what
+    // finally removes it — along with the pod holding its logs.
+    await ignoreMissing(() =>
+      this.batch.deleteNamespacedJob({
+        name: restoreJobName(id),
+        namespace: ns,
+        propagationPolicy: "Background",
+      }),
+    );
 
     // The retention policy deliberately keeps volumes when a StatefulSet is
     // removed, so DELETE has to remove them explicitly. This is the point at

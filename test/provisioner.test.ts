@@ -15,7 +15,12 @@ import {
   TEMPLATE_HASH_ANNOTATION,
   templateHash,
 } from "../src/k8s/manifests.js";
-import { NotFoundError, Provisioner } from "../src/k8s/provisioner.js";
+import {
+  NotFoundError,
+  Provisioner,
+  ValidationError,
+  validateRestoreFrom,
+} from "../src/k8s/provisioner.js";
 
 const ID = "a1b2c3d4e5f6";
 const EXT = "openvoid-app-01JQ";
@@ -71,9 +76,19 @@ function provisionerFor(sts: ReturnType<typeof statefulSet>) {
 
   // The constructor takes its clients, so the whole path is exercisable without
   // a cluster.
-  const provisioner = new Provisioner(apps as never, core as never, {} as never);
+  const provisioner = new Provisioner(apps as never, core as never, {} as never, noRestoreJob as never);
   return { provisioner, patch };
 }
+
+// Most databases were never restored into, so "no such Job" is the ordinary
+// answer and the one every existing test wants.
+const noRestoreJob = {
+  readNamespacedJob: async () => {
+    const err = new Error("not found") as Error & { code: number };
+    err.code = 404;
+    throw err;
+  },
+};
 
 beforeEach(() => {
   calls = [];
@@ -155,7 +170,7 @@ describe("wake", () => {
         throw Object.assign(new Error("not found"), { code: 404 });
       },
     };
-    const provisioner = new Provisioner(apps as never, {} as never, {} as never);
+    const provisioner = new Provisioner(apps as never, {} as never, {} as never, noRestoreJob as never);
 
     await expect(provisioner.wake(ID)).rejects.toBeInstanceOf(NotFoundError);
   });
@@ -210,7 +225,7 @@ function rotatableFor(sts: ReturnType<typeof statefulSet>) {
     replaceNamespacedSecret: replaceSecret,
     listNamespacedPod: async () => ({ items: sts.spec.replicas > 0 ? [{}] : [] }),
   };
-  const provisioner = new Provisioner(apps as never, core as never, {} as never);
+  const provisioner = new Provisioner(apps as never, core as never, {} as never, noRestoreJob as never);
   return { provisioner, replaceSecret };
 }
 
@@ -259,8 +274,45 @@ describe("credential rotation", () => {
         throw Object.assign(new Error("not found"), { code: 404 });
       },
     };
-    const provisioner = new Provisioner(apps as never, {} as never, {} as never);
+    const provisioner = new Provisioner(apps as never, {} as never, {} as never, noRestoreJob as never);
 
     await expect(provisioner.rotateCredentials(ID)).rejects.toBeInstanceOf(NotFoundError);
+  });
+});
+
+describe("restore_from validation", () => {
+  it("accepts a key of the shape this service writes", () => {
+    expect(validateRestoreFrom({ database_id: "a1b2c3d4e5f6", key: "20260905T040000Z.sql.gz" }))
+      .toEqual({ databaseId: "a1b2c3d4e5f6", key: "20260905T040000Z.sql.gz" });
+  });
+
+  it("is absent when not asked for", () => {
+    expect(validateRestoreFrom(undefined)).toBeUndefined();
+    expect(validateRestoreFrom(null)).toBeUndefined();
+  });
+
+  it("refuses a key that would read outside its own prefix", () => {
+    // The key is joined onto a bucket prefix, so a traversal here would reach
+    // another database's backups.
+    for (const key of [
+      "../other/20260905T040000Z.sql.gz",
+      "../../etc/passwd",
+      "sub/20260905T040000Z.sql.gz",
+      "20260905T040000Z.sql.gz/../../x",
+    ]) {
+      expect(() => validateRestoreFrom({ database_id: "a1b2c3d4e5f6", key })).toThrow(ValidationError);
+    }
+  });
+
+  it("refuses anything that is not a database id", () => {
+    for (const id of ["", "../a", "A1B2C3D4E5F6", "a1b2c3", "a1b2c3d4e5f6g", 42, null]) {
+      expect(() => validateRestoreFrom({ database_id: id, key: "20260905T040000Z.sql.gz" }))
+        .toThrow(ValidationError);
+    }
+  });
+
+  it("refuses a malformed body", () => {
+    expect(() => validateRestoreFrom("nope")).toThrow(ValidationError);
+    expect(() => validateRestoreFrom({})).toThrow(ValidationError);
   });
 });

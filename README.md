@@ -58,7 +58,7 @@ silent no-op. The other two hold without it.
 ## API
 
 ```
-POST   /v1/databases            { external_id }   → 202 + connection_uri
+POST   /v1/databases            { external_id, restore_from? }  → 202 + connection_uri
 GET    /v1/databases            list
 GET    /v1/databases/{id}       status and endpoint
 POST   /v1/databases/{id}/wake       → 202
@@ -232,11 +232,31 @@ RBAC, and a control plane that can exec into any pod can read every tenant's dat
 An empty list means a database that has never been backed up. A `409` means backups are off for the
 installation, which is a different fact and one a caller must not confuse with the first.
 
-**Restore is not wired to the API yet.** The image can do it by hand — `drigodb-backup restore KEY`
-loads a dump into the app database, and refuses a database that already holds tables unless
-`DRIGODB_RESTORE_FORCE=1` says otherwise. Making that an operation is
-[#22](https://github.com/drigolabs/drigodb/issues/22), which gets substantially simpler now that a
-restore loads into a running server rather than replacing a data directory.
+**Restoring is provisioning with a source.**
+
+```bash
+curl -XPOST localhost:8080/v1/databases -H "Authorization: Bearer $TOKEN" \
+  -d '{"external_id":"my-app-recovered",
+       "restore_from":{"database_id":"a1b2c3d4e5f6","key":"20260905T040000Z.sql.gz"}}'
+```
+
+A new database, with its own id, volume and credentials. **The one it was restored from is untouched**,
+which is what makes this the safe shape — an undo that cannot destroy the thing being undone. To
+replace a database with an older version of itself, restore into a new one, repoint, and delete the old.
+
+The load runs as a Kubernetes Job that is an *ordinary consumer* of the new database: it connects over
+TCP with the app's own credentials and carries the same `drigodb.io/allow-database` label any consumer
+opts in with. It holds nothing the isolation model does not already hand out, and no service account
+token at all.
+
+**The database reports `restoring` until the data has landed**, and that status is doing real work: a
+restored database answers on its port before its dump has been loaded, and a caller that connected then
+would find it empty — and any write it made would leave the restore to find a non-empty target and skip
+it. Poll until `ready`.
+
+Restoring in place, over an existing database, is not built. It is the one someone recovering from
+corruption wants and it is genuinely destructive, so it waits for someone to have needed it —
+[#22](https://github.com/drigolabs/drigodb/issues/22).
 
 ## Schema inside a database
 

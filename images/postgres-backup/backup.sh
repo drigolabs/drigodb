@@ -22,6 +22,7 @@
 #   drigodb-backup once            one backup, then exit
 #   drigodb-backup run             back up whenever one is due, forever
 #   drigodb-backup restore KEY     load that dump into the app database
+#   drigodb-backup restore-remote  load DRIGODB_RESTORE_SOURCE over TCP, once
 #   drigodb-backup list            print every object key, oldest first
 #   drigodb-backup latest          print the newest object key, if any
 #
@@ -36,6 +37,13 @@
 #   APP_DB_NAME              database to probe for readiness (default app)
 #   PGHOST                   socket directory (default /sockets)
 #   DRIGODB_RESTORE_FORCE    set to 1 to load into a non-empty database
+#   DRIGODB_RESTORE_SOURCE   "<database-id>/<key>" to restore from (restore-remote)
+#
+# restore-remote is how a database is provisioned FROM a backup. It runs as a
+# Job rather than in the database's pod, and connects over TCP with the app's
+# own credentials — the same route any consumer uses — so it holds nothing the
+# isolation model does not already hand out. libpq reads PGHOST, PGUSER,
+# PGPASSWORD, PGDATABASE and PGSSLMODE from the environment.
 set -euo pipefail
 
 DB_ID="${DRIGODB_DATABASE_ID:?DRIGODB_DATABASE_ID must be set}"
@@ -148,6 +156,30 @@ case "${1:-run}" in
     ;;
   latest)
     latest_key
+    ;;
+  restore-remote)
+    SRC="${DRIGODB_RESTORE_SOURCE:?restore-remote needs DRIGODB_RESTORE_SOURCE}"
+    # Over TCP, so the socket-based wait does not apply.
+    for i in $(seq 1 60); do
+      pg_isready -q && break
+      [ "$i" = 60 ] && { log "server never became reachable"; exit 1; }
+      sleep 2
+    done
+
+    # Skip rather than fail on a populated database. This Job is retried by
+    # Kubernetes, and a restore that already succeeded must not make the next
+    # attempt look like a failure — nor load a second copy over the first.
+    if [ "$(psql -tAc \
+              "select count(*) from pg_class c join pg_namespace n on n.oid=c.relnamespace \
+               where n.nspname not in ('pg_catalog','information_schema') and c.relkind='r'")" != "0" ]; then
+      log "${PGDATABASE:-app} already holds tables; nothing to restore"
+      exit 0
+    fi
+
+    log "loading ${SRC} into ${PGDATABASE:-app} on ${PGHOST}"
+    rclone cat "dest:${BUCKET}/${SRC}" | gunzip -c \
+      | psql -v ON_ERROR_STOP=1 -q
+    log "restored"
     ;;
   restore)
     KEY="${2:?restore needs an object key}"
