@@ -6,7 +6,7 @@ type: application
 version: 0.1.0
 # The control plane this chart installs by default. Moved by the standing issue
 # a release files — see the README's Continuous delivery section.
-appVersion: "0.7.4"
+appVersion: "0.8.0"
 home: https://github.com/drigolabs/drigodb
 sources:
   - https://github.com/drigolabs/drigodb

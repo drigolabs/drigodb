@@ -29,8 +29,9 @@ on:
       - images/postgres-backup/**
       # The integration test mounts these, and they encode the peer-auth
       # contract the sidecar depends on. A change here can break the image
-      # without its Dockerfile changing.
-      - config/**
+      # without its Dockerfile changing. They moved into the chart when drigodb
+      # became something people install — Helm cannot read files outside it.
+      - charts/drigodb/files/**
       - images/versions.env
       - .github/workflows/images.yml
   workflow_dispatch:
