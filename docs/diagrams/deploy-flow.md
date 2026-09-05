@@ -96,7 +96,7 @@ sequenceDiagram
     Dev->>Repo: merge the pin bump (one line in the overlay)
     loop every sync interval
         Recon->>Repo: pull
-        Recon->>Recon: render the kustomize overlay
+        Recon->>Recon: render the chart with this cluster's values
         Recon->>K8s: apply what differs
     end
     K8s->>API: roll the Deployment onto the new image
@@ -153,7 +153,7 @@ step in the same direction: an account-owner kubeconfig became a two-namespace S
 | Moves | Issue |
 |---|---|
 | API image pinned in Git, not resolved from the newest tag at apply time | [#48](https://github.com/drigolabs/drigodb/issues/48) |
-| `deploy.sh`'s `sed`, generated token and `--dry-run \| apply` become manifests | [#49](https://github.com/drigolabs/drigodb/issues/49) |
+| `deploy.sh`'s `sed`, generated token and `--dry-run \| apply` become a Helm chart | [#49](https://github.com/drigolabs/drigodb/issues/49) |
 | Flux or Argo CD chosen, measured on a real node | [#50](https://github.com/drigolabs/drigodb/issues/50) |
 | Reconciler installed by `doks-up.sh`; deploy job and its three secrets deleted | [#51](https://github.com/drigolabs/drigodb/issues/51) |
 | A local cluster runs the same loop | [#52](https://github.com/drigolabs/drigodb/issues/52) |
