@@ -150,14 +150,18 @@ done
 for p in "${race_pids[@]}"; do wait "$p" || true; done
 for i in 1 2 3 4; do race_codes="${race_codes}$(cat "/tmp/drigodb-race-$$-$i.code" 2>/dev/null) "; done
 
-RACE_COUNT="$(k get sts -n drigodb-databases -l "drigodb.io/external-id=${RACE_ID}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+RACE_COUNT="$(k get clusters.postgresql.cnpg.io -n drigodb-databases -l "drigodb.io/external-id=${RACE_ID}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
 CREATED="$(printf '%s' "$race_codes" | tr ' ' '\n' | grep -c '^202$' || true)"
 
 if [ "$RACE_COUNT" = "1" ]; then
   ok "4 simultaneous creates, 1 database (codes: ${race_codes})"
 else
-  fail "4 simultaneous creates made ${RACE_COUNT} databases — one caller's data is split"
-  k get sts -n drigodb-databases -l "drigodb.io/external-id=${RACE_ID}"
+  if [ "$RACE_COUNT" = "0" ]; then
+    fail "4 simultaneous creates made no database at all — every one of them failed"
+  else
+    fail "4 simultaneous creates made ${RACE_COUNT} databases — one caller's data is split"
+  fi
+  k get clusters.postgresql.cnpg.io -n drigodb-databases -l "drigodb.io/external-id=${RACE_ID}"
   exit 1
 fi
 # Exactly one caller owns the password. The others must not be handed a URI they
@@ -168,7 +172,7 @@ else
   fail "expected one 202, got ${CREATED} (codes: ${race_codes})"
   exit 1
 fi
-RACE_DB="$(k get sts -n drigodb-databases -l "drigodb.io/external-id=${RACE_ID}" \
+RACE_DB="$(k get clusters.postgresql.cnpg.io -n drigodb-databases -l "drigodb.io/external-id=${RACE_ID}" \
   -o jsonpath='{.items[0].metadata.labels.drigodb\.io/database-id}' 2>/dev/null)"
 [ -n "$RACE_DB" ] && api -XDELETE "localhost:${API_PORT}/v1/databases/${RACE_DB}" >/dev/null 2>&1
 rm -f "/tmp/drigodb-race-$$-"*
@@ -193,12 +197,20 @@ esac
 # URI as issued, which carries sslmode=require and passes whether or not
 # plaintext is ALSO accepted. Nothing else asks the opposite question, and the
 # regression was real: measured on kind before the rule was added.
+#
+# Asserted on the OUTPUT, not on an exit code: psql_in_cluster returns the pod's
+# logs and its own status is `printf`, which always succeeds. Written the other
+# way round first, and the assertion then fired on every run whatever the server
+# did — a check that cannot pass is no better than one that cannot fail.
 PLAIN_URI="$(printf '%s' "$URI" | sed 's/sslmode=require/sslmode=disable/')"
-if psql_in_cluster "$PLAIN_URI" "SELECT 1" >/dev/null 2>&1; then
-  fail "a plaintext connection was accepted — pg_hba is not requiring TLS"
-  exit 1
-fi
-ok "a plaintext connection is refused"
+PLAIN_OUT="$(psql_in_cluster "$PLAIN_URI" "SELECT 'PLAINTEXT-ACCEPTED'")"
+case "$PLAIN_OUT" in
+  *PLAINTEXT-ACCEPTED*)
+    fail "a plaintext connection was accepted — pg_hba is not requiring TLS"
+    exit 1 ;;
+  *)
+    ok "a plaintext connection is refused" ;;
+esac
 
 step "Hibernate and wake"
 api -XPOST "localhost:${API_PORT}/v1/databases/${DB_ID}/hibernate" >/dev/null
@@ -211,28 +223,26 @@ for _ in $(seq 1 60); do
 done
 ok "hibernated — zero compute, volume retained"
 
-# Waking is also when a database picks up the pod template the control plane
-# currently renders — a rebuilt postgres image, a fixed probe. Staling the
-# recorded template hash makes the next wake think this database was built by
-# an older drigodb, which is exactly the state a real fleet is in after an
-# image rebuild. If the reconcile does not run, the hash stays "stale".
-k annotate statefulset "db-${DB_ID}" -n drigodb-databases \
-  drigodb.io/template-hash=stale --overwrite >/dev/null
-ok "marked as built by an older template"
-
+# The template reconcile this used to stale-and-check is gone: CloudNativePG
+# owns the pod template and rolls it itself, so there is no drigodb-rendered
+# hash for a wake to bring forward. What is still drigodb's, and still worth
+# timing, is that a hibernated database comes back.
 t0=$(date +%s)
 api -XPOST "localhost:${API_PORT}/v1/databases/${DB_ID}/wake" >/dev/null
 for _ in $(seq 1 60); do
   [ "$(api "localhost:${API_PORT}/v1/databases/${DB_ID}" | jqf '["status"]')" = "ready" ] && break
   sleep 2
 done
+[ "$(api "localhost:${API_PORT}/v1/databases/${DB_ID}" | jqf '["status"]')" = "ready" ] \
+  || { fail "never came back from hibernation"; exit 1; }
 ok "woke in $(( $(date +%s) - t0 ))s"
 
-HASH="$(k get statefulset "db-${DB_ID}" -n drigodb-databases \
-  -o jsonpath='{.metadata.annotations.drigodb\.io/template-hash}')"
-case "$HASH" in
-  stale|"") fail "wake did not reconcile the template (hash: ${HASH:-unset})"; exit 1 ;;
-  *) ok "reconciled to template ${HASH} on the way up" ;;
+# The data survived the cycle. Cheap, and it is the assertion that makes
+# hibernation a feature rather than a way to lose a volume.
+WOKE="$(psql_in_cluster "$URI" "SELECT proof FROM smoke")"
+case "$WOKE" in
+  *provisioned-by-api*) ok "the row written before hibernation is still there" ;;
+  *) fail "data did not survive the hibernate/wake cycle (${WOKE})"; exit 1 ;;
 esac
 
 PG_RUNNING="$(k get pod -n drigodb-databases -l "drigodb.io/database-id=${DB_ID}" \

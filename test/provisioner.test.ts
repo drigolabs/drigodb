@@ -68,7 +68,14 @@ function racingCluster() {
   const core = {
     createNamespacedSecret: async () => ({}),
     createNamespacedService: async () => ({}),
-    listNamespacedPod: async () => ({ items: [] }),
+    // Readiness is counted from pods now, because a hibernated Cluster still
+    // reports readyInstances: 1 with nothing running. The fake has to serve
+    // pods or every database looks like it is still provisioning.
+    listNamespacedPod: async () => ({
+      items: [...objects.values()]
+        .filter((o) => o.ready > 0)
+        .map(() => ({ status: { conditions: [{ type: "Ready", status: "True" }] } })),
+    }),
     listNamespacedPersistentVolumeClaim: async () => ({ items: pvcs }),
   };
   const net = { createNamespacedNetworkPolicy: async () => ({}) };

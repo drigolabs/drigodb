@@ -31,7 +31,6 @@ export const MANAGED_BY_VALUE = "drigodb";
 // across namespaces, so consumers need not live anywhere in particular.
 export const ALLOW_LABEL = "drigodb.io/allow-database";
 
-
 // Which tier a database is on. On the StatefulSet, because the live PVC is the
 // truth and reading a PVC to answer "how big is this database" is a second API
 // call for something a label already knows.
@@ -66,6 +65,18 @@ export const CLUSTERS_PLURAL = "clusters";
 // replica count, and drigodb keeps its own HIBERNATED_LABEL beside it: this one
 // says what the operator was asked to do, the label says what drigodb meant.
 export const CNPG_HIBERNATION_ANNOTATION = "cnpg.io/hibernation";
+
+// Where the operator runs, and the port it reaches each instance on to read its
+// status. drigodb's NetworkPolicy has to admit it, or the operator cannot
+// reconcile the databases it is managing.
+// Which version of the credential Secret drigodb expects the operator to have
+// applied. Written on the Cluster to make rotation actually happen: replacing
+// the Secret alone does not, because CloudNativePG reports the role already
+// `reconciled` and does not look again until something touches the Cluster.
+export const CREDENTIAL_VERSION_ANNOTATION = "drigodb.io/credential-version";
+
+export const CNPG_NAMESPACE = "cnpg-system";
+export const CNPG_STATUS_PORT = 8000;
 
 // The key CNPG reads a username from when it is handed a credential Secret. It
 // wants a kubernetes.io/basic-auth Secret, so the password alone is not enough.
@@ -147,7 +158,6 @@ export function tlsSecretName(id: string): string {
 export const POSTGRES_PORT = 5432;
 export const POSTGRES_PORT_NAME = "postgres";
 
-
 export const DB_USER = "appuser";
 
 export const DB_NAME = "app";
@@ -175,7 +185,6 @@ const PG_CPU_REQUEST = "100m";
 const PG_MEMORY_REQUEST = "192Mi";
 const PG_MEMORY_LIMIT = "1Gi";
 
-
 export function serviceName(id: string): string {
   return `db-${id}`;
 }
@@ -184,8 +193,6 @@ export function secretName(id: string): string {
   return `db-${id}-credentials`;
 }
 
-
-
 // The Cluster carries the name a StatefulSet used to, so nothing that derives a
 // hostname, a Secret name or an id from it has to change — and idempotent create
 // keeps working the same way, because the name is still the lock.
@@ -193,8 +200,10 @@ export function clusterName(id: string): string {
   return `db-${id}`;
 }
 
-
-export function labelsFor(id: string, externalId: string): Record<string, string> {
+export function labelsFor(
+  id: string,
+  externalId: string,
+): Record<string, string> {
   return {
     [DB_ID_LABEL]: id,
     [EXTERNAL_ID_LABEL]: externalId,
@@ -219,7 +228,11 @@ export function connectionUri(id: string, password: string): string {
   );
 }
 
-export function buildSecret(id: string, externalId: string, password: string): V1Secret {
+export function buildSecret(
+  id: string,
+  externalId: string,
+  password: string,
+): V1Secret {
   return {
     apiVersion: "v1",
     kind: "Secret",
@@ -237,11 +250,12 @@ export function buildSecret(id: string, externalId: string, password: string): V
     // is a Secret that is correct only because something else agrees about a
     // value it cannot see.
     type: "kubernetes.io/basic-auth",
-    stringData: { [USERNAME_SECRET_KEY]: DB_USER, [PASSWORD_SECRET_KEY]: password },
+    stringData: {
+      [USERNAME_SECRET_KEY]: DB_USER,
+      [PASSWORD_SECRET_KEY]: password,
+    },
   };
 }
-
-
 
 // A cert-manager Certificate for one database.
 //
@@ -254,7 +268,10 @@ export function buildSecret(id: string, externalId: string, password: string): V
 // Issuer can only be used from its own namespace, and the alternative is a
 // ClusterIssuer that anything in the cluster could ask for a certificate from.
 // The Secret is then mirrored into the database namespace by the provisioner.
-export function buildCertificate(id: string, externalId: string): Record<string, unknown> {
+export function buildCertificate(
+  id: string,
+  externalId: string,
+): Record<string, unknown> {
   return {
     apiVersion: "cert-manager.io/v1",
     kind: "Certificate",
@@ -287,9 +304,6 @@ export function buildCertificate(id: string, externalId: string): Record<string,
   };
 }
 
-
-
-
 // A hosted database, as CloudNativePG sees it. Decision 0004.
 //
 // This replaces buildStatefulSet, and with it most of what drigodb used to
@@ -309,8 +323,16 @@ export interface CnpgClusterSpec {
   postgresql: { parameters: Record<string, string>; pg_hba: string[] };
   certificates?: { serverCASecret: string; serverTLSSecret: string };
   resources: object;
-  bootstrap: { initdb: { database: string; owner: string; secret: { name: string } } };
-  managed: { roles: Array<{ name: string; login: boolean; passwordSecret: { name: string } }> };
+  bootstrap: {
+    initdb: { database: string; owner: string; secret: { name: string } };
+  };
+  managed: {
+    roles: Array<{
+      name: string;
+      login: boolean;
+      passwordSecret: { name: string };
+    }>;
+  };
 }
 
 // Typed rather than `object`, so a field renamed here fails at compile time in
@@ -459,8 +481,6 @@ export function buildCluster(
   };
 }
 
-
-
 export function buildService(id: string, externalId: string): V1Service {
   return {
     apiVersion: "v1",
@@ -515,7 +535,10 @@ export function buildService(id: string, externalId: string): V1Service {
 // selector stops matching, `kubectl port-forward` bypasses it entirely, and a
 // CNI that ignores NetworkPolicy makes it a silent no-op. The separate instance
 // and the per-database credentials hold independently of it.
-export function buildNetworkPolicy(id: string, externalId: string): V1NetworkPolicy {
+export function buildNetworkPolicy(
+  id: string,
+  externalId: string,
+): V1NetworkPolicy {
   return {
     apiVersion: "networking.k8s.io/v1",
     kind: "NetworkPolicy",
@@ -538,6 +561,36 @@ export function buildNetworkPolicy(id: string, externalId: string): V1NetworkPol
               podSelector: { matchLabels: { [ALLOW_LABEL]: id } },
             },
           ],
+          ports: [{ protocol: "TCP", port: POSTGRES_PORT }],
+        },
+        {
+          // The operator, on the status port it scrapes each instance through.
+          //
+          // Without this the policy blocks CloudNativePG from its own pods, and
+          // every database sits in "Instance Status Extraction Error:
+          // HTTP communication issue" — with the operator's own message naming
+          // NetworkPolicy as the likely cause, which is the only reason this was
+          // findable. A stuck reconcile means HIBERNATION SILENTLY DOES NOTHING:
+          // drigodb records the intent, the annotation is set, and the pod runs
+          // on. Measured, after sixty seconds of waiting for a pod to go.
+          //
+          // Every earlier hibernation measurement in this work was taken against
+          // a Cluster with no NetworkPolicy in front of it, which is why it kept
+          // looking fine.
+          _from: [
+            {
+              namespaceSelector: {
+                matchLabels: { "kubernetes.io/metadata.name": CNPG_NAMESPACE },
+              },
+            },
+          ],
+          ports: [{ protocol: "TCP", port: CNPG_STATUS_PORT }],
+        },
+        {
+          // Instance to instance, for replication. Not needed at one instance
+          // and needed the moment there are two (#81), and a policy that admits
+          // it only once someone turns HA on would fail exactly when it mattered.
+          _from: [{ podSelector: { matchLabels: { [DB_ID_LABEL]: id } } }],
           ports: [{ protocol: "TCP", port: POSTGRES_PORT }],
         },
       ],

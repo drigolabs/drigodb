@@ -26,8 +26,10 @@ import {
   TIER_ORDER,
   DB_ID_LABEL,
   CLUSTERS_PLURAL,
+  DB_USER,
   CNPG_GROUP,
   CNPG_HIBERNATION_ANNOTATION,
+  CREDENTIAL_VERSION_ANNOTATION,
   EXTERNAL_ID_LABEL,
   HIBERNATED_LABEL,
   MANAGED_BY_LABEL,
@@ -93,7 +95,13 @@ interface CnpgCluster {
     creationTimestamp?: string;
   };
   spec?: { instances?: number; storage?: { size?: string } };
-  status?: { readyInstances?: number; phase?: string };
+  status?: {
+    readyInstances?: number;
+    phase?: string;
+    managedRolesStatus?: {
+      passwordStatus?: Record<string, { resourceVersion?: string }>;
+    };
+  };
 }
 
 export class ValidationError extends Error {}
@@ -125,7 +133,6 @@ export class DeletionInFlightError extends Error {}
 // is a caller mistake or an attempt to read another prefix. Both are 400s.
 const RESTORE_KEY_RE = /^\d{8}T\d{6}Z\.sql\.gz$/;
 const DB_ID_RE = /^[0-9a-f]{12}$/;
-
 
 // Falls back rather than throwing on a bad value: a typo in an operator's env
 // must not stop every provision, and small is the safe direction to be wrong in.
@@ -178,14 +185,16 @@ function newPassword(): string {
 }
 
 function isAlreadyExists(err: unknown): boolean {
-  const code = (err as { code?: number; statusCode?: number })?.code
-    ?? (err as { statusCode?: number })?.statusCode;
+  const code =
+    (err as { code?: number; statusCode?: number })?.code ??
+    (err as { statusCode?: number })?.statusCode;
   return code === 409;
 }
 
 function isNotFound(err: unknown): boolean {
-  const code = (err as { code?: number; statusCode?: number })?.code
-    ?? (err as { statusCode?: number })?.statusCode;
+  const code =
+    (err as { code?: number; statusCode?: number })?.code ??
+    (err as { statusCode?: number })?.statusCode;
   return code === 404;
 }
 
@@ -254,7 +263,28 @@ export class Provisioner {
     // database was hibernated was wrong in exactly the case this distinguishes.
     if (labels[HIBERNATED_LABEL] === "true") return "hibernated";
 
-    const ready = cluster.status?.readyInstances ?? 0;
+    // Counted from the pods, not read from status.readyInstances.
+    //
+    // A hibernated Cluster reports readyInstances: 1 with zero pods running —
+    // CloudNativePG does not zero it on the way down. The hibernation label
+    // covers a database that is deliberately down, but a database on its way
+    // BACK up would have reported `ready` the instant the annotation flipped,
+    // before anything was listening. Measured: "woke in 0s", with no pod.
+    // `cnpg.io/podRole=instance` as well as drigodb's own id, because
+    // inheritedMetadata puts drigodb's labels on EVERY pod the operator makes
+    // for this database — including the initdb Job's. Selecting on the id alone
+    // counted that job pod as a ready instance and reported the database ready
+    // seven seconds in, while nothing was listening yet. Measured: "ready in
+    // 7s", then connection refused.
+    const pods = await this.core.listNamespacedPod({
+      namespace: config.databaseNamespace,
+      labelSelector: `${DB_ID_LABEL}=${id},cnpg.io/podRole=instance`,
+    });
+    const ready = (pods.items ?? []).filter((p) =>
+      (p.status?.conditions ?? []).some(
+        (c) => c.type === "Ready" && c.status === "True",
+      ),
+    ).length;
 
     // Before the ready check, not after: a database whose migrations failed has
     // a running server and an unusable schema, which is the whole reason this
@@ -287,6 +317,58 @@ export class Provisioner {
     };
   }
 
+  // Make the rotation happen, then wait for the operator to say it has.
+  //
+  // Replacing the Secret is not enough on its own, and this is the trap:
+  // CloudNativePG goes on reporting the role `reconciled` against the version it
+  // last applied and does not re-read the Secret until something touches the
+  // Cluster. Measured — the Secret at resourceVersion 6634, the operator
+  // reporting 6176, `reconciled`, indefinitely.
+  //
+  // Which is the worst shape a failed rotation can take. The API returns a new
+  // URI that does not work, and the OLD password goes on working — so a caller
+  // rotating because a credential leaked would believe they had revoked it.
+  //
+  // The annotation is the nudge and the record: it names the Secret version
+  // drigodb expects applied, so the two can be compared by anyone debugging.
+  // Reconciles in about four seconds once written.
+  private async applyCredentialVersion(
+    id: string,
+    version?: string,
+    attempts = 60,
+  ): Promise<void> {
+    if (!version) return;
+    await this.objects.patchNamespacedCustomObject(
+      {
+        group: CNPG_GROUP,
+        version: "v1",
+        namespace: config.databaseNamespace,
+        plural: CLUSTERS_PLURAL,
+        name: clusterName(id),
+        body: {
+          metadata: {
+            annotations: { [CREDENTIAL_VERSION_ANNOTATION]: version },
+          },
+        },
+      },
+      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+    );
+    for (let i = 0; i < attempts; i++) {
+      const cluster = await this.clusterFor(id);
+      const applied =
+        cluster?.status?.managedRolesStatus?.passwordStatus?.[DB_USER]
+          ?.resourceVersion;
+      if (applied === version) return;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    // Not fatal. The rotation HAS happened — the Secret is written and the
+    // operator will converge — so refusing to return the URI would leave the
+    // caller without a credential that is about to start working.
+    console.warn(
+      `[drigodb] ${id}: role password not confirmed applied after ${attempts}s`,
+    );
+  }
+
   private async ignoreMissing(fn: () => Promise<unknown>): Promise<void> {
     try {
       await fn();
@@ -297,13 +379,15 @@ export class Provisioner {
 
   private async jobFor(name: string): Promise<V1Job | undefined> {
     try {
-      return await this.batch.readNamespacedJob({ name, namespace: config.databaseNamespace });
+      return await this.batch.readNamespacedJob({
+        name,
+        namespace: config.databaseNamespace,
+      });
     } catch (err) {
       if (isNotFound(err)) return undefined;
       throw err;
     }
   }
-
 
   private async listClusters(selector: string): Promise<CnpgCluster[]> {
     const list = (await this.objects.listNamespacedCustomObject({
@@ -332,7 +416,9 @@ export class Provisioner {
   }
 
   async list(): Promise<Database[]> {
-    const clusters = await this.listClusters(`${MANAGED_BY_LABEL}=${MANAGED_BY_VALUE}`);
+    const clusters = await this.listClusters(
+      `${MANAGED_BY_LABEL}=${MANAGED_BY_VALUE}`,
+    );
     return Promise.all(clusters.map((c) => this.toDatabase(c)));
   }
 
@@ -376,7 +462,10 @@ export class Provisioner {
     // loser of a race overwrites it with an identical-shaped Secret carrying a
     // password nobody will ever be told, and then returns without using it.
     await this.ensure(() =>
-      this.core.createNamespacedSecret({ namespace: ns, body: buildSecret(id, externalId, password) }),
+      this.core.createNamespacedSecret({
+        namespace: ns,
+        body: buildSecret(id, externalId, password),
+      }),
     );
 
     // BEFORE the Cluster, not after, and that ordering is now load-bearing.
@@ -406,7 +495,9 @@ export class Provisioner {
       });
     } catch (err) {
       if (!isAlreadyExists(err)) throw err;
-      const owner = (await this.clusterFor(id))?.metadata?.labels?.[EXTERNAL_ID_LABEL];
+      const owner = (await this.clusterFor(id))?.metadata?.labels?.[
+        EXTERNAL_ID_LABEL
+      ];
       // Twelve hex characters is 48 bits, so a collision needs millions of
       // external_ids — but handing one caller another's database, credentials
       // and all, is not a failure to discover in production.
@@ -426,15 +517,23 @@ export class Provisioner {
     // Cluster carries the same name a StatefulSet did: the connection URI is
     // issued once and never reissued, so the hostname in it cannot move.
     await this.ensure(() =>
-      this.core.createNamespacedService({ namespace: ns, body: buildService(id, externalId) }),
+      this.core.createNamespacedService({
+        namespace: ns,
+        body: buildService(id, externalId),
+      }),
     );
     await this.ensure(() =>
-      this.net.createNamespacedNetworkPolicy({ namespace: ns, body: buildNetworkPolicy(id, externalId) }),
+      this.net.createNamespacedNetworkPolicy({
+        namespace: ns,
+        body: buildNetworkPolicy(id, externalId),
+      }),
     );
 
-
-
-    return { database: await this.get(id), uri: connectionUri(id, password), created: true };
+    return {
+      database: await this.get(id),
+      uri: connectionUri(id, password),
+      created: true,
+    };
   }
 
   // Bring a database up, on the template this build renders rather than the one
@@ -457,8 +556,6 @@ export class Provisioner {
     return this.get(id);
   }
 
-
-
   // Issue a new password and return the URI that carries it.
   //
   // The second and only other time a connection URI leaves this service. That
@@ -473,7 +570,9 @@ export class Provisioner {
   // pg_hba rule and a DDL-capable credential per database that the control
   // plane holds and can use — it already holds every credential; the point is
   // that it cannot use one from where it runs. See issue #29.
-  async rotateCredentials(id: string): Promise<{ database: Database; uri: string }> {
+  async rotateCredentials(
+    id: string,
+  ): Promise<{ database: Database; uri: string }> {
     const cluster = await this.clusterFor(id);
     if (!cluster) throw new NotFoundError(`no database with id ${id}`);
 
@@ -484,7 +583,7 @@ export class Provisioner {
     // happened before this landed would come back on the old password. This
     // order also fails safe: if the restart below never happens, the database
     // still converges on the new password at its next wake.
-    await this.core.replaceNamespacedSecret({
+    const written = await this.core.replaceNamespacedSecret({
       name: secretName(id),
       namespace: config.databaseNamespace,
       body: buildSecret(id, externalId, password),
@@ -496,6 +595,13 @@ export class Provisioner {
     // No restart. Under CloudNativePG the password is a managed role reconciled
     // against this Secret continuously, so replacing the Secret IS the rotation
     // — measured, including that the old password stops being accepted.
+    //
+    // But it is not instant, and this endpoint returns a URI a caller will use
+    // immediately. Waiting for the operator to say it has adopted THIS version
+    // of the Secret is what makes the returned credential true when it is
+    // returned. Without it the caller gets "password authentication failed" on
+    // a password drigodb has just told them is theirs — measured, not guessed.
+    await this.applyCredentialVersion(id, written?.metadata?.resourceVersion);
     //
     // The hibernate/wake cycle this used to perform was there because the old
     // data plane read the Secret only at start. Dropping it removes the one
@@ -541,23 +647,36 @@ export class Provisioner {
     // annotation acting on it can never disagree. The previous data plane needed
     // two writes — a label patch and a scale subresource — and an ordering
     // argument about which lies less when the second one fails.
-    await this.objects.patchNamespacedCustomObject({
-      group: CNPG_GROUP,
-      version: "v1",
-      namespace: config.databaseNamespace,
-      plural: CLUSTERS_PLURAL,
-      name: clusterName(id),
-      body: {
-        metadata: {
-          labels: { [HIBERNATED_LABEL]: want },
-          annotations: { [CNPG_HIBERNATION_ANNOTATION]: replicas === 0 ? "on" : "off" },
+    await this.objects.patchNamespacedCustomObject(
+      {
+        group: CNPG_GROUP,
+        version: "v1",
+        namespace: config.databaseNamespace,
+        plural: CLUSTERS_PLURAL,
+        name: clusterName(id),
+        body: {
+          metadata: {
+            labels: { [HIBERNATED_LABEL]: want },
+            annotations: {
+              [CNPG_HIBERNATION_ANNOTATION]: replicas === 0 ? "on" : "off",
+            },
+          },
         },
       },
-    });
+      // The merge-patch content type, which every patch this service sends
+      // needs. Without it the client sends a JSON Patch — an array of
+      // operations — and the API server rejects an object outright with
+      // "cannot unmarshal object into Go value of type []handlers.jsonPatchOp".
+      //
+      // Written without it here, and hibernate returned 500 on a real cluster
+      // while every unit test passed: a mocked client cannot notice a content
+      // type. The same mistake, in the same shape, as the one the StatefulSet
+      // patches carry a comment about.
+      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+    );
 
     return await this.get(id);
   }
-
 
   // Grow a database onto a bigger tier.
   //
@@ -621,12 +740,13 @@ export class Provisioner {
           metadata: { labels: { [TIER_LABEL]: target } },
           spec: {
             storage: { size: TIERS[target].storage },
-            postgresql: { parameters: { max_wal_size: TIERS[target].maxWalSize } },
+            postgresql: {
+              parameters: { max_wal_size: TIERS[target].maxWalSize },
+            },
           },
         },
       });
     } catch (err) {
-
       // The common cause is a StorageClass with allowVolumeExpansion: false —
       // kind's local-path, and plenty of others. Kubernetes says so clearly and
       // the caller should hear it, rather than the "internal error" a 500 gives
@@ -638,11 +758,16 @@ export class Provisioner {
       const raw = (err as { body?: unknown })?.body;
       let detail: string | undefined;
       if (typeof raw === "string") {
-        try { detail = (JSON.parse(raw) as { message?: string }).message; } catch { detail = raw; }
+        try {
+          detail = (JSON.parse(raw) as { message?: string }).message;
+        } catch {
+          detail = raw;
+        }
       } else if (raw && typeof raw === "object") {
         detail = (raw as { message?: string }).message;
       }
-      if (detail) throw new ResizeRefusedError(`could not grow the volume: ${detail}`);
+      if (detail)
+        throw new ResizeRefusedError(`could not grow the volume: ${detail}`);
       throw err;
     }
 
@@ -676,7 +801,10 @@ export class Provisioner {
   // bootstrap.sh self-signs, the URI still works with the sslmode it was issued
   // for, and the alternative is an installation where a broken cert-manager
   // stops anyone creating a database at all.
-  private async ensureCertificate(id: string, externalId: string): Promise<void> {
+  private async ensureCertificate(
+    id: string,
+    externalId: string,
+  ): Promise<void> {
     try {
       await this.objects.createNamespacedCustomObject({
         group: "cert-manager.io",
@@ -687,7 +815,10 @@ export class Provisioner {
       });
     } catch (err) {
       if (isAlreadyExists(err)) return;
-      console.error(`[drigodb] could not request a certificate for ${id}:`, err);
+      console.error(
+        `[drigodb] could not request a certificate for ${id}:`,
+        err,
+      );
     }
   }
 
@@ -713,24 +844,49 @@ export class Provisioner {
         name: clusterName(id),
       }),
     );
-    await ignoreMissing(() => this.core.deleteNamespacedService({ name: serviceName(id), namespace: ns }));
     await ignoreMissing(() =>
-      this.net.deleteNamespacedNetworkPolicy({ name: clusterName(id), namespace: ns }),
+      this.core.deleteNamespacedService({
+        name: serviceName(id),
+        namespace: ns,
+      }),
     );
-    await ignoreMissing(() => this.core.deleteNamespacedSecret({ name: secretName(id), namespace: ns }));
+    await ignoreMissing(() =>
+      this.net.deleteNamespacedNetworkPolicy({
+        name: clusterName(id),
+        namespace: ns,
+      }),
+    );
+    await ignoreMissing(() =>
+      this.core.deleteNamespacedSecret({ name: secretName(id), namespace: ns }),
+    );
 
     // The retention policy deliberately keeps volumes when a StatefulSet is
     // removed, so DELETE has to remove them explicitly. This is the point at
     // which the customer's data actually goes.
-    const pvcs = await this.core.listNamespacedPersistentVolumeClaim({
-      namespace: ns,
-      labelSelector: `${DB_ID_LABEL}=${id}`,
-    });
+    const pvcs = await this.core.listNamespacedPersistentVolumeClaim(
+      {
+        namespace: ns,
+        labelSelector: `${DB_ID_LABEL}=${id}`,
+      },
+      // The merge-patch content type, which every patch this service sends
+      // needs. Without it the client sends a JSON Patch — an array of
+      // operations — and the API server rejects an object outright with
+      // "cannot unmarshal object into Go value of type []handlers.jsonPatchOp".
+      //
+      // Written without it here, and hibernate returned 500 on a real cluster
+      // while every unit test passed: a mocked client cannot notice a content
+      // type. The same mistake, in the same shape, as the one the StatefulSet
+      // patches carry a comment about.
+      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+    );
     for (const pvc of pvcs.items ?? []) {
       const name = pvc.metadata?.name;
       if (name) {
         await ignoreMissing(() =>
-          this.core.deleteNamespacedPersistentVolumeClaim({ name, namespace: ns }),
+          this.core.deleteNamespacedPersistentVolumeClaim({
+            name,
+            namespace: ns,
+          }),
         );
       }
     }
@@ -759,5 +915,4 @@ export class Provisioner {
     if (!raw) throw new NotFoundError("the CA secret holds no certificate yet");
     return Buffer.from(raw, "base64").toString("utf8");
   }
-
 }
