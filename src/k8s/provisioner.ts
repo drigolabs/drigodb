@@ -37,30 +37,20 @@ import {
   MANAGED_BY_LABEL,
   MANAGED_BY_VALUE,
   POSTGRES_PORT,
-  TEMPLATE_HASH_ANNOTATION,
   buildNetworkPolicy,
-  buildPodTemplate,
   buildCertificate,
   buildRestoreJob,
   buildCluster,
-  buildMigrationJob,
-  buildMigratorSecret,
   buildSecret,
   buildService,
-  buildStatefulSet,
   connectionUri,
   endpointHost,
-  pvcName,
   restoreJobName,
   tierOf,
   tlsSecretName,
   secretName,
   serviceName,
   clusterName,
-  migrationJobName,
-  migratorSecretName,
-  statefulSetName,
-  templateHash,
 } from "./manifests.js";
 
 // "restoring" is deliberately NOT "ready". A restored database answers on its
@@ -282,20 +272,6 @@ export class Provisioner {
     // Before the ready check, not after: a database whose migrations failed has
     // a running server and an unusable schema, which is the whole reason this
     // status exists. It is also why no URI is issued for one — see create().
-    const migration = await this.jobFor(migrationJobName(id));
-    if (migration) {
-      // The Job's own verdict, not its failed-pod count. A Job with a
-      // backoffLimit has failed pods on the way to succeeding — the migration
-      // runner's first attempt routinely fails because it starts before the
-      // server is accepting connections — and reading the count would mark a
-      // database permanently `failed` for a retry that then worked.
-      const givenUp = (migration.status?.conditions ?? []).some(
-        (c) => c.type === "Failed" && c.status === "True",
-      );
-      if (givenUp) return "failed";
-      if ((migration.status?.succeeded ?? 0) === 0) return ready > 0 ? "migrating" : "provisioning";
-    }
-
     const restore = await this.restoreJobFor(id);
     if (restore) {
       if ((restore.status?.succeeded ?? 0) > 0) return ready > 0 ? "ready" : "provisioning";
@@ -328,29 +304,6 @@ export class Provisioner {
         ? new Date(cluster.metadata.creationTimestamp).toISOString()
         : undefined,
     };
-  }
-
-  // Run drigodb's migrations against a database that is up.
-  //
-  // Deleted and recreated rather than reused: a Job's pod template is immutable,
-  // so a second wake cannot re-run an existing one, and a Job left behind from
-  // the last wake would make statusOf report a stale verdict about the current
-  // one. Deleting first is what makes "the Job for this database" mean the run
-  // that is happening now.
-  private async runMigrations(id: string, externalId: string): Promise<void> {
-    await this.ignoreMissing(() =>
-      this.batch.deleteNamespacedJob({
-        name: migrationJobName(id),
-        namespace: config.databaseNamespace,
-        propagationPolicy: "Background",
-      }),
-    );
-    await this.ensure(() =>
-      this.batch.createNamespacedJob({
-        namespace: config.databaseNamespace,
-        body: buildMigrationJob(id, externalId),
-      }),
-    );
   }
 
   private async ignoreMissing(fn: () => Promise<unknown>): Promise<void> {
@@ -458,15 +411,6 @@ export class Provisioner {
     await this.ensure(() =>
       this.core.createNamespacedSecret({ namespace: ns, body: buildSecret(id, externalId, password) }),
     );
-    // The migration runner's own credential, never issued to anyone. Written
-    // here for the same reason as the one above: managed.roles reconciles the
-    // role against it, so it has to exist before the Cluster does.
-    await this.ensure(() =>
-      this.core.createNamespacedSecret({
-        namespace: ns,
-        body: buildMigratorSecret(id, externalId, newPassword()),
-      }),
-    );
 
     // The Cluster is the lock, exactly as the StatefulSet was: whichever caller
     // creates it wins, and the other is told AlreadyExists and handed the
@@ -507,11 +451,6 @@ export class Provisioner {
       this.net.createNamespacedNetworkPolicy({ namespace: ns, body: buildNetworkPolicy(id, externalId) }),
     );
 
-    // A Cluster comes up on its own — there is no hibernated-then-woken dance,
-    // because the operator starts provisioning the moment the object exists.
-    // Migrations are what the wake path used to carry, so they are run
-    // explicitly here and again on every wake.
-    await this.runMigrations(id, externalId);
 
     // After the wake, because the Job connects over TCP to a server that has to
     // be listening — and creating it earlier would only mean it crash-looped
@@ -543,74 +482,10 @@ export class Provisioner {
     if (!cluster) throw new NotFoundError(`no database with id ${id}`);
 
     await this.scale(id, 1);
-    // Waking is still how a change reaches an existing database, but the change
-    // is no longer a pod template: the operator owns that and rolls it itself.
-    // What is left is drigodb's own schema, so a wake re-runs the migration Job.
-    await this.runMigrations(id, cluster.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "");
     return this.get(id);
   }
 
-  // Rewrite the pod template if this build renders a different one.
-  //
-  // Ordering is the point: this runs BEFORE the scale, while the StatefulSet is
-  // still at zero replicas. With no pods there is nothing to roll, so the
-  // rewrite costs nothing and the pod that follows starts once, on the new
-  // template. Reconciling after the scale would start it on the old template
-  // and then roll it — two starts, and roughly twice the eight seconds a wake
-  // is supposed to take.
-  private async reconcile(sts: V1StatefulSet): Promise<void> {
-    const labels = sts.metadata?.labels ?? {};
-    const id = labels[DB_ID_LABEL];
-    const externalId = labels[EXTERNAL_ID_LABEL];
-    if (!id || !externalId) return;
 
-    // Waking is how everything else reaches an existing database — a rebuilt
-    // image, a new migration, a resized volume — and a certificate is no
-    // different. Without this, turning server authentication on would give it
-    // only to databases created afterwards, and the fleet would divide silently
-    // into verifiable and not.
-    if (serverAuthEnabled()) await this.ensureCertificate(id, externalId);
-
-    // Only on the way up from hibernation. Callers wake speculatively — that is
-    // what the endpoint is for — and a wake on a database that is already
-    // serving must not touch it: rewriting the template of a running
-    // StatefulSet rolls the pod and drops every live connection. A database
-    // that is already awake reconciles on its next hibernate/wake cycle.
-    if ((sts.spec?.replicas ?? 0) > 0) return;
-
-    // From the StatefulSet's own label, not from configuration. A resized
-    // database is on a tier this installation may not create by default, and
-    // rebuilding its template from config.defaultTier would silently move it
-    // back — undoing a resize on the next wake, with the PVC left large and
-    // max_wal_size dropped underneath it.
-    const tier = tierOf(labels);
-
-    const want = templateHash(id, externalId, tier);
-    if (sts.metadata?.annotations?.[TEMPLATE_HASH_ANNOTATION] === want) return;
-
-    await this.apps.patchNamespacedStatefulSet(
-      {
-        name: statefulSetName(id),
-        namespace: config.databaseNamespace,
-        body: {
-          metadata: { annotations: { [TEMPLATE_HASH_ANNOTATION]: want } },
-          // Only the template. A StatefulSet's selector, serviceName and
-          // volumeClaimTemplates are immutable, so anything wider than this is
-          // rejected outright; replicas is left out so the patch cannot fight
-          // the scale that follows it.
-          spec: { template: buildPodTemplate(id, externalId, tier) },
-        },
-      },
-      // A merge patch, not the strategic merge the client would otherwise send.
-      // Strategic merge unions lists by key — containers by name, env by name —
-      // so a field this build no longer renders would survive in the live
-      // object indefinitely. Merge patch replaces lists wholesale, which is
-      // what "make it match what we render" actually means.
-      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
-    );
-
-    console.log(`[drigodb] reconciled ${id} to template ${want}`);
-  }
 
   // Issue a new password and return the URI that carries it.
   //
@@ -748,23 +623,38 @@ export class Provisioner {
 
     const ns = config.databaseNamespace;
 
-    // 1. The volume. Expansion is online — measured on DigitalOcean 2026-09-05,
-    //    974M to 2.0G with the database serving and no restart — so this alone
-    //    costs a tenant nothing.
+    // One patch, and the operator does both halves.
+    //
+    // The old data plane needed two: a PVC patch to grow the volume, then a pod
+    // template rewrite for max_wal_size, ordered so that a failure between them
+    // left a LARGER volume running the old ceiling rather than a raised ceiling
+    // on a volume that never grew — PostgreSQL on a full disk PANICs.
+    //
+    // That ordering argument is gone. The Cluster carries the size and the
+    // parameter, and the operator expands the volume and decides whether the
+    // parameter needs a restart. It also means the PVC name is no longer
+    // drigodb's business, which is just as well: CloudNativePG names it
+    // `db-<id>-1`, not the `data-db-<id>-0` a StatefulSet would have.
+    //
+    // Expansion is online — measured on DigitalOcean 2026-09-05, 974M to 2.0G
+    // with the database serving and no restart.
     try {
-      await this.core.patchNamespacedPersistentVolumeClaim(
-        {
-          name: pvcName(id),
-          namespace: ns,
-          body: { spec: { resources: { requests: { storage: TIERS[target].storage } } } },
+      await this.objects.patchNamespacedCustomObject({
+        group: CNPG_GROUP,
+        version: "v1",
+        namespace: ns,
+        plural: CLUSTERS_PLURAL,
+        name: clusterName(id),
+        body: {
+          metadata: { labels: { [TIER_LABEL]: target } },
+          spec: {
+            storage: { size: TIERS[target].storage },
+            postgresql: { parameters: { max_wal_size: TIERS[target].maxWalSize } },
+          },
         },
-        // Same reason the StatefulSet patch sets this: without it the client
-        // sends a JSON Patch, which expects an array of operations and rejects
-        // this object outright with "cannot unmarshal object into Go value of
-        // type []handlers.jsonPatchOp". A mocked client cannot notice that.
-        setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
-      );
+      });
     } catch (err) {
+
       // The common cause is a StorageClass with allowVolumeExpansion: false —
       // kind's local-path, and plenty of others. Kubernetes says so clearly and
       // the caller should hear it, rather than the "internal error" a 500 gives
@@ -783,35 +673,6 @@ export class Provisioner {
       if (detail) throw new ResizeRefusedError(`could not grow the volume: ${detail}`);
       throw err;
     }
-
-    // 2. The template and the label, together. The pod template carries
-    //    DRIGODB_MAX_WAL_SIZE, which bootstrap.sh writes into PGDATA at start —
-    //    so this takes effect on the cycle below, after the volume has grown.
-    await this.apps.patchNamespacedStatefulSet(
-      {
-        name: statefulSetName(id),
-        namespace: ns,
-        body: {
-          metadata: {
-            labels: { [TIER_LABEL]: target },
-            annotations: { [TEMPLATE_HASH_ANNOTATION]: templateHash(id, externalId, target) },
-          },
-          spec: { template: buildPodTemplate(id, externalId, target) },
-        },
-      },
-      // Every patch this service sends needs this. Without it the client sends a
-      // JSON Patch, which wants an array of operations and rejects an object —
-      // and a mocked client in a unit test cannot tell the difference, which is
-      // why both of these got it wrong until a real cluster said so.
-      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
-    );
-
-    // There is no transaction across these two, and the order is what makes that
-    // survivable: a failure between them leaves a LARGER volume still running
-    // the old max_wal_size, which is merely wasteful. Reversed, it would leave a
-    // raised WAL ceiling on a volume that never grew — and PostgreSQL on a full
-    // disk does not degrade, it PANICs and will not restart until space is
-    // freed. Observed exactly once during development, in the safe direction.
 
     // 3. The cycle, which is what the WAL change needs and the volume does not.
     //    Skipped for a hibernated database: it will pick both up when it wakes,
@@ -882,16 +743,9 @@ export class Provisioner {
     );
     await ignoreMissing(() => this.core.deleteNamespacedService({ name: serviceName(id), namespace: ns }));
     await ignoreMissing(() =>
-      this.net.deleteNamespacedNetworkPolicy({ name: statefulSetName(id), namespace: ns }),
+      this.net.deleteNamespacedNetworkPolicy({ name: clusterName(id), namespace: ns }),
     );
     await ignoreMissing(() => this.core.deleteNamespacedSecret({ name: secretName(id), namespace: ns }));
-    // The migrator's credential too. Left behind, it would be a live password
-    // for a role in a database that no longer exists — and then get adopted by
-    // the next database to take this id, since ids are derived from external_id
-    // and therefore reused.
-    await ignoreMissing(() =>
-      this.core.deleteNamespacedSecret({ name: migratorSecretName(id), namespace: ns }),
-    );
     // A failed restore Job outlives its TTL on purpose, so DELETE is what
     // finally removes it — along with the pod holding its logs.
     if (serverAuthEnabled()) {

@@ -185,11 +185,20 @@ esac
 
 # The schema drigodb installs into every database, which nothing else asserts
 # outside its own integration test.
-VER="$(psql_in_cluster "$URI" "SELECT _drigodb.version()")" || true
-case "$VER" in
-  *.sql*) ok "migrations applied, at $(echo "$VER" | tr -d '\r' | head -1)" ;;
-  *) fail "_drigodb.version() did not answer (${VER})"; exit 1 ;;
-esac
+# TLS or nothing. CloudNativePG's default pg_hba ends `host all all all
+# scram-sha-256` — plain `host` — so a client passing sslmode=disable connects in
+# the clear unless drigodb says otherwise. It does, in the Cluster's pg_hba.
+#
+# This assertion exists because every other connection in this script uses the
+# URI as issued, which carries sslmode=require and passes whether or not
+# plaintext is ALSO accepted. Nothing else asks the opposite question, and the
+# regression was real: measured on kind before the rule was added.
+PLAIN_URI="$(printf '%s' "$URI" | sed 's/sslmode=require/sslmode=disable/')"
+if psql_in_cluster "$PLAIN_URI" "SELECT 1" >/dev/null 2>&1; then
+  fail "a plaintext connection was accepted — pg_hba is not requiring TLS"
+  exit 1
+fi
+ok "a plaintext connection is refused"
 
 step "Hibernate and wake"
 api -XPOST "localhost:${API_PORT}/v1/databases/${DB_ID}/hibernate" >/dev/null

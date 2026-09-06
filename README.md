@@ -342,32 +342,17 @@ Restoring in place, over an existing database, is not built. It is the one someo
 corruption wants and it is genuinely destructive, so it waits for someone to have needed it —
 [#22](https://github.com/drigolabs/drigodb/issues/22).
 
-## Schema inside a database
+## Nothing inside a database
 
-A provisioned database carries a `_drigodb` schema, applied from
-[`config/migrations/`](charts/drigodb/files/migrations/) in filename order, exactly once each and recorded in
-`_drigodb.schema_migrations`. `SELECT _drigodb.version()` says where a database is up to.
+drigodb creates the database, the role and the volume, and then it stops. There
+is no drigodb schema in a hosted database, no table it owns, nothing it reads
+back out. `public` is yours and so is everything else.
 
-`config/bootstrap.sh` runs them, over the local socket, as `postgres`. **The control plane never
-connects to a database** — it holds every credential but has no route to use one, and giving it a way in
-would mean a `pg_hba` rule, a NetworkPolicy hole and a DDL-capable credential per database. Shipping
-schema through the pod instead means a new migration reaches an existing database on its next wake,
-through the same template reconcile that carries an image update.
-
-An ordinary wake still costs nothing: a marker in `PGDATA` records which set of files the cluster has
-seen, so the server is only started early when there is actually work — the same trick the credential
-fingerprint uses, and they share one start/stop cycle when both are due.
-
-**Migrations are forward-only.** The runner records a checksum per file, and an edited migration that
-has already been applied stops the server from starting rather than letting a schema drift from the file
-claiming to describe it. That failure is fleet-wide by design, so it has to be caught before it ships —
-`config/migrations-test.sh` runs the real `bootstrap.sh` against the real image on every CI run and
-asserts exactly that.
-
-What is deliberately *not* in there: no patch log, no manifest tables, no `apply_patch`. Those belong to
-the document-framework proposal in [docs/plans/](docs/plans/), which is a separate bet. This is the
-mechanism that would deliver them, and is worth having either way — without it nothing can change a
-provisioned database after it is created.
+That was not always true. A `_drigodb` schema used to be applied from a set of
+migration files, tracked in a ledger, with a runner enforcing checksums — and
+the only migration that ever existed created the ledger and a function reporting
+what was in the ledger. Nothing in the control plane read either. See
+[decision 0006](docs/decisions/0006-nothing-inside-a-hosted-database.md).
 
 ## Measured
 

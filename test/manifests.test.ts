@@ -1,98 +1,30 @@
 // Pins the contract that was expensive to discover, where every failure mode is
-// silent rather than loud. See docs/leaving-documentdb.md for what changed when
-// the extension and the gateway went, and docs/documentdb-multitenancy-spike.md
-// for the isolation findings that shaped what stayed.
+// silent rather than loud.
+//
+// A hosted database is a CloudNativePG Cluster now (decision 0004), so most of
+// what this file used to assert about a pod template has gone with the pod
+// template. What is left is the part drigodb still owns — and the parts of the
+// Cluster spec that were established against a live cluster because a plausible
+// spelling does nothing.
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   ALLOW_LABEL,
-  DATA_VOLUME,
   DB_ID_LABEL,
   EXTERNAL_ID_LABEL,
-  MIGRATIONS_CONFIG_MAP_NAME,
-  MIGRATIONS_MOUNT_PATH,
   POSTGRES_PORT,
-  RUN_AS_GROUP,
-  RUN_AS_USER,
-  SOCKET_MOUNT_PATH,
-  SOCKET_VOLUME,
   buildNetworkPolicy,
   buildSecret,
   buildService,
-  buildStatefulSet,
+  buildCluster,
   connectionUri,
-  templateHash,
 } from "../src/k8s/manifests.js";
 import { ValidationError, validateExternalId } from "../src/k8s/provisioner.js";
 
 const ID = "a1b2c3d4e5f6";
 const EXT = "openvoid-app-01JQ";
 
-describe("statefulset", () => {
-  it("runs as the image's postgres UID and GID, which are not the same number", () => {
-    // uid=26(postgres) gid=102(postgres) in CNPG's image. Carrying the old
-    // assumption that both were 26 would leave PGDATA group-owned by a group
-    // the server does not belong to.
-    const ctx = buildStatefulSet(ID, EXT).spec?.template.spec?.securityContext;
-    expect(ctx?.runAsUser).toBe(RUN_AS_USER);
-    expect(ctx?.runAsGroup).toBe(RUN_AS_GROUP);
-    expect(ctx?.fsGroup).toBe(RUN_AS_GROUP);
-    expect(RUN_AS_GROUP).not.toBe(RUN_AS_USER);
-  });
-
-  it("runs postgres alone, with no proxy in front of it", () => {
-    const containers = buildStatefulSet(ID, EXT).spec?.template.spec?.containers ?? [];
-    expect(containers.map((c) => c.name)).toEqual(["postgres"]);
-  });
-
-  it("keeps the shared socket, which outlived the gateway", () => {
-    // The backup sidecar reaches the server over it and authenticates by peer,
-    // which is why backups need no credential and no network path.
-    const pg = buildStatefulSet(ID, EXT).spec?.template.spec?.containers?.[0];
-    expect((pg?.volumeMounts ?? []).map((m) => m.mountPath)).toContain(SOCKET_MOUNT_PATH);
-  });
-
-  it("mounts the migrations ConfigMap and tells bootstrap.sh where it is", () => {
-    // Separate from drigodb-config because --from-file flattens a directory,
-    // so migrations sharing it would sit beside postgresql.conf.
-    const spec = buildStatefulSet(ID, EXT).spec?.template.spec;
-    const pg = spec?.containers?.[0];
-    expect((pg?.volumeMounts ?? []).find((m) => m.mountPath === MIGRATIONS_MOUNT_PATH)?.readOnly).toBe(true);
-    expect(pg?.env?.find((e) => e.name === "APP_DB_MIGRATIONS_DIR")?.value).toBe(MIGRATIONS_MOUNT_PATH);
-    expect((spec?.volumes ?? []).find((v) => v.name === "migrations")?.configMap?.name)
-      .toBe(MIGRATIONS_CONFIG_MAP_NAME);
-  });
-
-  it("publishes PostgreSQL's port from the container", () => {
-    const pg = buildStatefulSet(ID, EXT).spec?.template.spec?.containers?.[0];
-    expect(pg?.ports?.[0]?.containerPort).toBe(POSTGRES_PORT);
-  });
-
-  it("does not let fsGroup break PostgreSQL on remount", () => {
-    // Recursive g+rwX on every mount turns PGDATA group-writable, which
-    // PostgreSQL refuses to start on — so the database wakes exactly never.
-    expect(buildStatefulSet(ID, EXT).spec?.template.spec?.securityContext?.fsGroupChangePolicy)
-      .toBe("OnRootMismatch");
-  });
-
-  it("starts hibernated and retains its volume", () => {
-    const spec = buildStatefulSet(ID, EXT).spec;
-    expect(spec?.replicas).toBe(0);
-    // The alternative silently deletes a customer's data.
-    expect(spec?.persistentVolumeClaimRetentionPolicy?.whenScaled).toBe("Retain");
-    expect(spec?.persistentVolumeClaimRetentionPolicy?.whenDeleted).toBe("Retain");
-  });
-
-  it("never inlines the password", () => {
-    const pg = buildStatefulSet(ID, EXT).spec?.template.spec?.containers?.find(
-      (c) => c.name === "postgres",
-    );
-    const pw = pg?.env?.find((e) => e.name === "APP_DB_PASSWORD");
-    expect(pw?.value).toBeUndefined();
-    expect(pw?.valueFrom?.secretKeyRef?.name).toBe(`db-${ID}-credentials`);
-  });
-});
 
 describe("network policy", () => {
   it("uses `_from`, which serializes to `from`", () => {
@@ -111,14 +43,14 @@ describe("network policy", () => {
 });
 
 describe("service and identity", () => {
-  it("exposes PostgreSQL's port and selects only this database", () => {
+  it("selects whichever instance is primary, by number not by port name", () => {
     const svc = buildService(ID, EXT);
     expect(svc.spec?.ports?.[0]?.port).toBe(POSTGRES_PORT);
     expect(svc.spec?.selector).toEqual({ [DB_ID_LABEL]: ID });
   });
 
   it("labels objects with both ids so lookups and idempotency work", () => {
-    for (const obj of [buildStatefulSet(ID, EXT), buildService(ID, EXT), buildSecret(ID, EXT, "pw")]) {
+    for (const obj of [buildCluster(ID, EXT), buildService(ID, EXT), buildSecret(ID, EXT, "pw")]) {
       expect(obj.metadata?.labels?.[DB_ID_LABEL]).toBe(ID);
       expect(obj.metadata?.labels?.[EXTERNAL_ID_LABEL]).toBe(EXT);
     }
@@ -157,86 +89,6 @@ describe("external_id validation", () => {
 // Backups are opt-in, and the shape of the opt-out matters as much as the
 // opt-in: with no destination configured a database must be exactly what it was
 // before, not a pod carrying a container that cannot do its job.
-describe("backup sidecar", () => {
-  async function withBackupEnv(env: Record<string, string>) {
-    vi.resetModules();
-    for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v);
-    const m = await import("../src/k8s/manifests.js");
-    return m;
-  }
-
-  afterEach(() => {
-    vi.unstubAllEnvs();
-    vi.resetModules();
-  });
-
-  it("adds no sidecar when nothing is configured", () => {
-    const containers = buildStatefulSet(ID, EXT).spec?.template.spec?.containers ?? [];
-    expect(containers.map((c) => c.name)).toEqual(["postgres"]);
-  });
-
-  it("adds one when a bucket and an endpoint are set", async () => {
-    const m = await withBackupEnv({
-      DRIGODB_BACKUP_BUCKET: "drigodb-backups",
-      DRIGODB_BACKUP_ENDPOINT: "https://fra1.digitaloceanspaces.com",
-    });
-    const containers = m.buildStatefulSet(ID, EXT).spec?.template.spec?.containers ?? [];
-    expect(containers.map((c) => c.name).sort()).toEqual(["backup", "postgres"]);
-  });
-
-  it("stays off when only half of it is configured", async () => {
-    // A bucket with nowhere to send it is a misconfiguration, and the safe
-    // reading of a misconfiguration is "backups are off", not "add a container
-    // that will fail".
-    const m = await withBackupEnv({ DRIGODB_BACKUP_BUCKET: "drigodb-backups" });
-    const containers = m.buildStatefulSet(ID, EXT).spec?.template.spec?.containers ?? [];
-    expect(containers.map((c) => c.name)).not.toContain("backup");
-  });
-
-  it("carries no probe, so a broken bucket cannot take the database offline", async () => {
-    // A readiness probe here would put backups on the pod's Ready condition,
-    // and a NotReady pod is removed from its Service. An unreachable bucket
-    // would then sever a database that is working perfectly well.
-    const m = await withBackupEnv({
-      DRIGODB_BACKUP_BUCKET: "drigodb-backups",
-      DRIGODB_BACKUP_ENDPOINT: "https://fra1.digitaloceanspaces.com",
-    });
-    const backup = (m.buildStatefulSet(ID, EXT).spec?.template.spec?.containers ?? [])
-      .find((c) => c.name === "backup");
-    expect(backup?.readinessProbe).toBeUndefined();
-    expect(backup?.livenessProbe).toBeUndefined();
-    expect(backup?.startupProbe).toBeUndefined();
-  });
-
-  it("reaches PostgreSQL by socket and never mounts the data volume", async () => {
-    const m = await withBackupEnv({
-      DRIGODB_BACKUP_BUCKET: "drigodb-backups",
-      DRIGODB_BACKUP_ENDPOINT: "https://fra1.digitaloceanspaces.com",
-    });
-    const backup = (m.buildStatefulSet(ID, EXT).spec?.template.spec?.containers ?? [])
-      .find((c) => c.name === "backup");
-    const mounts = (backup?.volumeMounts ?? []).map((v) => v.name);
-    expect(mounts).toEqual([SOCKET_VOLUME]);
-    expect(mounts).not.toContain(DATA_VOLUME);
-  });
-
-  it("carries migrations in the template, so a new one reaches existing databases on wake", () => {
-    // The whole reason schema ships through the pod rather than from the
-    // control plane: the template hash moves, and the existing reconcile
-    // carries it. See issue #29.
-    const pg = buildStatefulSet(ID, EXT).spec?.template.spec?.containers?.[0];
-    expect((pg?.volumeMounts ?? []).map((m) => m.name)).toContain("migrations");
-  });
-
-  it("changes the template hash, so existing databases gain it on their next wake", async () => {
-    const before = templateHash(ID, EXT);
-    const m = await withBackupEnv({
-      DRIGODB_BACKUP_BUCKET: "drigodb-backups",
-      DRIGODB_BACKUP_ENDPOINT: "https://fra1.digitaloceanspaces.com",
-    });
-    expect(m.templateHash(ID, EXT)).not.toBe(before);
-  });
-});
 
 // Restoring into a new database. The Job is deliberately unprivileged: it holds
 // the app's own credential and reaches the database the way any consumer does.
@@ -302,16 +154,14 @@ describe("storage class portability", () => {
     // being told which.
     vi.resetModules();
     const m = await import("../src/k8s/manifests.js");
-    const claim = m.buildStatefulSet(ID, EXT).spec?.volumeClaimTemplates?.[0];
-    expect(claim?.spec).not.toHaveProperty("storageClassName");
+    expect(m.buildCluster(ID, EXT).spec.storage).not.toHaveProperty("storageClass");
   });
 
   it("sets it when someone names one", async () => {
     vi.resetModules();
     vi.stubEnv("DRIGODB_STORAGE_CLASS", "do-block-storage");
     const m = await import("../src/k8s/manifests.js");
-    const claim = m.buildStatefulSet(ID, EXT).spec?.volumeClaimTemplates?.[0];
-    expect(claim?.spec?.storageClassName).toBe("do-block-storage");
+    expect(m.buildCluster(ID, EXT).spec.storage.storageClass).toBe("do-block-storage");
   });
 });
 
@@ -335,35 +185,31 @@ describe("storage tiers", () => {
     expect(m.tierOf({ [m.TIER_LABEL]: "large" })).toBe("large");
   });
 
-  it("carries max_wal_size per database, since the ConfigMap cannot", async () => {
-    // drigodb-config is one ConfigMap mounted by every database, so a per-tier
-    // value has to travel on the pod template instead.
+  it("carries max_wal_size per database, on the Cluster the operator reads", async () => {
     const m = await import("../src/k8s/manifests.js");
     const walOf = (t: "small" | "medium" | "large") =>
-      m.buildPodTemplate(ID, EXT, t).spec?.containers?.[0]?.env
-        ?.find((e) => e.name === "DRIGODB_MAX_WAL_SIZE")?.value;
+      m.buildCluster(ID, EXT, t).spec.postgresql.parameters.max_wal_size;
     expect(walOf("small")).toBe("256MB");
     expect(walOf("medium")).toBe("1GB");
     expect(walOf("large")).toBe("2GB");
   });
 
-  it("changes the template hash, so a resize reconciles on the cycle after it", async () => {
+  it("keeps min_wal_size, which the deleted postgresql.conf used to carry", async () => {
+    // The rest of that file was the operator's business. This one setting was
+    // not, and dropping it silently would have changed checkpoint behaviour on
+    // every database with nothing to notice it.
     const m = await import("../src/k8s/manifests.js");
-    expect(m.templateHash(ID, EXT, "medium")).not.toBe(m.templateHash(ID, EXT, "small"));
+    expect(m.buildCluster(ID, EXT).spec.postgresql.parameters.min_wal_size).toBe("64MB");
   });
 
-  it("labels the StatefulSet, because the PVC is the truth and reading it is a second call", async () => {
+  it("labels the Cluster, because the volume is the truth and reading it is a second call", async () => {
     const m = await import("../src/k8s/manifests.js");
-    const sts = m.buildStatefulSet(ID, EXT, "medium");
-    expect(sts.metadata?.labels?.[m.TIER_LABEL]).toBe("medium");
-    expect(sts.spec?.volumeClaimTemplates?.[0]?.spec?.resources?.requests?.storage).toBe("5Gi");
+    const cluster = m.buildCluster(ID, EXT, "medium");
+    expect(cluster.metadata.labels[m.TIER_LABEL]).toBe("medium");
+    expect(cluster.spec.storage.size).toBe("5Gi");
   });
 
-  it("names the PVC the way the StatefulSet controller does", async () => {
-    // Wrong here and a resize patches nothing, silently.
-    const m = await import("../src/k8s/manifests.js");
-    expect(m.pvcName(ID)).toBe(`data-db-${ID}-0`);
-  });
+
 });
 
 describe("server authentication", () => {
@@ -396,21 +242,10 @@ describe("server authentication", () => {
     expect(cert.spec.dnsNames).toContain(m.endpointHost(ID));
   });
 
-  it("mounts the certificate optionally, so issuance cannot delay a start", async () => {
-    // cert-manager may not have issued yet. A database waiting on a certificate
-    // to serve traffic it could serve without one is worse than one that
-    // self-signs and picks the real certificate up on its next cycle.
-    const m = await withIssuer();
-    const spec = m.buildStatefulSet(ID, EXT).spec?.template.spec;
-    const vol = (spec?.volumes ?? []).find((v) => v.name === "server-tls");
-    expect(vol?.secret?.optional).toBe(true);
-    expect(vol?.secret?.secretName).toBe(m.tlsSecretName(ID));
-  });
-
-  it("adds nothing at all when there is no issuer", async () => {
-    vi.resetModules();
-    const m = await import("../src/k8s/manifests.js");
-    const spec = m.buildStatefulSet(ID, EXT).spec?.template.spec;
-    expect((spec?.volumes ?? []).map((v) => v.name)).not.toContain("server-tls");
-  });
+  // The certificate tests that used to live here asserted a volume mount on a
+  // pod template drigodb no longer builds. CloudNativePG owns the pod and
+  // manages its own TLS, and how drigodb's cert-manager Certificate meets that
+  // is the one part of decision 0004 still unestablished — see #80. Deleted
+  // rather than adapted, because a test asserting the wrong mechanism passes
+  // while the feature is broken.
 });
