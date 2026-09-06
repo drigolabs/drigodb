@@ -10,7 +10,38 @@ image:
   pullPolicy: IfNotPresent
 
 api:
+  # One, and the concurrency work in this repository is not what pays for that.
+  #
+  # Idempotent create is safe at ANY replica count — the StatefulSet's name is
+  # the lock — but it had to be, because the race was never really about
+  # replicas. Two simultaneous creates for one external_id produced two
+  # databases on a SINGLE replica: the handler awaits a read before it writes,
+  # and both requests get through that gap. Measured on kind, two StatefulSets,
+  # two volumes, one application's data split in half.
+  #
+  # So this is a capacity setting rather than a correctness one, and at one
+  # consumer there is no capacity problem to solve. A second replica is 45 MiB
+  # measured — against decision 0001's 1500 MiB node that fits two databases,
+  # that is a meaningful fraction of a database for availability nobody is
+  # asking for yet.
+  #
+  # The blast radius of losing the control plane is small, and worth stating
+  # because it is the main argument for this architecture: existing databases
+  # are unaffected. Consumers connect to their own database directly, not
+  # through here, so an outage stops provisioning, waking and hibernating — not
+  # serving. A rollout costs a few seconds of that.
+  #
+  # Raise it to 2 when waking moves onto the serving path. Automatic
+  # hibernation (#85) is what does that: once a cold application's first request
+  # depends on a wake, an API outage stops traffic rather than administration,
+  # and the PodDisruptionBudget below turns itself on.
   replicas: 1
+  # Keeps a voluntary disruption — a drain, an upgrade — from taking both at
+  # once. Set to 0 alongside replicas: 1, or a single-replica install can never
+  # be drained at all.
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
   # The bearer token every API call carries. One of these is required — the
   # chart will not invent a credential, because a template that generates one
   # renders differently every time and silently rotates it under any renderer

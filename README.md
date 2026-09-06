@@ -69,6 +69,7 @@ it — on top of [#62](https://github.com/drigolabs/drigodb/issues/62).
 
 ```
 POST   /v1/databases            { external_id, restore_from? }  → 202 + connection_uri
+                                                             → 200 if it already existed (no uri)
 GET    /v1/databases            list
 GET    /v1/databases/{id}       status and endpoint
 POST   /v1/databases/{id}/wake       → 202
@@ -95,6 +96,12 @@ which. `GET /healthz` stays liveness only.
 
 **New here? [docs/getting-started.md](docs/getting-started.md)** — kind on a
 laptop, a cluster you already have, or DigitalOcean from nothing, step by step.
+
+Creating is idempotent on `external_id`, including when two callers do it at the same moment: the id
+is derived from the `external_id`, so the StatefulSet's own name is the lock and Kubernetes decides
+the winner. Only the caller that created it gets the `connection_uri`. The one case that is refused
+rather than served is a `409` on a create arriving while a database of the same `external_id` is
+still being deleted — its volume has not gone yet, and a retry a few seconds later is clean.
 
 **Building an application against drigodb?** [docs/consuming-drigodb.md](docs/consuming-drigodb.md)
 documents the pod-side contract — the half that is not HTTP. It leads with the

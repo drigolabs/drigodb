@@ -129,6 +129,50 @@ done
 [ "$STATUS" = "ready" ] || { fail "never became ready (last: ${STATUS})"; exit 1; }
 ok "ready in $(( $(date +%s) - t0 ))s"
 
+step "Two callers at once get one database"
+# Not a replica test — a create test. The handler awaits a read before it
+# writes, so two requests pass through that gap on a SINGLE replica and both
+# create. Measured on main before the fix: two ids, two StatefulSets, two
+# volumes, one application split in half, and the caller keeping only one of the
+# two URIs it was handed.
+#
+# Runs at whatever replica count this installation uses, because the race does
+# not need two of anything.
+RACE_ID="${EXTERNAL_ID}-race"
+race_codes=""
+race_pids=()
+for i in 1 2 3 4; do
+  ( api -o "/tmp/drigodb-race-$$-$i.json" -w "%{http_code}" \
+      -XPOST "localhost:${API_PORT}/v1/databases" -d "{\"external_id\":\"${RACE_ID}\"}" \
+      > "/tmp/drigodb-race-$$-$i.code" 2>/dev/null ) &
+  race_pids+=($!)
+done
+for p in "${race_pids[@]}"; do wait "$p" || true; done
+for i in 1 2 3 4; do race_codes="${race_codes}$(cat "/tmp/drigodb-race-$$-$i.code" 2>/dev/null) "; done
+
+RACE_COUNT="$(k get sts -n drigodb-databases -l "drigodb.io/external-id=${RACE_ID}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+CREATED="$(printf '%s' "$race_codes" | tr ' ' '\n' | grep -c '^202$' || true)"
+
+if [ "$RACE_COUNT" = "1" ]; then
+  ok "4 simultaneous creates, 1 database (codes: ${race_codes})"
+else
+  fail "4 simultaneous creates made ${RACE_COUNT} databases — one caller's data is split"
+  k get sts -n drigodb-databases -l "drigodb.io/external-id=${RACE_ID}"
+  exit 1
+fi
+# Exactly one caller owns the password. The others must not be handed a URI they
+# would then believe in.
+if [ "$CREATED" = "1" ]; then
+  ok "exactly one 202, so exactly one connection_uri was issued"
+else
+  fail "expected one 202, got ${CREATED} (codes: ${race_codes})"
+  exit 1
+fi
+RACE_DB="$(k get sts -n drigodb-databases -l "drigodb.io/external-id=${RACE_ID}" \
+  -o jsonpath='{.items[0].metadata.labels.drigodb\.io/database-id}' 2>/dev/null)"
+[ -n "$RACE_DB" ] && api -XDELETE "localhost:${API_PORT}/v1/databases/${RACE_DB}" >/dev/null 2>&1
+rm -f "/tmp/drigodb-race-$$-"*
+
 step "Connecting a PostgreSQL client to what it gave us"
 OUT="$(psql_in_cluster "$URI" "
   CREATE TABLE IF NOT EXISTS smoke (id text PRIMARY KEY, proof text NOT NULL);

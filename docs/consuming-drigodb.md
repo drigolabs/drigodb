@@ -100,6 +100,17 @@ and retry the create — which is idempotent, returns the *existing* database, a
 request, a restarted process, a reconcile loop — returns the existing database
 rather than creating a second one and splitting your data across two instances.
 
+That holds for calls made *at the same time*, not only one after another: two
+pods, two reconcile loops or a client fanning out its retries all converge on one
+database. The status code says which of them made it — `202` created it and
+carries the `connection_uri`, `200` found it already there and does not. So a
+caller that gets a `200` on what it thought was its first create has lost the
+race, not the database, and it needs `POST /credentials` to get in.
+
+One create is refused rather than served: a `409` while a database of the same
+`external_id` is still being deleted. Deleting a database removes its volume,
+and that removal is not instant. Retry after a few seconds.
+
 ## 3. Label your pod, or you will be denied silently
 
 ```yaml

@@ -51,6 +51,20 @@ export const TEMPLATE_HASH_ANNOTATION = "drigodb.io/template-hash";
 // having to know that.
 export const TIER_LABEL = "drigodb.io/tier";
 
+// Whether a database is at zero replicas on purpose.
+//
+// Zero replicas alone cannot answer that. It is also what a create looks like
+// in the window between the StatefulSet — which is the lock, so it is written
+// first — and the wake that follows it, and with two API replicas that window
+// is not rare: it is precisely where a concurrent caller lands. Before this
+// label, those callers were told a database being built was hibernated.
+//
+// Written with the scale rather than derived from it, so it records the intent
+// that caused the number rather than the number itself. Absent on databases
+// created before it existed, which is why the replica count is still the
+// fallback.
+export const HIBERNATED_LABEL = "drigodb.io/hibernated";
+
 // A tier is a floor, not a quota. Nothing stops a database filling its volume.
 //
 // max_wal_size scales with the tier for performance rather than correctness: it
@@ -521,13 +535,17 @@ function canonical(value: unknown): string {
 
 export function buildStatefulSet(id: string, externalId: string, tier: Tier = "small"): V1StatefulSet {
   const labels = { ...labelsFor(id, externalId), [TIER_LABEL]: tier };
+  // On the StatefulSet only, never in labelsFor: a pod carrying a copy of
+  // this would be stating something about its own StatefulSet that stopped
+  // being true the moment it was scaled.
+  const stsLabels = { ...labels, [HIBERNATED_LABEL]: "false" };
   return {
     apiVersion: "apps/v1",
     kind: "StatefulSet",
     metadata: {
       name: statefulSetName(id),
       namespace: config.databaseNamespace,
-      labels,
+      labels: stsLabels,
       // Stamped at birth so a database created by this build is already
       // current, and its first wake reconciles nothing.
       annotations: { [TEMPLATE_HASH_ANNOTATION]: templateHash(id, externalId, tier) },

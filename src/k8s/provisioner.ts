@@ -5,7 +5,7 @@
 // it as a label. That keeps v0.0.1 to one moving part, and makes idempotency a
 // label lookup rather than a transaction.
 
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   AppsV1Api,
   BatchV1Api,
@@ -30,6 +30,7 @@ import {
   TIER_ORDER,
   DB_ID_LABEL,
   EXTERNAL_ID_LABEL,
+  HIBERNATED_LABEL,
   MANAGED_BY_LABEL,
   MANAGED_BY_VALUE,
   POSTGRES_PORT,
@@ -88,6 +89,14 @@ export class BackupsDisabledError extends Error {}
 // something drigodb can work around.
 export class ResizeRefusedError extends Error {}
 
+// A create landed on an id whose previous database is still being deleted.
+//
+// Only reachable because ids are derived from external_id: delete-then-recreate
+// now lands on the same StatefulSet name and the same volume name, where random
+// ids gave it a fresh one every time. Retryable, and a caller that waits a few
+// seconds gets a clean database.
+export class DeletionInFlightError extends Error {}
+
 // Object keys are written by this service, so anything that is not one of ours
 // is a caller mistake or an attempt to read another prefix. Both are 400s.
 const RESTORE_KEY_RE = /^\d{8}T\d{6}Z\.sql\.gz$/;
@@ -136,8 +145,26 @@ export function validateExternalId(value: unknown): string {
   return value;
 }
 
-function newId(): string {
-  return randomBytes(6).toString("hex");
+// Derived from external_id rather than random, and that is what makes create
+// safe on more than one replica.
+//
+// Idempotency was a read-then-create with no lock: two replicas handling the
+// same external_id both find nothing and both create, which is precisely the
+// failure idempotency exists to prevent. There is no lock to take — so the
+// StatefulSet's NAME becomes one, because Kubernetes will not create two objects
+// with the same name and tells the loser so.
+//
+// Twelve hex characters, the same shape the random id had, so nothing that
+// consumes an id can tell the difference.
+//
+// THE TRADE: an id is now derivable by anyone who knows the external_id, where
+// before it was unguessable. That weakens the NetworkPolicy layer against
+// someone who knows both — they could label a pod and reach the Service. It does
+// not get them in: the password is the real gate, and the README already records
+// the network layer as the one trusted least. #72, which makes a database belong
+// to the token that created it, is the control that actually replaces this.
+function idFor(externalId: string): string {
+  return createHash("sha256").update(externalId).digest("hex").slice(0, 12);
 }
 
 function newPassword(): string {
@@ -204,8 +231,23 @@ export class Provisioner {
     }
   }
 
-  private async statusOf(id: string, desiredReplicas: number, ready: number): Promise<DatabaseStatus> {
-    if (desiredReplicas === 0) return "hibernated";
+  private async statusOf(
+    id: string,
+    labels: Record<string, string>,
+    desiredReplicas: number,
+    ready: number,
+  ): Promise<DatabaseStatus> {
+    // Hibernation is an intent, so it is read from the label that records the
+    // intent rather than inferred from the replica count it produced. A create
+    // is also at zero replicas while it runs, and telling the concurrent caller
+    // its database was hibernated was wrong in the one case the second API
+    // replica exists to serve.
+    const hibernated = labels[HIBERNATED_LABEL];
+    if (hibernated === "true") return "hibernated";
+    // Databases created before the label carry no intent to read, and the
+    // replica count is what they were always judged by. They gain the label the
+    // first time they are scaled.
+    if (hibernated === undefined && desiredReplicas === 0) return "hibernated";
 
     // Before the ready check, not after: a restoring database has a ready pod
     // and is not usable, which is the whole reason this status exists.
@@ -239,7 +281,12 @@ export class Provisioner {
   private async toDatabase(sts: { metadata?: { labels?: Record<string, string>; creationTimestamp?: Date }; spec?: { replicas?: number }; status?: { readyReplicas?: number } }): Promise<Database> {
     const labels = sts.metadata?.labels ?? {};
     const id = labels[DB_ID_LABEL] ?? "";
-    const status = await this.statusOf(id, sts.spec?.replicas ?? 0, sts.status?.readyReplicas ?? 0);
+    const status = await this.statusOf(
+      id,
+      labels,
+      sts.spec?.replicas ?? 0,
+      sts.status?.readyReplicas ?? 0,
+    );
     return {
       id,
       external_id: labels[EXTERNAL_ID_LABEL] ?? "",
@@ -295,24 +342,67 @@ export class Provisioner {
     externalId: string,
     restoreFrom?: { databaseId: string; key: string },
   ): Promise<{ database: Database; uri: string; created: boolean }> {
-    const existing = await this.findByExternalId(externalId);
-    if (existing) {
-      // Idempotent: a retry must not create a second database and split the
-      // caller's data across two instances.
-      return { database: existing, uri: "", created: false };
-    }
-
-    const id = newId();
+    const id = idFor(externalId);
     const password = newPassword();
     const ns = config.databaseNamespace;
 
-    await this.core.createNamespacedSecret({ namespace: ns, body: buildSecret(id, externalId, password) });
-    await this.core.createNamespacedService({ namespace: ns, body: buildService(id, externalId) });
-    await this.net.createNamespacedNetworkPolicy({ namespace: ns, body: buildNetworkPolicy(id, externalId) });
-    await this.apps.createNamespacedStatefulSet({
+    // A volume outliving its database is the one way a derived id can hand a
+    // caller someone else's data. DELETE removes the PVC, but removal is not
+    // instant — it waits for the pod — so for a few seconds after a delete the
+    // volume is still there under a name the next create would reuse. PostgreSQL
+    // would find an initialised PGDATA, skip initdb, and come up holding the
+    // deleted database's rows behind a password that no longer matches the URI
+    // just issued. Refusing is the whole fix: a retry moments later is clean.
+    //
+    // Only when the StatefulSet is gone. A PVC beside a live StatefulSet is an
+    // ordinary database being created again, which is the idempotent path below.
+    const leftover = await this.core.listNamespacedPersistentVolumeClaim({
       namespace: ns,
-      body: buildStatefulSet(id, externalId, defaultTier()),
+      labelSelector: `${DB_ID_LABEL}=${id}`,
     });
+    if ((leftover.items ?? []).length > 0 && !(await this.statefulSetFor(id))) {
+      throw new DeletionInFlightError(
+        `a database for external_id ${externalId} is still being deleted; retry in a moment`,
+      );
+    }
+
+    // The StatefulSet FIRST, and it is the lock rather than merely the first
+    // step. Whichever replica creates it wins; the other is told AlreadyExists
+    // and returns the database that now exists, which is the same answer a plain
+    // retry gets. Its pod template references a Secret that does not exist yet,
+    // which is fine because it starts at zero replicas — nothing resolves a
+    // secretKeyRef until the wake below.
+    try {
+      await this.apps.createNamespacedStatefulSet({
+        namespace: ns,
+        body: buildStatefulSet(id, externalId, defaultTier()),
+      });
+    } catch (err) {
+      if (!isAlreadyExists(err)) throw err;
+      const owner = (await this.statefulSetFor(id))?.metadata?.labels?.[EXTERNAL_ID_LABEL];
+      // Twelve hex characters is 48 bits, so a collision needs millions of
+      // external_ids — but handing one caller another's database, credentials
+      // and all, is not a failure to discover in production.
+      if (owner !== undefined && owner !== externalId) {
+        throw new ValidationError(
+          `external_id ${externalId} collides with an existing database; choose another`,
+        );
+      }
+      return { database: await this.get(id), uri: "", created: false };
+    }
+
+    // Tolerating AlreadyExists on each: a create that failed partway leaves some
+    // of these behind, and a retry has to be able to finish the job rather than
+    // stall on the first object it already made.
+    await this.ensure(() =>
+      this.core.createNamespacedSecret({ namespace: ns, body: buildSecret(id, externalId, password) }),
+    );
+    await this.ensure(() =>
+      this.core.createNamespacedService({ namespace: ns, body: buildService(id, externalId) }),
+    );
+    await this.ensure(() =>
+      this.net.createNamespacedNetworkPolicy({ namespace: ns, body: buildNetworkPolicy(id, externalId) }),
+    );
 
     // Created hibernated, then woken: provisioning and waking are the same code
     // path, so the wake path is exercised on every single create — including
@@ -500,6 +590,25 @@ export class Provisioner {
     const namespace = config.databaseNamespace;
     let lastErr: unknown;
 
+    // Before the scale, in both directions, because a label that lags the
+    // replica count is a status that lies. Going down it briefly reports
+    // hibernated for a pod still running, which is where it is heading; going
+    // up it reports provisioning for a pod not yet started, which is what it
+    // is. The reverse order would report a live database as hibernated after a
+    // failure, and leave it that way.
+    //
+    // Only when it disagrees. Waking is called speculatively against databases
+    // that are already awake, and writing a label its value already has would
+    // make every one of those a write.
+    const want = replicas === 0 ? "true" : "false";
+    const live = await this.statefulSetFor(id);
+    if (live && live.metadata?.labels?.[HIBERNATED_LABEL] !== want) {
+      await this.apps.patchNamespacedStatefulSet(
+        { name, namespace, body: { metadata: { labels: { [HIBERNATED_LABEL]: want } } } },
+        setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+      );
+    }
+
     for (let attempt = 0; attempt < 5; attempt++) {
       try {
         const scale = await this.apps.readNamespacedStatefulSetScale({ name, namespace });
@@ -626,6 +735,20 @@ export class Provisioner {
     }
 
     return await this.get(id);
+  }
+
+  // Create, and treat "it is already there" as success.
+  //
+  // A create that failed partway leaves some of its objects behind, and the
+  // retry has to be able to finish the job rather than stall on the first one it
+  // already made. That is also the loser's path in a race: it never reaches
+  // here, but a caller retrying after a partial failure does.
+  private async ensure(fn: () => Promise<unknown>): Promise<void> {
+    try {
+      await fn();
+    } catch (err) {
+      if (!isAlreadyExists(err)) throw err;
+    }
   }
 
   // Ask cert-manager for a certificate naming this database's Service DNS.

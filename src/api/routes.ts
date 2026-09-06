@@ -7,6 +7,7 @@ import {
   NotFoundError,
   ResizeRefusedError,
   Provisioner,
+  DeletionInFlightError,
   ValidationError,
   validateExternalId,
   validateRestoreFrom,
@@ -118,6 +119,9 @@ export function buildRoutes(provisioner: Provisioner): Hono {
     // 409, not 500: the volume could not grow, the caller can read why, and an
     // operator can fix it by choosing a StorageClass that allows expansion.
     if (err instanceof ResizeRefusedError) return c.json({ error: err.message }, 409);
+    // 409, not 500: the id is briefly taken by a database on its way out. The
+    // caller has done nothing wrong and a retry in a few seconds succeeds.
+    if (err instanceof DeletionInFlightError) return c.json({ error: err.message }, 409);
     console.error("[drigodb] unhandled error:", err);
     return c.json({ error: "internal error" }, 500);
   });

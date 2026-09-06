@@ -1,0 +1,23 @@
+{{/*
+Stops a voluntary disruption taking every replica at once.
+
+Deliberately guarded on replicas: a PodDisruptionBudget requiring one available
+pod out of one makes the node undrainable — the eviction can never satisfy it,
+so `kubectl drain` blocks forever on a single-replica install. That is a worse
+failure than the one it protects against, and it is silent until someone is
+draining a node under time pressure.
+*/}}
+{{- if and .Values.api.podDisruptionBudget.enabled (gt (int .Values.api.replicas) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "drigodb.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "drigodb.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.api.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "drigodb.selectorLabels" . | nindent 6 }}
+{{- end }}
