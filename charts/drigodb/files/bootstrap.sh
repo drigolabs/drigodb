@@ -47,9 +47,15 @@ write_tier_conf() {
 # Idempotent, and needed on the RESTART path as well as at init: every database
 # created before tiers existed has a PGDATA whose postgresql.conf includes the
 # mounted config and nothing else.
+#
+# include_if_exists, not include. A plain include of a missing file is a startup
+# FAILURE, and the file is only written when DRIGODB_MAX_WAL_SIZE is set — so a
+# database started without it, as the migration test does, would refuse to boot
+# on an include pointing at nothing. The tolerant form means the worst case is a
+# database running the shared default rather than one that will not start.
 ensure_tier_include() {
-  grep -qF "include = 'drigodb-tier.conf'" "${PGDATA}/postgresql.conf" 2>/dev/null && return 0
-  printf "\ninclude = 'drigodb-tier.conf'\n" >> "${PGDATA}/postgresql.conf"
+  grep -qF "include_if_exists = 'drigodb-tier.conf'" "${PGDATA}/postgresql.conf" 2>/dev/null && return 0
+  printf "\ninclude_if_exists = 'drigodb-tier.conf'\n" >> "${PGDATA}/postgresql.conf"
   log "added the per-database config include"
 }
 
