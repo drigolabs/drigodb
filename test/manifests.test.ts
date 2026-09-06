@@ -210,3 +210,49 @@ describe("server authentication", () => {
   // rather than adapted, because a test asserting the wrong mechanism passes
   // while the feature is broken.
 });
+
+describe("server certificates", () => {
+  afterEach(() => { vi.unstubAllEnvs(); vi.resetModules(); });
+
+  it("adds nothing when this installation issues no certificates", async () => {
+    vi.resetModules();
+    const m = await import("../src/k8s/manifests.js");
+    expect(m.buildCluster(ID, EXT).spec).not.toHaveProperty("certificates");
+  });
+
+  it("hands CloudNativePG drigodb's own CA and server certificate", async () => {
+    // Without this the operator signs its own, from a CA it generates PER
+    // CLUSTER, naming only its own -rw/-ro/-r Services. The connection URI names
+    // drigodb's Service, which is not among them, so verify-full fails hostname
+    // verification on every database — while sslmode=require goes on passing,
+    // which is how nobody would notice. Measured against CNPG 1.27.
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_TLS_ISSUER", "drigodb-ca");
+    const m = await import("../src/k8s/manifests.js");
+    const certs = m.buildCluster(ID, EXT).spec.certificates;
+    expect(certs?.serverTLSSecret).toBe(m.tlsSecretName(ID));
+    expect(certs?.serverCASecret).toBe("drigodb-api-ca");
+  });
+
+  it("never names the CA secret after the cluster", async () => {
+    // `<cluster>-ca` is where CloudNativePG keeps its own CLIENT CA. Taking the
+    // name leaves the operator looking for a private key nobody put there, and
+    // the cluster fails to reconcile with "missing ca.key secret data" — which
+    // reads like a refusal to accept an external CA and is not one.
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_TLS_ISSUER", "drigodb-ca");
+    const m = await import("../src/k8s/manifests.js");
+    const certs = m.buildCluster(ID, EXT).spec.certificates;
+    expect(certs?.serverCASecret).not.toBe(`db-${ID}-ca`);
+    expect(certs?.serverTLSSecret).not.toBe(`db-${ID}-server`);
+  });
+
+  it("names drigodb's Service in the certificate, which is what the URI points at", async () => {
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_TLS_ISSUER", "drigodb-ca");
+    const m = await import("../src/k8s/manifests.js");
+    const spec = (m.buildCertificate(ID, EXT) as { spec: { dnsNames: string[]; commonName: string } }).spec;
+    expect(spec.commonName).toBe(m.endpointHost(ID));
+    expect(spec.dnsNames).toContain(m.endpointHost(ID));
+  });
+});

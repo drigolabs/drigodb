@@ -307,6 +307,7 @@ export interface CnpgClusterSpec {
   inheritedMetadata: { labels: Record<string, string> };
   storage: { size: string; storageClass?: string };
   postgresql: { parameters: Record<string, string>; pg_hba: string[] };
+  certificates?: { serverCASecret: string; serverTLSSecret: string };
   resources: object;
   bootstrap: { initdb: { database: string; owner: string; secret: { name: string } } };
   managed: { roles: Array<{ name: string; login: boolean; passwordSecret: { name: string } }> };
@@ -361,6 +362,33 @@ export function buildCluster(
         // on the second.
         ...(config.storageClass ? { storageClass: config.storageClass } : {}),
       },
+
+      // The server identity a consumer verifies, when this installation issues
+      // one. Measured against CNPG 1.27, including the two negatives:
+      //
+      //   verify-full, drigodb's Service name, drigodb's CA   →  connects
+      //   the same URI with no CA supplied                    →  refused
+      //   CNPG's own -rw name against drigodb's CA            →  refused
+      //
+      // Without this, CloudNativePG signs its own certificate from a CA it
+      // generates PER CLUSTER, naming only its own -rw/-ro/-r Services. The
+      // connection URI names drigodb's Service, which is not among them — so
+      // verify-full would fail hostname verification on every database while
+      // sslmode=require went on passing, which is how nobody would notice.
+      //
+      // The CA secret must NOT be named `<cluster>-ca`: that is where
+      // CloudNativePG keeps its own CLIENT CA, and taking the name leaves it
+      // looking for a private key that was never put there. drigodb owns the
+      // server identity, the operator keeps its internal ones, and the fleet
+      // CA's private key never has to reach this namespace.
+      ...(serverAuthEnabled()
+        ? {
+            certificates: {
+              serverCASecret: config.tls.caSecret,
+              serverTLSSecret: tlsSecretName(id),
+            },
+          }
+        : {}),
 
       postgresql: {
         parameters: {

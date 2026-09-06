@@ -117,9 +117,6 @@ tls:
     duration: 2160h    # 90 days
     renewBefore: 360h  # 15 days
 
-# Off unless a bucket and an endpoint are set. With neither, no sidecar is added
-# at all — a database is exactly what it was before, rather than one carrying a
-# container that cannot do its job.
 # Backups are not available in this release.
 #
 # They were a sidecar in the database's pod template, and decision 0004 gave

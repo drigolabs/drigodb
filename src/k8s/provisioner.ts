@@ -379,6 +379,20 @@ export class Provisioner {
       this.core.createNamespacedSecret({ namespace: ns, body: buildSecret(id, externalId, password) }),
     );
 
+    // BEFORE the Cluster, not after, and that ordering is now load-bearing.
+    //
+    // The Cluster's spec names this Secret, so CloudNativePG waits for it —
+    // a database whose certificate has not issued stays provisioning, visibly,
+    // instead of coming up on a certificate that names the wrong host.
+    //
+    // That is a deliberate change. The old data plane self-signed as a fallback
+    // so a slow cert-manager cost a database its certificate and not its
+    // availability. There is no fallback to reach for now: the operator would
+    // sign its own, naming its own Services, and every consumer's verify-full
+    // would fail against a URI drigodb had already issued. Failing to start is
+    // louder than failing to verify.
+    if (serverAuthEnabled()) await this.ensureCertificate(id, externalId);
+
     // The Cluster is the lock, exactly as the StatefulSet was: whichever caller
     // creates it wins, and the other is told AlreadyExists and handed the
     // database that now exists — the same answer a plain retry gets.
