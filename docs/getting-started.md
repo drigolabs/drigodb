@@ -465,6 +465,40 @@ For an interactive session, add `-it` and drop the `-c` flags:
 kubectl -n drigodb-databases exec -it psql-client -- psql "$DB_URI"
 ```
 
+### From your own machine, with your own psql
+
+A client outside the cluster can reach a database through a port-forward. The
+URI is issued for the in-cluster hostname, so the host has to be rewritten and
+nothing else:
+
+```bash
+kubectl -n drigodb-databases port-forward svc/db-$DB_ID 15432:5432 &
+
+# the URI as issued, with only the host and port changed
+LOCAL_URI=$(echo "$DB_URI" | sed "s#@db-$DB_ID\.drigodb-databases\.svc\.cluster\.local:5432#@localhost:15432#")
+psql "$LOCAL_URI" -c "select 1"
+```
+
+Two things to know before relying on this.
+
+**It bypasses the NetworkPolicy completely.** A port-forward is not pod-to-pod
+traffic — it goes through the API server to the kubelet — so no label is
+involved and the isolation you tested in step 6 does not apply. Anyone who can
+port-forward in that namespace can reach any database, and the password is the
+only thing left in the way. That is fine for a human debugging with `kubectl`
+and it is not a connection path to build an application on.
+
+**It breaks if server authentication is on.** With cert-manager configured, the
+URI is issued with `sslmode=verify-full` and the certificate names the Service
+DNS name — which `localhost` is not, so verification fails. Map the real name to
+`127.0.0.1` in `/etc/hosts` and forward on `5432` if you need this, or connect
+from a pod as above.
+
+Also worth knowing why `scripts/smoke.sh` does **not** do this: rewriting the
+host means the string being tested is no longer the string the API handed out.
+It used to work this way, and the test could not have caught a bad hostname in
+an issued URI.
+
 ### 5. Check the connection is actually encrypted
 
 The URI says `sslmode=require`. Confirm the server agrees rather than trusting
