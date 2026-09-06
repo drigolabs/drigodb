@@ -49,6 +49,17 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get", "list", "delete"]
+  # A hosted database is a CloudNativePG Cluster (decision 0004), so these are
+  # the verbs that provision, hibernate, wake and delete one. The operator does
+  # the rest: it owns the pods, the volumes and the Services, and drigodb never
+  # names them.
+  #
+  # No `update`. Hibernation is an annotation and a resize is a storage size, so
+  # every change drigodb makes to a live Cluster is a patch — and the
+  # whole-object verb would let a bug replace a database's spec wholesale.
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["clusters"]
+    verbs: ["create", "get", "list", "watch", "patch", "delete"]
 {{- if .Values.tls.certManager.enabled }}
   # One Certificate per database, in this namespace, so each serves a certificate
   # for its own Service name and its Secret lands where the pod mounts it.

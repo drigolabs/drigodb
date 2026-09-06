@@ -27,6 +27,14 @@ k() { kubectl --context "$CTX" "$@"; }
 step "Target"
 ok "context ${CTX}"
 
+step "Prerequisites"
+# The operator drigodb provisions through. Decision 0004 makes a hosted database
+# a CloudNativePG Cluster, so this has to exist before the API can create one.
+#
+# Here rather than in the chart, and left alone if someone else installed it —
+# scripts/cnpg-install.sh says why at length.
+KUBE_CONTEXT="$CTX" bash "${ROOT}/scripts/cnpg-install.sh"
+
 step "API token"
 # The chart will not invent a credential — a template that generates one renders
 # differently every time, and silently rotates it under any renderer without a

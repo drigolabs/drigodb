@@ -4,6 +4,33 @@ PostgreSQL databases, provisioned through an API. Each one is a separate
 PostgreSQL instance with its own volume, credentials and network policy, and
 they hibernate when idle — zero compute, storage only.
 
+## Before you install: CloudNativePG
+
+drigodb **requires** the [CloudNativePG](https://cloudnative-pg.io) operator on
+the cluster. A hosted database is a CNPG `Cluster`
+([decision 0004](../../docs/decisions/0004-cloudnativepg-for-the-data-plane.md)),
+so without it every provision fails.
+
+```bash
+kubectl apply --server-side -f \
+  https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.27/releases/cnpg-1.27.0.yaml
+```
+
+`scripts/cnpg-install.sh` in this repository does the same thing, pinned and
+idempotently, and leaves an operator someone else installed alone.
+
+**This chart does not install it, deliberately.** CRDs are cluster-scoped: a
+cluster already running CloudNativePG would find drigodb trying to own its CRDs,
+and Helm installs a subchart's `crds/` once and never upgrades it. Installing an
+operator is a cluster decision, not an application one — so it raises the
+permission floor for installing drigodb, and that is stated here rather than
+discovered at `helm install`.
+
+The chart cannot check for you. `lookup` is banned by
+`scripts/chart-determinism-test.sh` and `.Capabilities.APIVersions` is the same
+mistake with a friendlier name, since it answers from the renderer rather than
+the cluster. `scripts/smoke.sh` checks instead.
+
 ```bash
 helm install drigodb oci://ghcr.io/drigolabs/charts/drigodb \
   --namespace drigodb-system --create-namespace

@@ -81,6 +81,32 @@ ok "context ${CTX}"
 TOKEN="$(k get secret drigodb-api-token -n drigodb-system -o jsonpath='{.data.token}' | base64 -d)"
 ok "API token read from the cluster"
 
+step "The operator drigodb provisions through"
+# Decision 0004 makes a hosted database a CloudNativePG Cluster. Two things have
+# to be true and both fail silently in different ways: a missing CRD makes every
+# provision fail at runtime with a message nobody reads until a consumer
+# complains, and a missing RBAC rule does the same one layer further in.
+#
+# `auth can-i --as` asks the API server the same question it will ask itself,
+# which is the only way to check a Role without exercising the thing it guards.
+if k get crd clusters.postgresql.cnpg.io >/dev/null 2>&1; then
+  ok "clusters.postgresql.cnpg.io present"
+  # Read from the Deployment rather than assumed. The chart's fullname is
+  # `drigodb-api`, not `drigodb`, and a hardcoded guess made this check report a
+  # missing permission that was actually present — a false alarm in a preflight
+  # is worse than no preflight, because the next person disables it.
+  SA="system:serviceaccount:drigodb-system:$(k -n drigodb-system get deploy drigodb-api -o jsonpath='{.spec.template.spec.serviceAccountName}')"
+  if [ "$(k auth can-i create clusters.postgresql.cnpg.io --as "$SA" -n drigodb-databases 2>/dev/null)" = "yes" ]; then
+    ok "the API may create a Cluster in drigodb-databases"
+  else
+    fail "the API service account cannot create Clusters — provisioning will fail"
+    exit 1
+  fi
+else
+  fail "clusters.postgresql.cnpg.io is missing; run scripts/cnpg-install.sh"
+  exit 1
+fi
+
 step "Reaching the API"
 start_pf svc/drigodb-api "$API_PORT" drigodb-system 80 /tmp/drigodb-smoke-api.log || exit 1
 api() { curl -fsS -H "Authorization: Bearer ${TOKEN}" -H 'content-type: application/json' "$@"; }
