@@ -27,6 +27,29 @@ k() { kubectl --context "$CTX" "$@"; }
 step "Target"
 ok "context ${CTX}"
 
+step "API token"
+# The chart will not invent a credential — a template that generates one renders
+# differently every time, and silently rotates it under any renderer without a
+# cluster. Querying the cluster is legitimate HERE, in an installer, which is
+# why the responsibility moved rather than disappeared.
+#
+# Created once and then left alone. Rotating it is a deliberate act, not
+# something a redeploy does to you: every consumer holds this token, and there is
+# no notification when it changes — calls simply start returning 401.
+#
+# Issue #62 replaces this with tokens drigodb issues itself.
+TOKEN_SECRET="${DRIGODB_TOKEN_SECRET:-drigodb-api-token}"
+if k get secret "$TOKEN_SECRET" -n drigodb-system >/dev/null 2>&1; then
+  note "token already exists; leaving it alone"
+else
+  k create namespace drigodb-system --dry-run=client -o yaml | k apply -f - >/dev/null
+  TOKEN="$(head -c 32 /dev/urandom | base64 | tr -d '=+/' | cut -c1-40)"
+  k create secret generic "$TOKEN_SECRET" -n drigodb-system --from-literal=token="$TOKEN" >/dev/null
+  ok "token generated"
+  note "read it with:"
+  note "  kubectl -n drigodb-system get secret ${TOKEN_SECRET} -o jsonpath='{.data.token}' | base64 -d"
+fi
+
 step "Control plane"
 # One `helm upgrade --install` replaces what used to be six kubectl invocations,
 # two of which built ConfigMaps by piping `create --dry-run` into `apply` and one
@@ -36,7 +59,7 @@ step "Control plane"
 # --install so this is the same command whether or not drigodb is already there.
 # --create-namespace because the release namespace is Helm's to make; the
 # database namespace is the chart's.
-HELM_ARGS=()
+HELM_ARGS=(--set "api.existingSecret=${TOKEN_SECRET}")
 if [ -n "${DRIGODB_API_IMAGE:-}" ]; then
   # Deploying something other than what the chart pins: a branch build, a
   # bisect, a local image on kind.

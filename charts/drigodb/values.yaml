@@ -11,9 +11,17 @@ image:
 
 api:
   replicas: 1
-  # The bearer token every API call carries. Left empty, one is generated on
-  # first install and PRESERVED across upgrades — see templates/secret-api-token.yaml
-  # for why that has to be deliberate rather than incidental.
+  # The bearer token every API call carries. One of these is required — the
+  # chart will not invent a credential, because a template that generates one
+  # renders differently every time and silently rotates it under any renderer
+  # without a cluster. See templates/secret-api-token.yaml.
+  #
+  # existingSecret is the right answer for anything real: the token belongs in
+  # SOPS, External Secrets or sealed-secrets, not in a values file that lives in
+  # git. It must hold a `token` key.
+  existingSecret: ""
+  # An explicit value, for kind and for trying it out. It ends up in Helm's
+  # release metadata, so it is not where a real credential belongs.
   token: ""
   resources:
     requests: { cpu: 50m, memory: 64Mi }

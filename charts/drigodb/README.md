@@ -35,10 +35,26 @@ place and can never be shrunk, and a StatefulSet's `volumeClaimTemplates` is
 immutable, so this is permanent for every database created under it. Too small
 is a patch; too large is forever.
 
-**`api.token`** — left empty, one is generated on install and **preserved across
-upgrades**. A chart that regenerated it would invalidate every consumer's
-credential on every upgrade, so the template reads what is already in the
-cluster. Rotate deliberately: delete the Secret and upgrade, or set this.
+**`api.existingSecret` or `api.token`** — one is required, and the chart will not
+invent a credential.
+
+It used to, using Helm's `lookup` to preserve the value across upgrades. That
+made the chart render differently depending on who rendered it: anything without
+a cluster — Argo CD, `helm diff`, `helm template` in CI, kustomize's Helm
+inflator — took the random fallback instead. Measured under Argo CD, that meant a
+new bearer token on every sync, reported as `Synced` and healthy, silently
+invalidating every consumer's credential.
+
+So the chart is a pure function of its values, asserted by
+`scripts/chart-determinism-test.sh` on every CI run.
+
+`api.existingSecret` is the right answer for anything real — the token belongs in
+SOPS, External Secrets or sealed-secrets rather than a values file that lives in
+git. It must hold a `token` key. `api.token` is an explicit value for kind and
+for trying it out; it ends up in Helm's release metadata.
+
+`scripts/deploy.sh` creates the Secret if it does not exist and leaves it alone
+if it does, which is where querying a cluster is legitimate.
 
 **`backup.bucket` / `backup.endpoint`** — off until both are set. With neither,
 no backup sidecar is added at all, so a half-configured backup cannot be the

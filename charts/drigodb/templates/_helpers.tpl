@@ -26,3 +26,15 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- define "drigodb.image" -}}
 {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
 {{- end -}}
+
+{{/*
+Where the API reads its bearer token from: a Secret the operator manages, or one
+the chart made from an explicit value. Never one the chart invented.
+*/}}
+{{- define "drigodb.tokenSecret" -}}
+{{- if .Values.api.existingSecret -}}
+{{- .Values.api.existingSecret -}}
+{{- else -}}
+{{- printf "%s-token" (include "drigodb.fullname" .) -}}
+{{- end -}}
+{{- end -}}
