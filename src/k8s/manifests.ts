@@ -20,7 +20,7 @@ import type {
   V1StatefulSet,
 } from "@kubernetes/client-node";
 
-import { backupsEnabled, config, serverAuthEnabled } from "../config.js";
+import { config, serverAuthEnabled } from "../config.js";
 
 export const DB_ID_LABEL = "drigodb.io/database-id";
 export const EXTERNAL_ID_LABEL = "drigodb.io/external-id";
@@ -113,7 +113,7 @@ export const CONFIG_MOUNT_PATH = "/drigodb-config";
 //
 // The GID is not 26. It was under our own image, and carrying that assumption
 // across would leave PGDATA group-owned by a group the server does not belong
-// to. The backup sidecar must run as the same UID, because peer auth over the
+// to. Kept because the UID and GID a database runs as are a property of the
 // shared socket resolves the caller's UID against the server's passwd database
 // and a mismatch fails every connection.
 //
@@ -124,9 +124,9 @@ export const CONFIG_MOUNT_PATH = "/drigodb-config";
 export const RUN_AS_USER = 26;
 export const RUN_AS_GROUP = 102;
 
-// Shared with the backup sidecar, which reaches the server over this socket and
+// A Unix socket directory on the pod. CloudNativePG mounts its own; this
 // authenticates by peer. It outlived the gateway it was introduced for: a
-// socket is still how a backup runs without a credential or a network path.
+// constant survives only because the NetworkPolicy tests name it.
 export const SOCKET_VOLUME = "socket";
 export const SOCKET_MOUNT_PATH = "/sockets";
 export const DATA_VOLUME = "data";
@@ -147,8 +147,6 @@ export function tlsSecretName(id: string): string {
 export const POSTGRES_PORT = 5432;
 export const POSTGRES_PORT_NAME = "postgres";
 
-export const BACKUP_KEY_SECRET_KEY = "access_key";
-export const BACKUP_SECRET_SECRET_KEY = "secret_key";
 
 export const DB_USER = "appuser";
 
@@ -176,12 +174,6 @@ const MIN_WAL_SIZE = "64MB";
 const PG_CPU_REQUEST = "100m";
 const PG_MEMORY_REQUEST = "192Mi";
 const PG_MEMORY_LIMIT = "1Gi";
-// Idle almost all the time; it streams a backup out on an interval and holds
-// nothing between them. Requests are what the scheduler reserves, so keeping
-// them small is what stops backups halving how many databases fit on a node.
-const BACKUP_CPU_REQUEST = "10m";
-const BACKUP_MEMORY_REQUEST = "32Mi";
-const BACKUP_MEMORY_LIMIT = "256Mi";
 
 
 export function serviceName(id: string): string {
@@ -193,9 +185,6 @@ export function secretName(id: string): string {
 }
 
 
-export function restoreJobName(id: string): string {
-  return `restore-${id}`;
-}
 
 // The Cluster carries the name a StatefulSet used to, so nothing that derives a
 // hostname, a Secret name or an id from it has to change — and idempotent create
@@ -253,90 +242,6 @@ export function buildSecret(id: string, externalId: string, password: string): V
 }
 
 
-// Loads a dump into a freshly provisioned database.
-//
-// A Job, and an ORDINARY CONSUMER of the database rather than a privileged path
-// into it. It connects over TCP to the Service with the app's own credentials,
-// carrying the same `drigodb.io/allow-database` label any consumer opts in
-// with, and holds nothing the isolation model does not already hand out. There
-// is no socket to share — a Job is its own pod — and that is the point: a
-// logical restore is a client executing SQL, so it should look like one.
-//
-// The alternative, running it inside the database pod, would mean the restore
-// path needed the pod template to carry a one-shot instruction that every later
-// wake would have to reason about. This leaves the template alone.
-//
-// ttlSecondsAfterFinished so a succeeded Job removes itself. A failed one stays
-// until the database is deleted, because its logs are the only account of why a
-// restore did not happen.
-export function buildRestoreJob(
-  id: string,
-  externalId: string,
-  source: string,
-): V1Job {
-  const labels = {
-    ...labelsFor(id, externalId),
-    // Opts this pod through the database's own NetworkPolicy — the same way a
-    // consumer does, rather than by widening the policy for restores.
-    [ALLOW_LABEL]: id,
-  };
-  return {
-    apiVersion: "batch/v1",
-    kind: "Job",
-    metadata: { name: restoreJobName(id), namespace: config.databaseNamespace, labels },
-    spec: {
-      backoffLimit: 3,
-      ttlSecondsAfterFinished: 3600,
-      template: {
-        metadata: { labels },
-        spec: {
-          restartPolicy: "OnFailure",
-          automountServiceAccountToken: false,
-          containers: [
-            {
-              name: "restore",
-              image: config.backup.image,
-              args: ["restore-remote"],
-              env: [
-                { name: "DRIGODB_DATABASE_ID", value: id },
-                { name: "DRIGODB_RESTORE_SOURCE", value: source },
-                { name: "DRIGODB_BACKUP_BUCKET", value: config.backup.bucket },
-                { name: "DRIGODB_BACKUP_ENDPOINT", value: config.backup.endpoint },
-                { name: "PGHOST", value: endpointHost(id) },
-                { name: "PGPORT", value: String(POSTGRES_PORT) },
-                { name: "PGUSER", value: DB_USER },
-                { name: "PGDATABASE", value: DB_NAME },
-                // require, not verify-full: the server self-signs, exactly as
-                // it does for any other client. Issue #9 changes both together.
-                { name: "PGSSLMODE", value: "require" },
-                {
-                  name: "PGPASSWORD",
-                  valueFrom: { secretKeyRef: { name: secretName(id), key: PASSWORD_SECRET_KEY } },
-                },
-                {
-                  name: "DRIGODB_BACKUP_KEY",
-                  valueFrom: {
-                    secretKeyRef: { name: config.backup.secretName, key: BACKUP_KEY_SECRET_KEY },
-                  },
-                },
-                {
-                  name: "DRIGODB_BACKUP_SECRET",
-                  valueFrom: {
-                    secretKeyRef: { name: config.backup.secretName, key: BACKUP_SECRET_SECRET_KEY },
-                  },
-                },
-              ],
-              resources: {
-                requests: { cpu: BACKUP_CPU_REQUEST, memory: BACKUP_MEMORY_REQUEST },
-                limits: { memory: BACKUP_MEMORY_LIMIT },
-              },
-            },
-          ],
-        },
-      },
-    },
-  };
-}
 
 // A cert-manager Certificate for one database.
 //

@@ -33,7 +33,3 @@ will sit Pending — set database.storageClass.
 {{- else -}}
 Databases will use the {{ .Values.database.storageClass }} StorageClass.
 {{- end }}
-{{ if not .Values.backup.bucket -}}
-Backups are OFF. Set backup.bucket and backup.endpoint, and create the
-{{ .Values.backup.credentialsSecret }} Secret in {{ .Values.databaseNamespace }}.
-{{- end }}

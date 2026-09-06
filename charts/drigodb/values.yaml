@@ -120,19 +120,12 @@ tls:
 # Off unless a bucket and an endpoint are set. With neither, no sidecar is added
 # at all — a database is exactly what it was before, rather than one carrying a
 # container that cannot do its job.
-backup:
-  bucket: ""
-  endpoint: ""
-  # Derived from the endpoint when empty: DigitalOcean Spaces puts the region in
-  # the hostname, and most S3-compatible servers accept us-east-1.
-  region: ""
-  intervalSeconds: 86400
-  image: ghcr.io/drigolabs/drigodb-backup:18-20260905-b13
-  # Holds access_key and secret_key, in the database namespace. Cluster-wide
-  # rather than per database: one bucket, one credential, and the object prefix
-  # is what separates tenants inside it. Created outside this chart, because a
-  # chart that generated it would rotate it on every sync.
-  credentialsSecret: drigodb-backup-credentials
+# Backups are not available in this release.
+#
+# They were a sidecar in the database's pod template, and decision 0004 gave
+# that template to CloudNativePG. The operator has its own backup machinery and
+# adopting it is issue #95; until then a hosted database has no backup, and
+# GET /v1/databases/{id} says so rather than leaving anyone to infer it.
 
 nameOverride: ""
 fullnameOverride: ""

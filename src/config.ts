@@ -71,26 +71,7 @@ export const config = {
 
   // Backups. Off unless a bucket and an endpoint are configured — with neither,
   // no sidecar is added and a database is exactly what it was before. That
-  // matters because a half-configured backup must not be the reason a database
-  // fails to start.
-  backup: {
-    bucket: envOr("DRIGODB_BACKUP_BUCKET", ""),
-    endpoint: envOr("DRIGODB_BACKUP_ENDPOINT", ""),
-    intervalSeconds: envOr("DRIGODB_BACKUP_INTERVAL", "86400"),
-    // Tagged by PostgreSQL major alone: the data plane no longer carries an
-    // upstream extension version. pg_dump must not be older than the server, so
-    // this image derives from the same postgres image the database runs.
-    image: envOr("DRIGODB_BACKUP_IMAGE", "ghcr.io/drigolabs/drigodb-backup:18"),
-    // Holds access_key and secret_key. Cluster-wide rather than per database:
-    // one bucket, one credential, and the object prefix is what separates
-    // tenants inside it.
-    secretName: envOr("DRIGODB_BACKUP_SECRET", "drigodb-backup-credentials"),
-    // SigV4 needs a region string and the server checks it, so a wrong guess
-    // fails the signature rather than being ignored. Derived from the endpoint
-    // by default — Spaces puts it in the hostname, MinIO has none — and
-    // overridable for anything that does neither.
-    region: envOr("DRIGODB_BACKUP_REGION", ""),
-  },
+
 } as const;
 
 // Backups are configured only when there is somewhere to put them.
@@ -101,9 +82,6 @@ export function serverAuthEnabled(): boolean {
   return config.tls.issuer !== "";
 }
 
-export function backupsEnabled(): boolean {
-  return config.backup.bucket !== "" && config.backup.endpoint !== "";
-}
 
 // Read lazily so tests and `--help`-style invocations do not need a token.
 export function apiToken(): string {

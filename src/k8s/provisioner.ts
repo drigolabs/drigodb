@@ -19,12 +19,8 @@ import {
 import type { V1Job, V1StatefulSet } from "@kubernetes/client-node";
 import type { Tier } from "./manifests.js";
 
-import { backupsEnabled, config, serverAuthEnabled } from "../config.js";
-import type { BackupObject } from "../backups/s3.js";
-import { BackupStorageError, listObjects, regionFromEndpoint } from "../backups/s3.js";
+import { config, serverAuthEnabled } from "../config.js";
 import {
-  BACKUP_KEY_SECRET_KEY,
-  BACKUP_SECRET_SECRET_KEY,
   TIERS,
   TIER_LABEL,
   TIER_ORDER,
@@ -39,13 +35,11 @@ import {
   POSTGRES_PORT,
   buildNetworkPolicy,
   buildCertificate,
-  buildRestoreJob,
   buildCluster,
   buildSecret,
   buildService,
   connectionUri,
   endpointHost,
-  restoreJobName,
   tierOf,
   tlsSecretName,
   secretName,
@@ -53,17 +47,12 @@ import {
   clusterName,
 } from "./manifests.js";
 
-// "restoring" is deliberately NOT "ready". A restored database answers on its
-// port before its data has landed, and a caller that connected then would see
-// an empty database — and any write it made would leave the restore to find a
-// non-empty target and skip. The status is what stops that race.
 export type DatabaseStatus =
   | "provisioning"
   // Running, and not usable yet: the server accepts connections but drigodb's
   // migrations have not finished. Distinct from `restoring`, which is data
   // arriving, and from `failed`, which is a migration that will not finish.
   | "migrating"
-  | "restoring"
   | "ready"
   | "hibernated"
   | "failed";
@@ -72,6 +61,15 @@ export type Database = {
   id: string;
   external_id: string;
   status: DatabaseStatus;
+  // Not a lifecycle state, and deliberately on every database rather than only
+  // the unprotected ones: right now that is all of them.
+  //
+  // The backup sidecar lived in a pod template drigodb no longer owns
+  // (decision 0004), so it went with it, and CloudNativePG's own backups are
+  // #95. Until that lands a hosted database has no backup at all, and a
+  // consumer polling this endpoint should be told rather than left to infer it
+  // from an endpoint that no longer exists.
+  backups: "unavailable";
   tier: Tier;
   endpoint: string;
   port: number;
@@ -102,11 +100,18 @@ export class ValidationError extends Error {}
 export class NotFoundError extends Error {}
 // "Backups are off" is a different answer from "there are none", and a caller
 // acting on the second when the first is true would be wrong.
-export class BackupsDisabledError extends Error {}
 // The storage layer refused to grow the volume. Almost always a StorageClass
 // with allowVolumeExpansion: false, which is the operator's to change and not
 // something drigodb can work around.
 export class ResizeRefusedError extends Error {}
+
+// A feature this installation has not turned on was asked for.
+//
+// caCertificate used to throw BackupsDisabledError for "server authentication is
+// off", which was true of the HTTP status and a lie about everything else. An
+// error class is read by whoever is debugging at 3am; naming it after a
+// different feature costs them the first ten minutes.
+export class NotConfiguredError extends Error {}
 
 // A create landed on an id whose previous database is still being deleted.
 //
@@ -121,24 +126,6 @@ export class DeletionInFlightError extends Error {}
 const RESTORE_KEY_RE = /^\d{8}T\d{6}Z\.sql\.gz$/;
 const DB_ID_RE = /^[0-9a-f]{12}$/;
 
-export function validateRestoreFrom(
-  value: unknown,
-): { databaseId: string; key: string } | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== "object") throw new ValidationError("restore_from must be an object");
-  const { database_id: dbId, key } = value as { database_id?: unknown; key?: unknown };
-
-  if (typeof dbId !== "string" || !DB_ID_RE.test(dbId)) {
-    throw new ValidationError("restore_from.database_id must be a database id");
-  }
-  // A key is joined onto a bucket prefix, so a traversal here would read
-  // another database's backups. Matching the exact shape this service writes is
-  // a tighter check than rejecting "..", and needs no reasoning about encoding.
-  if (typeof key !== "string" || !RESTORE_KEY_RE.test(key)) {
-    throw new ValidationError("restore_from.key must be a backup key, e.g. 20260905T040000Z.sql.gz");
-  }
-  return { databaseId: dbId, key };
-}
 
 // Falls back rather than throwing on a bad value: a typo in an operator's env
 // must not stop every provision, and small is the safe direction to be wrong in.
@@ -272,13 +259,6 @@ export class Provisioner {
     // Before the ready check, not after: a database whose migrations failed has
     // a running server and an unusable schema, which is the whole reason this
     // status exists. It is also why no URI is issued for one — see create().
-    const restore = await this.restoreJobFor(id);
-    if (restore) {
-      if ((restore.status?.succeeded ?? 0) > 0) return ready > 0 ? "ready" : "provisioning";
-      if ((restore.status?.failed ?? 0) > 0) return "failed";
-      return "restoring";
-    }
-
     if (ready > 0) return "ready";
 
     // The operator's own verdict, for the cases it can see and drigodb cannot:
@@ -297,6 +277,7 @@ export class Provisioner {
       id,
       external_id: labels[EXTERNAL_ID_LABEL] ?? "",
       status: await this.statusOf(id, labels, cluster),
+      backups: "unavailable",
       tier: tierOf(labels),
       endpoint: endpointHost(id),
       port: POSTGRES_PORT,
@@ -323,19 +304,6 @@ export class Provisioner {
     }
   }
 
-  // Missing is the ordinary case: most databases were never restored into, and
-  // a succeeded Job removes itself after an hour.
-  private async restoreJobFor(id: string): Promise<V1Job | undefined> {
-    try {
-      return await this.batch.readNamespacedJob({
-        name: restoreJobName(id),
-        namespace: config.databaseNamespace,
-      });
-    } catch (err) {
-      if (isNotFound(err)) return undefined;
-      throw err;
-    }
-  }
 
   private async listClusters(selector: string): Promise<CnpgCluster[]> {
     const list = (await this.objects.listNamespacedCustomObject({
@@ -373,7 +341,6 @@ export class Provisioner {
   // leak database credentials.
   async create(
     externalId: string,
-    restoreFrom?: { databaseId: string; key: string },
   ): Promise<{ database: Database; uri: string; created: boolean }> {
     const id = idFor(externalId);
     const password = newPassword();
@@ -452,15 +419,6 @@ export class Provisioner {
     );
 
 
-    // After the wake, because the Job connects over TCP to a server that has to
-    // be listening — and creating it earlier would only mean it crash-looped
-    // through its backoff while the database initialised.
-    if (restoreFrom) {
-      await this.batch.createNamespacedJob({
-        namespace: ns,
-        body: buildRestoreJob(id, externalId, `${restoreFrom.databaseId}/${restoreFrom.key}`),
-      });
-    }
 
     return { database: await this.get(id), uri: connectionUri(id, password), created: true };
   }
@@ -746,29 +704,6 @@ export class Provisioner {
       this.net.deleteNamespacedNetworkPolicy({ name: clusterName(id), namespace: ns }),
     );
     await ignoreMissing(() => this.core.deleteNamespacedSecret({ name: secretName(id), namespace: ns }));
-    // A failed restore Job outlives its TTL on purpose, so DELETE is what
-    // finally removes it — along with the pod holding its logs.
-    if (serverAuthEnabled()) {
-      // The Certificate, not just its Secret: cert-manager would reissue the
-      // Secret it owns, leaving a certificate for a database that no longer
-      // exists renewing itself indefinitely.
-      await ignoreMissing(() =>
-        this.objects.deleteNamespacedCustomObject({
-          group: "cert-manager.io",
-          version: "v1",
-          namespace: config.tls.issuerNamespace,
-          plural: "certificates",
-          name: tlsSecretName(id),
-        }),
-      );
-    }
-    await ignoreMissing(() =>
-      this.batch.deleteNamespacedJob({
-        name: restoreJobName(id),
-        namespace: ns,
-        propagationPolicy: "Background",
-      }),
-    );
 
     // The retention policy deliberately keeps volumes when a StatefulSet is
     // removed, so DELETE has to remove them explicitly. This is the point at
@@ -795,7 +730,7 @@ export class Provisioner {
   // consumer to read a Secret in a namespace it has no business in.
   async caCertificate(): Promise<string> {
     if (!serverAuthEnabled()) {
-      throw new BackupsDisabledError(
+      throw new NotConfiguredError(
         "server authentication is not configured; connection URIs use sslmode=require",
       );
     }
@@ -811,48 +746,4 @@ export class Provisioner {
     return Buffer.from(raw, "base64").toString("utf8");
   }
 
-  // Every backup this database has, newest first.
-  //
-  // Answered from the control plane rather than from the pod, because the pod
-  // is exactly what is missing when the question matters: a hibernated database
-  // has no container to exec into, and "what can I restore?" is a question
-  // people ask about idle databases. Reaching `drigodb-backup latest` instead
-  // would need pods/exec RBAC, and a control plane that can exec into any
-  // database pod can read every tenant's data — strictly worse than listing a
-  // bucket, and still unable to answer while hibernated. See issue #39.
-  async listBackups(id: string): Promise<BackupObject[]> {
-    // 404 before 409: a database that does not exist is not a database whose
-    // backups are disabled.
-    const cluster = await this.clusterFor(id);
-    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
-    if (!backupsEnabled()) {
-      throw new BackupsDisabledError("backups are not configured for this installation");
-    }
-
-    const secret = await this.core.readNamespacedSecret({
-      name: config.backup.secretName,
-      namespace: config.databaseNamespace,
-    });
-    const read = (k: string): string => {
-      const v = secret.data?.[k];
-      if (!v) throw new BackupStorageError(`${config.backup.secretName} has no ${k}`);
-      return Buffer.from(v, "base64").toString("utf8");
-    };
-
-    const objects = await listObjects({
-      endpoint: config.backup.endpoint,
-      bucket: config.backup.bucket,
-      // The trailing slash matters: without it the prefix for "a1" would also
-      // match "a1b2", which is another tenant's backups.
-      prefix: `${id}/`,
-      accessKeyId: read(BACKUP_KEY_SECRET_KEY),
-      secretAccessKey: read(BACKUP_SECRET_SECRET_KEY),
-      region: config.backup.region || regionFromEndpoint(config.backup.endpoint),
-    });
-
-    // Keys are ISO-8601 UTC timestamps, so this is chronological — but sorted
-    // on lastModified rather than the name, because the name is what the writer
-    // chose and the timestamp is what the store observed.
-    return objects.sort((a, b) => (a.lastModified < b.lastModified ? 1 : -1));
-  }
 }

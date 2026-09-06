@@ -177,36 +177,6 @@ jobs:
         # and versions.env is commented.
         run: grep -E '^[A-Z_]+=' images/versions.env >> "$GITHUB_ENV"
 
-      # Only the backup image is ours. The postgres and gateway images are gone
-      # — databases run CNPG's postgresql directly, so there is nothing here to
-      # smoke-test for a loaded extension and no wire-protocol gateway to drive
-      # a MongoDB driver against. See docs/leaving-documentdb.md.
-      #
-      # Built from the PUBLISHED base rather than a locally loaded one:
-      # setup-buildx-action uses a container driver, which cannot see images in
-      # the local Docker daemon.
-      - name: Build backup
-        uses: docker/build-push-action@v6
-        with:
-          context: images/postgres-backup
-          platforms: linux/amd64
-          load: true
-          tags: drigolabs/drigodb-backup:ci
-          build-args: |
-            POSTGRES_IMAGE=ghcr.io/cloudnative-pg/postgresql:${{ env.PG_MAJOR }}
-          cache-from: type=gha,scope=backup-amd64
-          cache-to: type=gha,mode=max,scope=backup-amd64
-
-      # Writes rows to a real server, backs them up, restores into a SECOND
-      # RUNNING instance, and reads the rows and an expression index back.
-      # Asserting on the data is the assertion that matters: under DocumentDB a
-      # pg_dump-based backup restored with no error at all and lost every
-      # collection.
-      - name: Backup restore test
-        run: |
-          bash images/postgres-backup/integration-test.sh \
-            drigolabs/drigodb-backup:ci \
-            ghcr.io/cloudnative-pg/postgresql:${{ env.PG_MAJOR }}
 
       # No cluster, a second to run, and it is what stops a template reaching for
       # a cluster or a clock again. The last one rotated every consumer's bearer

@@ -3,14 +3,13 @@
 import { Hono } from "hono";
 
 import {
-  BackupsDisabledError,
   NotFoundError,
   ResizeRefusedError,
   Provisioner,
   DeletionInFlightError,
+  NotConfiguredError,
   ValidationError,
   validateExternalId,
-  validateRestoreFrom,
   validateTier,
 } from "../k8s/provisioner.js";
 import type { Tier } from "../k8s/manifests.js";
@@ -18,24 +17,18 @@ import type { Tier } from "../k8s/manifests.js";
 export function buildRoutes(provisioner: Provisioner): Hono {
   const app = new Hono();
 
-  // `restore_from` makes this a provision with a source rather than a separate
-  // verb: a restored database is a new database, with a new id, its own volume
-  // and its own credentials. The one it was restored from is untouched, which
-  // is what makes this the safe shape — an undo that cannot destroy the thing
-  // being undone.
+
   app.post("/v1/databases", async (c) => {
     let externalId: string;
-    let restoreFrom: { databaseId: string; key: string } | undefined;
     try {
       const body = await c.req.json().catch(() => ({}));
       externalId = validateExternalId((body as { external_id?: unknown }).external_id);
-      restoreFrom = validateRestoreFrom((body as { restore_from?: unknown }).restore_from);
     } catch (err) {
       if (err instanceof ValidationError) return c.json({ error: err.message }, 400);
       throw err;
     }
 
-    const { database, uri, created } = await provisioner.create(externalId, restoreFrom);
+    const { database, uri, created } = await provisioner.create(externalId);
     // 202 on create because provisioning is asynchronous — roughly 12 seconds,
     // too long to hold a request open. 200 on a repeat, which returns the
     // existing database without its credentials.
@@ -65,12 +58,6 @@ export function buildRoutes(provisioner: Provisioner): Hono {
     return c.json({ ...database, connection_uri: uri });
   });
 
-  // Keys and sizes, never a credential — and an empty list for a database that
-  // has never been backed up, which is an answer rather than an error.
-  //
-  // Answers for a hibernated database too, which is the point: that is when
-  // "what can I restore?" gets asked, and it is exactly when there is no pod to
-  // ask. See issue #39.
   // Growing is owner-initiated and automatically granted, provided the target
   // is a real tier no larger than the installation's ceiling. 202, because the
   // volume grows online but the WAL change needs the pod cycled behind it.
@@ -96,12 +83,6 @@ export function buildRoutes(provisioner: Provisioner): Hono {
     c.text(await provisioner.caCertificate(), 200, { "content-type": "application/x-pem-file" }),
   );
 
-  app.get("/v1/databases/:id/backups", async (c) => {
-    const backups = await provisioner.listBackups(c.req.param("id"));
-    return c.json({
-      backups: backups.map((b) => ({ key: b.key, size: b.size, created_at: b.lastModified })),
-    });
-  });
 
   app.delete("/v1/databases/:id", async (c) => {
     await provisioner.delete(c.req.param("id"));
@@ -111,14 +92,12 @@ export function buildRoutes(provisioner: Provisioner): Hono {
   app.onError((err, c) => {
     if (err instanceof NotFoundError) return c.json({ error: err.message }, 404);
     if (err instanceof ValidationError) return c.json({ error: err.message }, 400);
-    // 409, not 404 or an empty list: "backups are off for this installation" is
-    // a different fact from "this database has none", and a caller that
-    // conflated them would conclude its data was unprotected when it is, or
-    // that it is protected when it is not.
-    if (err instanceof BackupsDisabledError) return c.json({ error: err.message }, 409);
     // 409, not 500: the volume could not grow, the caller can read why, and an
     // operator can fix it by choosing a StorageClass that allows expansion.
     if (err instanceof ResizeRefusedError) return c.json({ error: err.message }, 409);
+    // 409, not 404: the feature exists and this installation has not enabled it,
+    // which is a different fact from the thing not being there.
+    if (err instanceof NotConfiguredError) return c.json({ error: err.message }, 409);
     // 409, not 500: the id is briefly taken by a database on its way out. The
     // caller has done nothing wrong and a retry in a few seconds succeeds.
     if (err instanceof DeletionInFlightError) return c.json({ error: err.message }, 409);

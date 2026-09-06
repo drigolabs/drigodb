@@ -62,22 +62,6 @@ spec:
               value: {{ .Values.tls.certManager.renewBefore | quote }}
             - name: DRIGODB_TLS_CA_SECRET
               value: {{ include "drigodb.caSecret" . | quote }}
-            - name: DRIGODB_BACKUP_IMAGE
-              value: {{ .Values.backup.image | quote }}
-            # Backups are off until a bucket AND an endpoint are set. Empty here
-            # on purpose: with no destination configured no sidecar is added,
-            # and a half-configured backup must not be the reason a database
-            # fails to start.
-            - name: DRIGODB_BACKUP_BUCKET
-              value: {{ .Values.backup.bucket | quote }}
-            - name: DRIGODB_BACKUP_ENDPOINT
-              value: {{ .Values.backup.endpoint | quote }}
-            - name: DRIGODB_BACKUP_REGION
-              value: {{ .Values.backup.region | quote }}
-            - name: DRIGODB_BACKUP_INTERVAL
-              value: {{ .Values.backup.intervalSeconds | quote }}
-            - name: DRIGODB_BACKUP_SECRET
-              value: {{ .Values.backup.credentialsSecret | quote }}
           # /readyz, not /healthz. Readiness asks whether drigodb can do its job
           # on this cluster, which is a different question from whether the
           # process is running — and both things it checks (the CloudNativePG

@@ -45,8 +45,17 @@ describe("network policy", () => {
 describe("service and identity", () => {
   it("selects whichever instance is primary, by number not by port name", () => {
     const svc = buildService(ID, EXT);
+    // CloudNativePG's labels, so the endpoint follows a failover rather than
+    // pinning to one pod.
+    expect(svc.spec?.selector).toEqual({
+      "cnpg.io/cluster": `db-${ID}`,
+      "cnpg.io/instanceRole": "primary",
+    });
+    // The NUMBER. CNPG names the container port `postgresql`; a targetPort of
+    // "postgres" resolves to nothing, and a Service with no endpoints hangs
+    // every connection until TCP gives up rather than refusing it.
+    expect(svc.spec?.ports?.[0]?.targetPort).toBe(POSTGRES_PORT);
     expect(svc.spec?.ports?.[0]?.port).toBe(POSTGRES_PORT);
-    expect(svc.spec?.selector).toEqual({ [DB_ID_LABEL]: ID });
   });
 
   it("labels objects with both ids so lookups and idempotency work", () => {
@@ -92,54 +101,6 @@ describe("external_id validation", () => {
 
 // Restoring into a new database. The Job is deliberately unprivileged: it holds
 // the app's own credential and reaches the database the way any consumer does.
-describe("restore job", () => {
-  async function withBackups() {
-    vi.resetModules();
-    vi.stubEnv("DRIGODB_BACKUP_BUCKET", "drigodb-backups");
-    vi.stubEnv("DRIGODB_BACKUP_ENDPOINT", "https://fra1.digitaloceanspaces.com");
-    return await import("../src/k8s/manifests.js");
-  }
-
-  it("opts through the database's own NetworkPolicy rather than widening it", async () => {
-    const m = await withBackups();
-    const job = m.buildRestoreJob(ID, EXT, "src123/20260905T040000Z.sql.gz");
-    expect(job.metadata?.labels?.[m.ALLOW_LABEL]).toBe(ID);
-    expect(job.spec?.template.metadata?.labels?.[m.ALLOW_LABEL]).toBe(ID);
-  });
-
-  it("connects as the app, over TLS, and never inlines the password", async () => {
-    const m = await withBackups();
-    const job = m.buildRestoreJob(ID, EXT, "src123/20260905T040000Z.sql.gz");
-    const env = job.spec?.template.spec?.containers?.[0]?.env ?? [];
-    const val = (n: string) => env.find((e) => e.name === n)?.value;
-
-    expect(val("PGUSER")).toBe("appuser");
-    expect(val("PGSSLMODE")).toBe("require");
-    expect(val("PGHOST")).toBe(m.endpointHost(ID));
-    expect(val("DRIGODB_RESTORE_SOURCE")).toBe("src123/20260905T040000Z.sql.gz");
-
-    const pw = env.find((e) => e.name === "PGPASSWORD");
-    expect(pw?.value).toBeUndefined();
-    expect(pw?.valueFrom?.secretKeyRef?.name).toBe(`db-${ID}-credentials`);
-  });
-
-  it("carries no service account token", async () => {
-    // It talks to PostgreSQL and to object storage. It has no business with the
-    // Kubernetes API, and a token in a pod that does not need one is a
-    // credential waiting to be misused.
-    const m = await withBackups();
-    const job = m.buildRestoreJob(ID, EXT, "src123/20260905T040000Z.sql.gz");
-    expect(job.spec?.template.spec?.automountServiceAccountToken).toBe(false);
-  });
-
-  it("cleans up after itself when it succeeds", async () => {
-    const m = await withBackups();
-    const job = m.buildRestoreJob(ID, EXT, "src123/20260905T040000Z.sql.gz");
-    expect(job.spec?.ttlSecondsAfterFinished).toBeGreaterThan(0);
-    // Bounded retries: a restore that cannot work should stop, not loop.
-    expect(job.spec?.backoffLimit).toBeLessThanOrEqual(5);
-  });
-});
 
 describe("storage class portability", () => {
   afterEach(() => {

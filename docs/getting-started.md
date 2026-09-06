@@ -242,15 +242,11 @@ Prove it end to end:
 KUBE_CONTEXT=kind-drigodb bash scripts/smoke.sh
 ```
 
-Add object storage if you want backups and restore to work:
-
-```bash
-bash scripts/kind-up.sh --with-backups
-```
-
-That adds MinIO and points drigodb at it — the same substitution the backup
-image's own integration test makes.
-
+Backups are not available in this release. They were a sidecar in the database's
+pod template, and [decision 0004](decisions/0004-cloudnativepg-for-the-data-plane.md)
+gave that template to CloudNativePG; adopting the operator's own backups is
+[#95](https://github.com/drigolabs/drigodb/issues/95). `GET /v1/databases/{id}`
+reports `"backups": "unavailable"` rather than leaving anyone to infer it.
 **Tear down:** `bash scripts/kind-down.sh`. Nothing to sweep afterwards; kind's
 volumes are directories inside the node container.
 
