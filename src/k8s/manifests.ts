@@ -65,6 +65,21 @@ export const TIER_LABEL = "drigodb.io/tier";
 // fallback.
 export const HIBERNATED_LABEL = "drigodb.io/hibernated";
 
+// CloudNativePG's API group. A hosted database is a Cluster in it — decision
+// 0004 — and preflight checks that this cluster can list them before drigodb
+// reports itself able to work.
+export const CNPG_GROUP = "postgresql.cnpg.io";
+export const CLUSTERS_PLURAL = "clusters";
+
+// How CloudNativePG is told to put a database down. An annotation rather than a
+// replica count, and drigodb keeps its own HIBERNATED_LABEL beside it: this one
+// says what the operator was asked to do, the label says what drigodb meant.
+export const CNPG_HIBERNATION_ANNOTATION = "cnpg.io/hibernation";
+
+// The key CNPG reads a username from when it is handed a credential Secret. It
+// wants a kubernetes.io/basic-auth Secret, so the password alone is not enough.
+export const USERNAME_SECRET_KEY = "username";
+
 // A tier is a floor, not a quota. Nothing stops a database filling its volume.
 //
 // max_wal_size scales with the tier for performance rather than correctness: it
@@ -189,6 +204,17 @@ export function restoreJobName(id: string): string {
   return `restore-${id}`;
 }
 
+// The Cluster carries the name a StatefulSet used to, so nothing that derives a
+// hostname, a Secret name or an id from it has to change — and idempotent create
+// keeps working the same way, because the name is still the lock.
+export function clusterName(id: string): string {
+  return `db-${id}`;
+}
+
+export function migrationJobName(id: string): string {
+  return `migrate-${id}`;
+}
+
 export function labelsFor(id: string, externalId: string): Record<string, string> {
   return {
     [DB_ID_LABEL]: id,
@@ -223,8 +249,16 @@ export function buildSecret(id: string, externalId: string, password: string): V
       namespace: config.databaseNamespace,
       labels: labelsFor(id, externalId),
     },
-    type: "Opaque",
-    stringData: { [PASSWORD_SECRET_KEY]: password },
+    // basic-auth rather than Opaque, and it carries the username as well as the
+    // password. CloudNativePG will not accept a credential Secret in any other
+    // shape — bootstrap.initdb.secret and managed.roles both read `username`
+    // and `password` from a kubernetes.io/basic-auth Secret.
+    //
+    // The username never varies. It is written anyway, because the alternative
+    // is a Secret that is correct only because something else agrees about a
+    // value it cannot see.
+    type: "kubernetes.io/basic-auth",
+    stringData: { [USERNAME_SECRET_KEY]: DB_USER, [PASSWORD_SECRET_KEY]: password },
   };
 }
 
@@ -581,6 +615,158 @@ export function buildStatefulSet(id: string, externalId: string, tier: Tier = "s
   };
 }
 
+// A hosted database, as CloudNativePG sees it. Decision 0004.
+//
+// This replaces buildStatefulSet, and with it most of what drigodb used to
+// assemble by hand — the pod template, the probes, the volume claim, the
+// fsGroup, bootstrap.sh. The operator owns all of that now. What is left here is
+// the part that is drigodb's product rather than PostgreSQL's mechanics: the
+// tier, the credential, the labels the network boundary selects on, and the name
+// that makes create idempotent.
+//
+// Every field below was verified against CNPG 1.27 on a real cluster before it
+// was written, because several plausible-looking spellings do nothing.
+export function buildCluster(id: string, externalId: string, tier: Tier = "small"): object {
+  const labels = { ...labelsFor(id, externalId), [TIER_LABEL]: tier };
+  return {
+    apiVersion: `${CNPG_GROUP}/v1`,
+    kind: "Cluster",
+    metadata: {
+      name: clusterName(id),
+      namespace: config.databaseNamespace,
+      // Hibernation is an intent, and it is read from this label rather than
+      // from the annotation CNPG acts on, for the same reason it was read from a
+      // label rather than a replica count before: a create is also "not
+      // running", and telling a concurrent caller its database was hibernated
+      // was wrong in exactly the case the label exists to distinguish.
+      labels: { ...labels, [HIBERNATED_LABEL]: "false" },
+    },
+    spec: {
+      instances: 1,
+      imageName: config.pgImage,
+
+      // What makes the NetworkPolicy keep working. Without this the pods carry
+      // only CNPG's own labels, the policy's podSelector matches nothing, and
+      // every database becomes unreachable — silently, because a NetworkPolicy
+      // denies by dropping packets.
+      inheritedMetadata: {
+        labels: { [DB_ID_LABEL]: id, [MANAGED_BY_LABEL]: MANAGED_BY_VALUE },
+      },
+
+      storage: {
+        size: TIERS[tier].storage,
+        // Omitted when unset, never sent as "". Those mean opposite things: an
+        // empty string binds a pre-provisioned volume with NO storage class,
+        // while an absent field means the cluster default. Portability depends
+        // on the second.
+        ...(config.storageClass ? { storageClass: config.storageClass } : {}),
+      },
+
+      postgresql: { parameters: { max_wal_size: TIERS[tier].maxWalSize } },
+
+      resources: {
+        requests: { cpu: PG_CPU_REQUEST, memory: PG_MEMORY_REQUEST },
+        limits: { memory: PG_MEMORY_LIMIT },
+      },
+
+      bootstrap: {
+        initdb: {
+          database: DB_NAME,
+          owner: DB_USER,
+          // drigodb's own credential, not one CNPG invents. The URI is issued
+          // from this Secret, so the server has to be created with it.
+          //
+          // Read at initdb and never again — which is why managed.roles below
+          // exists. Changing this Secret alone rotates nothing, and the old
+          // password goes on working. Measured, not assumed.
+          secret: { name: secretName(id) },
+        },
+      },
+
+      // The rotation path. CNPG reconciles the role against this Secret
+      // continuously, so replacing the Secret is what changes the password —
+      // and the old one stops being accepted, which is the half that matters.
+      //
+      // postInitApplicationSQL is deliberately NOT used for migrations: it
+      // mangles `$$`, arriving as a single `$`, and 001-core.sql contains a
+      // dollar-quoted function body. That file is frozen by checksum and cannot
+      // be rewritten to suit it. See buildMigrationJob.
+      managed: {
+        roles: [
+          {
+            name: DB_USER,
+            login: true,
+            passwordSecret: { name: secretName(id) },
+          },
+        ],
+      },
+    },
+  };
+}
+
+// Apply drigodb's migrations to a database that is already running.
+//
+// A Job rather than an init hook, because CNPG's hooks run once at creation and
+// migrations have to reach databases that already exist — that is the whole
+// point of a forward-only migration runner, and today it happens on every start
+// of bootstrap.sh. One mechanism has to cover both.
+//
+// It connects over TCP as an ordinary consumer, carrying the allow-label like
+// any other client, so the network boundary applies to drigodb's own tooling
+// exactly as it does to a consumer.
+export function buildMigrationJob(id: string, externalId: string): V1Job {
+  return {
+    apiVersion: "batch/v1",
+    kind: "Job",
+    metadata: {
+      name: migrationJobName(id),
+      namespace: config.databaseNamespace,
+      labels: labelsFor(id, externalId),
+    },
+    spec: {
+      // Retried, because the database may not be accepting connections the
+      // instant the Cluster reports ready.
+      backoffLimit: 6,
+      ttlSecondsAfterFinished: 3600,
+      template: {
+        metadata: { labels: { ...labelsFor(id, externalId), [ALLOW_LABEL]: id } },
+        spec: {
+          restartPolicy: "Never",
+          containers: [
+            {
+              name: "migrate",
+              image: config.pgImage,
+              env: [
+                { name: "PGHOST", value: endpointHost(id) },
+                { name: "PGPORT", value: String(POSTGRES_PORT) },
+                { name: "PGDATABASE", value: DB_NAME },
+                { name: "PGUSER", value: DB_USER },
+                { name: "PGSSLMODE", value: "require" },
+                {
+                  name: "PGPASSWORD",
+                  valueFrom: {
+                    secretKeyRef: { name: secretName(id), key: PASSWORD_SECRET_KEY },
+                  },
+                },
+                { name: "MIGRATIONS_DIR", value: MIGRATIONS_MOUNT_PATH },
+              ],
+              volumeMounts: [
+                { name: "migrations", mountPath: MIGRATIONS_MOUNT_PATH, readOnly: true },
+                { name: "runner", mountPath: "/drigodb-bin", readOnly: true },
+              ],
+              command: ["bash", "/drigodb-bin/migrate.sh"],
+            },
+          ],
+          volumes: [
+            { name: "migrations", configMap: { name: MIGRATIONS_CONFIG_MAP_NAME, defaultMode: 0o644 } },
+            { name: "runner", configMap: { name: CONFIG_MAP_NAME, defaultMode: 0o755 } },
+          ],
+        },
+      },
+    },
+  };
+}
+
 export function buildService(id: string, externalId: string): V1Service {
   return {
     apiVersion: "v1",
@@ -592,7 +778,21 @@ export function buildService(id: string, externalId: string): V1Service {
     },
     spec: {
       type: "ClusterIP",
-      selector: { [DB_ID_LABEL]: id },
+      // CNPG's labels, not drigodb's, and deliberately.
+      //
+      // The pods carry drigodb's database-id too (inheritedMetadata), but that
+      // would match every instance. This matches only whichever pod is CURRENTLY
+      // primary, which is what makes the connection URI survive a failover: the
+      // hostname a consumer wrote down stays the same and the endpoint behind it
+      // moves. It is also why opt-in HA (#81) needs nothing here.
+      //
+      // drigodb keeps its own Service rather than pointing the URI at CNPG's
+      // `-rw` one, because the URI is issued once and never reissued. Adopting
+      // their name would rename every consumer's endpoint.
+      selector: {
+        "cnpg.io/cluster": clusterName(id),
+        "cnpg.io/instanceRole": "primary",
+      },
       ports: [
         {
           name: POSTGRES_PORT_NAME,

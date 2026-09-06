@@ -18,6 +18,8 @@ data:
 {{- end }}
   bootstrap.sh: |
 {{ .Files.Get "files/bootstrap.sh" | indent 4 }}
+  migrate.sh: |
+{{ .Files.Get "files/migrate.sh" | indent 4 }}
 ---
 {{/*
 Schema, on its own ConfigMap. Not more keys on drigodb-config: these are applied

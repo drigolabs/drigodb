@@ -29,6 +29,9 @@ import {
   TIER_LABEL,
   TIER_ORDER,
   DB_ID_LABEL,
+  CLUSTERS_PLURAL,
+  CNPG_GROUP,
+  CNPG_HIBERNATION_ANNOTATION,
   EXTERNAL_ID_LABEL,
   HIBERNATED_LABEL,
   MANAGED_BY_LABEL,
@@ -39,6 +42,8 @@ import {
   buildPodTemplate,
   buildCertificate,
   buildRestoreJob,
+  buildCluster,
+  buildMigrationJob,
   buildSecret,
   buildService,
   buildStatefulSet,
@@ -50,6 +55,8 @@ import {
   tlsSecretName,
   secretName,
   serviceName,
+  clusterName,
+  migrationJobName,
   statefulSetName,
   templateHash,
 } from "./manifests.js";
@@ -60,6 +67,10 @@ import {
 // non-empty target and skip. The status is what stops that race.
 export type DatabaseStatus =
   | "provisioning"
+  // Running, and not usable yet: the server accepts connections but drigodb's
+  // migrations have not finished. Distinct from `restoring`, which is data
+  // arriving, and from `failed`, which is a migration that will not finish.
+  | "migrating"
   | "restoring"
   | "ready"
   | "hibernated"
@@ -78,6 +89,22 @@ export type Database = {
 // Kubernetes label values: alphanumeric, with dashes, underscores and dots
 // permitted inside. Callers get a 400 rather than a confusing API-server error.
 const EXTERNAL_ID_RE = /^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$/;
+
+// The slice of a CloudNativePG Cluster drigodb reads.
+//
+// Deliberately not the operator's full type. drigodb depends on four fields, and
+// writing them down is what keeps a CNPG upgrade from being able to change
+// something this code silently relied on.
+interface CnpgCluster {
+  metadata?: {
+    name?: string;
+    labels?: Record<string, string>;
+    annotations?: Record<string, string>;
+    creationTimestamp?: string;
+  };
+  spec?: { instances?: number; storage?: { size?: string } };
+  status?: { readyInstances?: number; phase?: string };
+}
 
 export class ValidationError extends Error {}
 export class NotFoundError extends Error {}
@@ -219,12 +246,18 @@ export class Provisioner {
     );
   }
 
-  private async statefulSetFor(id: string) {
+  // The shape drigodb reads out of a CNPG Cluster. Narrow on purpose: the
+  // operator's status has a great deal in it and depending on more of it than
+  // this would make every CNPG upgrade a risk.
+  private async clusterFor(id: string): Promise<CnpgCluster | undefined> {
     try {
-      return await this.apps.readNamespacedStatefulSet({
-        name: statefulSetName(id),
+      return (await this.objects.getNamespacedCustomObject({
+        group: CNPG_GROUP,
+        version: "v1",
         namespace: config.databaseNamespace,
-      });
+        plural: CLUSTERS_PLURAL,
+        name: clusterName(id),
+      })) as CnpgCluster;
     } catch (err) {
       if (isNotFound(err)) return undefined;
       throw err;
@@ -234,23 +267,25 @@ export class Provisioner {
   private async statusOf(
     id: string,
     labels: Record<string, string>,
-    desiredReplicas: number,
-    ready: number,
+    cluster: CnpgCluster,
   ): Promise<DatabaseStatus> {
     // Hibernation is an intent, so it is read from the label that records the
-    // intent rather than inferred from the replica count it produced. A create
-    // is also at zero replicas while it runs, and telling the concurrent caller
-    // its database was hibernated was wrong in the one case the second API
-    // replica exists to serve.
-    const hibernated = labels[HIBERNATED_LABEL];
-    if (hibernated === "true") return "hibernated";
-    // Databases created before the label carry no intent to read, and the
-    // replica count is what they were always judged by. They gain the label the
-    // first time they are scaled.
-    if (hibernated === undefined && desiredReplicas === 0) return "hibernated";
+    // intent rather than from what the operator has done about it yet. A create
+    // is also "no instances running", and telling a concurrent caller its
+    // database was hibernated was wrong in exactly the case this distinguishes.
+    if (labels[HIBERNATED_LABEL] === "true") return "hibernated";
 
-    // Before the ready check, not after: a restoring database has a ready pod
-    // and is not usable, which is the whole reason this status exists.
+    const ready = cluster.status?.readyInstances ?? 0;
+
+    // Before the ready check, not after: a database whose migrations failed has
+    // a running server and an unusable schema, which is the whole reason this
+    // status exists. It is also why no URI is issued for one — see create().
+    const migration = await this.jobFor(migrationJobName(id));
+    if (migration) {
+      if ((migration.status?.failed ?? 0) > 0) return "failed";
+      if ((migration.status?.succeeded ?? 0) === 0) return ready > 0 ? "migrating" : "provisioning";
+    }
+
     const restore = await this.restoreJobFor(id);
     if (restore) {
       if ((restore.status?.succeeded ?? 0) > 0) return ready > 0 ? "ready" : "provisioning";
@@ -260,42 +295,69 @@ export class Provisioner {
 
     if (ready > 0) return "ready";
 
-    // Distinguish "still starting" from "stuck". A pod that cannot pull its
-    // image or is crash-looping will never become ready on its own, and a
-    // caller polling forever is worse than an error.
-    const pods = await this.core.listNamespacedPod({
-      namespace: config.databaseNamespace,
-      labelSelector: `${DB_ID_LABEL}=${id}`,
-    });
-    for (const pod of pods.items ?? []) {
-      for (const cs of pod.status?.containerStatuses ?? []) {
-        const reason = cs.state?.waiting?.reason ?? "";
-        if (reason === "CrashLoopBackOff" || reason.endsWith("ImagePullBackOff")) {
-          return "failed";
-        }
-      }
-    }
+    // The operator's own verdict, for the cases it can see and drigodb cannot:
+    // an image that will not pull, a volume that will not bind, a cluster that
+    // has given up. A caller polling forever is worse than an error.
+    const phase = cluster.status?.phase ?? "";
+    if (/failure|failed|unrecoverable/i.test(phase)) return "failed";
+
     return "provisioning";
   }
 
-  private async toDatabase(sts: { metadata?: { labels?: Record<string, string>; creationTimestamp?: Date }; spec?: { replicas?: number }; status?: { readyReplicas?: number } }): Promise<Database> {
-    const labels = sts.metadata?.labels ?? {};
+  private async toDatabase(cluster: CnpgCluster): Promise<Database> {
+    const labels = cluster.metadata?.labels ?? {};
     const id = labels[DB_ID_LABEL] ?? "";
-    const status = await this.statusOf(
-      id,
-      labels,
-      sts.spec?.replicas ?? 0,
-      sts.status?.readyReplicas ?? 0,
-    );
     return {
       id,
       external_id: labels[EXTERNAL_ID_LABEL] ?? "",
-      status,
+      status: await this.statusOf(id, labels, cluster),
       tier: tierOf(labels),
       endpoint: endpointHost(id),
       port: POSTGRES_PORT,
-      created_at: sts.metadata?.creationTimestamp?.toISOString(),
+      created_at: cluster.metadata?.creationTimestamp
+        ? new Date(cluster.metadata.creationTimestamp).toISOString()
+        : undefined,
     };
+  }
+
+  // Run drigodb's migrations against a database that is up.
+  //
+  // Deleted and recreated rather than reused: a Job's pod template is immutable,
+  // so a second wake cannot re-run an existing one, and a Job left behind from
+  // the last wake would make statusOf report a stale verdict about the current
+  // one. Deleting first is what makes "the Job for this database" mean the run
+  // that is happening now.
+  private async runMigrations(id: string, externalId: string): Promise<void> {
+    await this.ignoreMissing(() =>
+      this.batch.deleteNamespacedJob({
+        name: migrationJobName(id),
+        namespace: config.databaseNamespace,
+        propagationPolicy: "Background",
+      }),
+    );
+    await this.ensure(() =>
+      this.batch.createNamespacedJob({
+        namespace: config.databaseNamespace,
+        body: buildMigrationJob(id, externalId),
+      }),
+    );
+  }
+
+  private async ignoreMissing(fn: () => Promise<unknown>): Promise<void> {
+    try {
+      await fn();
+    } catch (err) {
+      if (!isNotFound(err)) throw err;
+    }
+  }
+
+  private async jobFor(name: string): Promise<V1Job | undefined> {
+    try {
+      return await this.batch.readNamespacedJob({ name, namespace: config.databaseNamespace });
+    } catch (err) {
+      if (isNotFound(err)) return undefined;
+      throw err;
+    }
   }
 
   // Missing is the ordinary case: most databases were never restored into, and
@@ -312,27 +374,35 @@ export class Provisioner {
     }
   }
 
-  async findByExternalId(externalId: string): Promise<Database | undefined> {
-    const list = await this.apps.listNamespacedStatefulSet({
+  private async listClusters(selector: string): Promise<CnpgCluster[]> {
+    const list = (await this.objects.listNamespacedCustomObject({
+      group: CNPG_GROUP,
+      version: "v1",
       namespace: config.databaseNamespace,
-      labelSelector: `${EXTERNAL_ID_LABEL}=${externalId},${MANAGED_BY_LABEL}=${MANAGED_BY_VALUE}`,
-    });
-    const found = list.items?.[0];
+      plural: CLUSTERS_PLURAL,
+      labelSelector: selector,
+    })) as { items?: CnpgCluster[] };
+    return list.items ?? [];
+  }
+
+  async findByExternalId(externalId: string): Promise<Database | undefined> {
+    const found = (
+      await this.listClusters(
+        `${EXTERNAL_ID_LABEL}=${externalId},${MANAGED_BY_LABEL}=${MANAGED_BY_VALUE}`,
+      )
+    )[0];
     return found ? await this.toDatabase(found) : undefined;
   }
 
   async get(id: string): Promise<Database> {
-    const sts = await this.statefulSetFor(id);
-    if (!sts) throw new NotFoundError(`no database with id ${id}`);
-    return this.toDatabase(sts);
+    const cluster = await this.clusterFor(id);
+    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
+    return this.toDatabase(cluster);
   }
 
   async list(): Promise<Database[]> {
-    const list = await this.apps.listNamespacedStatefulSet({
-      namespace: config.databaseNamespace,
-      labelSelector: `${MANAGED_BY_LABEL}=${MANAGED_BY_VALUE}`,
-    });
-    return Promise.all((list.items ?? []).map((s) => this.toDatabase(s)));
+    const clusters = await this.listClusters(`${MANAGED_BY_LABEL}=${MANAGED_BY_VALUE}`);
+    return Promise.all(clusters.map((c) => this.toDatabase(c)));
   }
 
   // Returns the database and its connection URI. The URI is returned here and
@@ -360,26 +430,39 @@ export class Provisioner {
       namespace: ns,
       labelSelector: `${DB_ID_LABEL}=${id}`,
     });
-    if ((leftover.items ?? []).length > 0 && !(await this.statefulSetFor(id))) {
+    if ((leftover.items ?? []).length > 0 && !(await this.clusterFor(id))) {
       throw new DeletionInFlightError(
         `a database for external_id ${externalId} is still being deleted; retry in a moment`,
       );
     }
 
-    // The StatefulSet FIRST, and it is the lock rather than merely the first
-    // step. Whichever replica creates it wins; the other is told AlreadyExists
-    // and returns the database that now exists, which is the same answer a plain
-    // retry gets. Its pod template references a Secret that does not exist yet,
-    // which is fine because it starts at zero replicas — nothing resolves a
-    // secretKeyRef until the wake below.
+    // The Secret BEFORE the Cluster, which is the one ordering CloudNativePG
+    // forces and the old data plane did not. bootstrap.initdb.secret is read
+    // during initdb, so a Cluster created first would bootstrap against a Secret
+    // that does not exist yet.
+    //
+    // Safe to write before the lock is taken, unlike the Cluster: a Secret for a
+    // database that never gets created is an orphan, not a second database. The
+    // loser of a race overwrites it with an identical-shaped Secret carrying a
+    // password nobody will ever be told, and then returns without using it.
+    await this.ensure(() =>
+      this.core.createNamespacedSecret({ namespace: ns, body: buildSecret(id, externalId, password) }),
+    );
+
+    // The Cluster is the lock, exactly as the StatefulSet was: whichever caller
+    // creates it wins, and the other is told AlreadyExists and handed the
+    // database that now exists — the same answer a plain retry gets.
     try {
-      await this.apps.createNamespacedStatefulSet({
+      await this.objects.createNamespacedCustomObject({
+        group: CNPG_GROUP,
+        version: "v1",
         namespace: ns,
-        body: buildStatefulSet(id, externalId, defaultTier()),
+        plural: CLUSTERS_PLURAL,
+        body: buildCluster(id, externalId, defaultTier()),
       });
     } catch (err) {
       if (!isAlreadyExists(err)) throw err;
-      const owner = (await this.statefulSetFor(id))?.metadata?.labels?.[EXTERNAL_ID_LABEL];
+      const owner = (await this.clusterFor(id))?.metadata?.labels?.[EXTERNAL_ID_LABEL];
       // Twelve hex characters is 48 bits, so a collision needs millions of
       // external_ids — but handing one caller another's database, credentials
       // and all, is not a failure to discover in production.
@@ -394,9 +477,10 @@ export class Provisioner {
     // Tolerating AlreadyExists on each: a create that failed partway leaves some
     // of these behind, and a retry has to be able to finish the job rather than
     // stall on the first object it already made.
-    await this.ensure(() =>
-      this.core.createNamespacedSecret({ namespace: ns, body: buildSecret(id, externalId, password) }),
-    );
+    //
+    // drigodb's own Service, not CloudNativePG's `-rw` one. Same reason the
+    // Cluster carries the same name a StatefulSet did: the connection URI is
+    // issued once and never reissued, so the hostname in it cannot move.
     await this.ensure(() =>
       this.core.createNamespacedService({ namespace: ns, body: buildService(id, externalId) }),
     );
@@ -404,17 +488,11 @@ export class Provisioner {
       this.net.createNamespacedNetworkPolicy({ namespace: ns, body: buildNetworkPolicy(id, externalId) }),
     );
 
-    // Created hibernated, then woken: provisioning and waking are the same code
-    // path, so the wake path is exercised on every single create — including
-    // its reconcile, which lands on the no-op branch because the StatefulSet
-    // was just built from the template it is about to be compared against.
-    // Before the wake, so cert-manager has the whole provisioning window to
-    // issue. The mount is optional and bootstrap.sh self-signs, so a slow
-    // issuance costs the database a certificate on its first start and not its
-    // availability — it picks the real one up on its next cycle.
-    if (serverAuthEnabled()) await this.ensureCertificate(id, externalId);
-
-    await this.wake(id);
+    // A Cluster comes up on its own — there is no hibernated-then-woken dance,
+    // because the operator starts provisioning the moment the object exists.
+    // Migrations are what the wake path used to carry, so they are run
+    // explicitly here and again on every wake.
+    await this.runMigrations(id, externalId);
 
     // After the wake, because the Job connects over TCP to a server that has to
     // be listening — and creating it earlier would only mean it crash-looped
@@ -440,13 +518,17 @@ export class Provisioner {
   // databases and never for existing ones. It is also how the plain-PostgreSQL
   // data plane reaches a database created before the migration.
   async wake(id: string): Promise<Database> {
-    const sts = await this.statefulSetFor(id);
+    const cluster = await this.clusterFor(id);
     // Read first, so waking something that does not exist is a 404 rather than
-    // a 500 from the scale subresource.
-    if (!sts) throw new NotFoundError(`no database with id ${id}`);
+    // whatever the patch below would have said.
+    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
 
-    await this.reconcile(sts);
-    return this.scale(id, 1);
+    await this.scale(id, 1);
+    // Waking is still how a change reaches an existing database, but the change
+    // is no longer a pod template: the operator owns that and rolls it itself.
+    // What is left is drigodb's own schema, so a wake re-runs the migration Job.
+    await this.runMigrations(id, cluster.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "");
+    return this.get(id);
   }
 
   // Rewrite the pod template if this build renders a different one.
@@ -526,10 +608,10 @@ export class Provisioner {
   // plane holds and can use — it already holds every credential; the point is
   // that it cannot use one from where it runs. See issue #29.
   async rotateCredentials(id: string): Promise<{ database: Database; uri: string }> {
-    const sts = await this.statefulSetFor(id);
-    if (!sts) throw new NotFoundError(`no database with id ${id}`);
+    const cluster = await this.clusterFor(id);
+    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
 
-    const externalId = sts.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "";
+    const externalId = cluster.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "";
     const password = newPassword();
 
     // The Secret first, always. The pod reads it at start, so a restart that
@@ -545,12 +627,13 @@ export class Provisioner {
     // A hibernated database has nothing to restart and nothing connected to it.
     // It picks the new password up when it next wakes, which is the first
     // moment the URI could be used anyway.
-    if ((sts.spec?.replicas ?? 0) > 0) {
-      await this.scale(id, 0);
-      await this.waitForPodsGone(id);
-      await this.wake(id);
-      await this.waitForReady(id);
-    }
+    // No restart. Under CloudNativePG the password is a managed role reconciled
+    // against this Secret continuously, so replacing the Secret IS the rotation
+    // — measured, including that the old password stops being accepted.
+    //
+    // The hibernate/wake cycle this used to perform was there because the old
+    // data plane read the Secret only at start. Dropping it removes the one
+    // operation that took a database offline to change a credential.
 
     return { database: await this.get(id), uri: connectionUri(id, password) };
   }
@@ -586,44 +669,29 @@ export class Provisioner {
   // especially right after create, where the object is being actively
   // reconciled. A 409 here is normal, not exceptional.
   async scale(id: string, replicas: number): Promise<Database> {
-    const name = statefulSetName(id);
-    const namespace = config.databaseNamespace;
-    let lastErr: unknown;
-
-    // Before the scale, in both directions, because a label that lags the
-    // replica count is a status that lies. Going down it briefly reports
-    // hibernated for a pod still running, which is where it is heading; going
-    // up it reports provisioning for a pod not yet started, which is what it
-    // is. The reverse order would report a live database as hibernated after a
-    // failure, and leave it that way.
-    //
-    // Only when it disagrees. Waking is called speculatively against databases
-    // that are already awake, and writing a label its value already has would
-    // make every one of those a write.
     const want = replicas === 0 ? "true" : "false";
-    const live = await this.statefulSetFor(id);
-    if (live && live.metadata?.labels?.[HIBERNATED_LABEL] !== want) {
-      await this.apps.patchNamespacedStatefulSet(
-        { name, namespace, body: { metadata: { labels: { [HIBERNATED_LABEL]: want } } } },
-        setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
-      );
-    }
 
-    for (let attempt = 0; attempt < 5; attempt++) {
-      try {
-        const scale = await this.apps.readNamespacedStatefulSetScale({ name, namespace });
-        scale.spec = { ...(scale.spec ?? {}), replicas };
-        await this.apps.replaceNamespacedStatefulSetScale({ name, namespace, body: scale });
-        return await this.get(id);
-      } catch (err) {
-        const code = (err as { code?: number })?.code;
-        if (code !== 409) throw err;
-        lastErr = err;
-        await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
-      }
-    }
-    throw lastErr;
+    // One patch, both fields, so the label recording the intent and the
+    // annotation acting on it can never disagree. The previous data plane needed
+    // two writes — a label patch and a scale subresource — and an ordering
+    // argument about which lies less when the second one fails.
+    await this.objects.patchNamespacedCustomObject({
+      group: CNPG_GROUP,
+      version: "v1",
+      namespace: config.databaseNamespace,
+      plural: CLUSTERS_PLURAL,
+      name: clusterName(id),
+      body: {
+        metadata: {
+          labels: { [HIBERNATED_LABEL]: want },
+          annotations: { [CNPG_HIBERNATION_ANNOTATION]: replicas === 0 ? "on" : "off" },
+        },
+      },
+    });
+
+    return await this.get(id);
   }
+
 
   // Grow a database onto a bigger tier.
   //
@@ -636,11 +704,11 @@ export class Provisioner {
   // not grown is how PostgreSQL PANICs on a full disk — and a full PVC is not a
   // quick recovery.
   async resize(id: string, target: Tier): Promise<Database> {
-    const sts = await this.statefulSetFor(id);
-    if (!sts) throw new NotFoundError(`no database with id ${id}`);
+    const cluster = await this.clusterFor(id);
+    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
 
-    const current = tierOf(sts.metadata?.labels);
-    const externalId = sts.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "";
+    const current = tierOf(cluster.metadata?.labels);
+    const externalId = cluster.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "";
     const at = TIER_ORDER.indexOf(current);
     const to = TIER_ORDER.indexOf(target);
     const ceiling = TIER_ORDER.indexOf(config.maxTier as Tier);
@@ -729,10 +797,9 @@ export class Provisioner {
     // 3. The cycle, which is what the WAL change needs and the volume does not.
     //    Skipped for a hibernated database: it will pick both up when it wakes,
     //    and waking one to change a setting it is not using would be rude.
-    if ((sts.spec?.replicas ?? 0) > 0) {
-      await this.scale(id, 0);
-      await this.wake(id);
-    }
+    // No cycle. The operator owns both halves: it expands the volume and it
+    // decides whether max_wal_size needs a restart to take effect. Doing it by
+    // hand would be racing the thing that is already doing it.
 
     return await this.get(id);
   }
@@ -774,8 +841,8 @@ export class Provisioner {
 
   async delete(id: string): Promise<void> {
     const ns = config.databaseNamespace;
-    const sts = await this.statefulSetFor(id);
-    if (!sts) throw new NotFoundError(`no database with id ${id}`);
+    const cluster = await this.clusterFor(id);
+    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
 
     const ignoreMissing = async (fn: () => Promise<unknown>) => {
       try {
@@ -870,8 +937,8 @@ export class Provisioner {
   async listBackups(id: string): Promise<BackupObject[]> {
     // 404 before 409: a database that does not exist is not a database whose
     // backups are disabled.
-    const sts = await this.statefulSetFor(id);
-    if (!sts) throw new NotFoundError(`no database with id ${id}`);
+    const cluster = await this.clusterFor(id);
+    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
     if (!backupsEnabled()) {
       throw new BackupsDisabledError("backups are not configured for this installation");
     }
