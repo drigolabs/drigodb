@@ -11,7 +11,8 @@ related:
 
 # Getting started
 
-Four ways in. Pick the row that describes you, then read only that section.
+Four ways in. Pick the row that describes you, do
+[section 0](#0-install-the-tools), then read only your section.
 
 | | you want | go to |
 |---|---|---|
@@ -23,6 +24,124 @@ Four ways in. Pick the row that describes you, then read only that section.
 All four end the same way: `scripts/smoke.sh` provisions a real database,
 connects to it over TLS, hibernates it, wakes it, and rotates its credentials.
 If that passes, drigodb works.
+
+**A takes about fifteen minutes from nothing**, including installing the tools,
+and costs nothing. If you are not sure which row you are, you are A.
+
+## 0. Install the tools
+
+Skip to [what drigodb needs from a cluster](#what-drigodb-needs-from-a-cluster)
+if you already have these. Otherwise start here — nothing below assumes anything
+is installed.
+
+| tool | A: kind | B: developing | C: remote | D: DigitalOcean |
+|---|:-:|:-:|:-:|:-:|
+| `docker` | ● | ● | | |
+| `kind` | ● | ● | | |
+| `kubectl` | ● | ● | ● | ● |
+| `helm` (3.8+) | ● | ● | ● | ● |
+| `git` | ● | ● | ● | ● |
+| `node` 22+ | | ● | | |
+| `doctl` | | | | ● |
+
+`curl` and `python3` are used by the scripts and are already present on macOS
+and on any ordinary Linux install. `jq` is optional — it only makes JSON output
+easier to read. **You do not need `psql`**: everything that speaks to a database
+does so from a pod inside the cluster, deliberately, so the connection string
+being tested is the one the API actually issued.
+
+### macOS
+
+[Homebrew](https://brew.sh) first, if you do not have it:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+Then:
+
+```bash
+brew install kubernetes-cli helm kind    # kubectl comes from kubernetes-cli
+brew install node                        # only for scenario B
+brew install doctl                       # only for scenario D
+```
+
+Docker Desktop is a `.dmg` rather than a formula — download it from
+[docker.com](https://www.docker.com/products/docker-desktop/), or
+`brew install --cask docker-desktop`. **Open it once after installing**; the
+`docker` command does nothing until the daemon is running, and "Cannot connect
+to the Docker daemon" is what that looks like.
+
+`git` and `curl` arrive with the Xcode command line tools, which macOS offers to
+install the first time you run `git`. If it does not: `xcode-select --install`.
+
+### Linux (Debian / Ubuntu)
+
+```bash
+# Docker
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker "$USER"
+```
+
+**Log out and back in after that**, or every docker command fails with
+`permission denied while trying to connect to the Docker daemon socket`. It is
+the single most common way this step appears to have failed when it worked.
+
+```bash
+# kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -Ls https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl && rm kubectl
+
+# helm
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# kind
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+sudo install -o root -g root -m 0755 kind /usr/local/bin/kind && rm kind
+
+# git, curl, python3 — almost certainly already there
+sudo apt-get update && sudo apt-get install -y git curl python3
+
+# node 22, only for scenario B
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y nodejs
+
+# doctl, only for scenario D. No snapd? Grab the tarball from
+# https://github.com/digitalocean/doctl/releases and put the binary on PATH.
+sudo snap install doctl
+```
+
+On arm64, replace `linux/amd64` with `linux/arm64` and `kind-linux-amd64` with
+`kind-linux-arm64`.
+
+### Windows
+
+Use [WSL 2](https://learn.microsoft.com/windows/wsl/install), then follow the
+Linux instructions inside it. Install Docker Desktop on Windows and enable its
+WSL 2 backend in Settings → Resources → WSL integration, rather than installing
+Docker inside WSL — the two fight over the same socket otherwise.
+
+### Give Docker enough memory
+
+A kind cluster runs a Kubernetes control plane, the CloudNativePG operator,
+drigodb, and then a PostgreSQL instance per database — all inside one container.
+**Docker Desktop → Settings → Resources → at least 4 GB of memory and 2 CPUs.**
+
+Below that, the symptom is not an error message. Pods sit `Pending` with
+`0/1 nodes are available: Insufficient memory`, or the kind node is killed
+mid-install and `kubectl` starts reporting connection refused.
+
+### Check it worked
+
+```bash
+docker info >/dev/null && echo "docker: ok"
+kind version
+kubectl version --client
+helm version --short
+```
+
+Four lines of output and no errors means you are ready. If `docker info` prints
+`Cannot connect to the Docker daemon`, the daemon is not running — start Docker
+Desktop, or `sudo systemctl start docker` on Linux.
 
 ## What drigodb needs from a cluster
 
@@ -73,8 +192,9 @@ warn you about that one.
 
 The fastest way to see drigodb work. No cloud account, nothing billed.
 
-**You need:** `docker` running, plus `kind`, `kubectl` and `helm`
-(`brew install kind kubectl helm`).
+**You need:** `docker`, `kind`, `kubectl`, `helm` and `git` — all of
+[section 0](#0-install-the-tools). Docker must be *running*, not merely
+installed.
 
 ```bash
 git clone https://github.com/drigolabs/drigodb.git
@@ -108,7 +228,17 @@ volumes are directories inside the node container.
 
 ## B. Local, developing drigodb
 
-Same cluster, but running your working tree instead of a published image.
+Everything from A, plus `node` 22 or newer. Same cluster, but running your
+working tree instead of a published image.
+
+```bash
+git clone https://github.com/drigolabs/drigodb.git
+cd drigodb
+npm install
+npm test          # 91 tests, no cluster needed — this should pass before you start
+```
+
+Then bring the cluster up on your own build:
 
 ```bash
 bash scripts/kind-up.sh --local
@@ -118,7 +248,9 @@ Builds the API from this checkout, loads it straight into the kind node, and
 deploys with `pullPolicy: Never` so the kubelet does not go looking for a tag
 that exists nowhere but inside this cluster.
 
-For a continuous loop, `tilt up` rebuilds and reloads on every save.
+For a continuous loop, install [Tilt](https://tilt.dev)
+(`brew install tilt-dev/tap/tilt`, or `curl -fsSL https://raw.githubusercontent.com/tilt-dev/tilt/master/scripts/install.sh | bash`)
+and run `tilt up`. It rebuilds and reloads on every save.
 
 The two loops want opposite things and both matter:
 `--local` is for speed, plain `kind-up.sh` is for proving the deployment path.
@@ -127,7 +259,24 @@ setup, and the four things a laptop cannot tell you.
 
 ## C. A remote cluster
 
-Any Kubernetes cluster you can already reach with `kubectl`. Two routes.
+Any Kubernetes cluster you can already reach with `kubectl`.
+
+First find out what your cluster is called and that you can actually reach it.
+`KUBE_CONTEXT` below is the **context name** from the first column — the entry
+marked `*` is the one `kubectl` uses when you do not say:
+
+```bash
+kubectl config get-contexts
+kubectl get nodes          # should list nodes, not an error
+```
+
+If that second command fails, nothing below will work. Get a kubeconfig from
+whoever runs the cluster, or from your provider — DigitalOcean is
+`doctl kubernetes cluster kubeconfig save <name>`, EKS is
+`aws eks update-kubeconfig --name <name>`, GKE is
+`gcloud container clusters get-credentials <name>`.
+
+Then pick a route.
 
 ### C1. From a clone — one command
 
@@ -191,7 +340,16 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8080/v1/databases
 
 Creates the cluster too. **Billing starts when this returns.**
 
-**You need:** `doctl`, authenticated (`doctl auth init`).
+**You need:** `kubectl`, `helm`, `git` and `doctl` from
+[section 0](#0-install-the-tools), plus a DigitalOcean account.
+
+Authenticate `doctl` first — it opens a browser and asks you to paste back a
+token:
+
+```bash
+doctl auth init
+doctl account get      # should print your account, not an error
+```
 
 ```bash
 git clone https://github.com/drigolabs/drigodb.git
@@ -200,6 +358,11 @@ bash scripts/doks-up.sh          # ~$12/month for s-1vcpu-2gb in fra1
 bash scripts/deploy.sh
 bash scripts/smoke.sh
 ```
+
+`doks-up.sh` writes the kubeconfig and switches your current context to the new
+cluster, so `deploy.sh` and `smoke.sh` need no `KUBE_CONTEXT`. Check with
+`kubectl config current-context` if you want to be sure what you are about to
+deploy to.
 
 A 1500 MiB node fits roughly **two** concurrent databases — memory binds before
 CPU. For more, `DRIGODB_DO_NODE_SIZE=s-2vcpu-4gb bash scripts/doks-up.sh`.
