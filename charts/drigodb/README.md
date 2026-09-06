@@ -4,40 +4,56 @@ PostgreSQL databases, provisioned through an API. Each one is a separate
 PostgreSQL instance with its own volume, credentials and network policy, and
 they hibernate when idle — zero compute, storage only.
 
-## Before you install: CloudNativePG
+## Getting started
 
-drigodb **requires** the [CloudNativePG](https://cloudnative-pg.io) operator on
-the cluster. A hosted database is a CNPG `Cluster`
-([decision 0004](../../docs/decisions/0004-cloudnativepg-for-the-data-plane.md)),
-so without it every provision fails.
+Two commands, and the first one is the part people skip:
 
 ```bash
+# 1. The operator drigodb provisions through.
 kubectl apply --server-side -f \
   https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.27/releases/cnpg-1.27.0.yaml
-```
 
-`scripts/cnpg-install.sh` in this repository does the same thing, pinned and
-idempotently, and leaves an operator someone else installed alone.
-
-**This chart does not install it, deliberately.** CRDs are cluster-scoped: a
-cluster already running CloudNativePG would find drigodb trying to own its CRDs,
-and Helm installs a subchart's `crds/` once and never upgrades it. Installing an
-operator is a cluster decision, not an application one — so it raises the
-permission floor for installing drigodb, and that is stated here rather than
-discovered at `helm install`.
-
-The chart cannot check for you. `lookup` is banned by
-`scripts/chart-determinism-test.sh` and `.Capabilities.APIVersions` is the same
-mistake with a friendlier name, since it answers from the renderer rather than
-the cluster. `scripts/smoke.sh` checks instead.
-
-```bash
+# 2. drigodb itself.
 helm install drigodb oci://ghcr.io/drigolabs/charts/drigodb \
-  --namespace drigodb-system --create-namespace
+  --namespace drigodb-system --create-namespace \
+  --set api.token="$(head -c 32 /dev/urandom | base64 | tr -d '=+/' | cut -c1-40)"
 ```
 
-Then read the token the chart generated, port-forward, and provision a database
-— `helm status drigodb` prints the exact commands.
+From a clone of this repository, `bash scripts/deploy.sh` does both plus the
+token, against whatever `kubectl` context is current, and is the same script the
+maintainers use on DigitalOcean.
+
+Then `helm status drigodb` prints how to read the token and provision a database.
+
+**[docs/getting-started.md](../../docs/getting-started.md)** has the complete
+step-by-step for each way in — kind, a cluster you already have, and
+DigitalOcean from nothing — plus what to check when it does not work.
+
+## Why the chart does not install CloudNativePG
+
+CRDs are cluster-scoped. A cluster already running CloudNativePG for something
+else would find drigodb trying to own its CRDs, and Helm installs a subchart's
+`crds/` directory once and never upgrades it — so the CRD would freeze at
+whatever version got there first. Installing an operator is a cluster decision,
+not an application one.
+
+The honest consequence: **installing drigodb needs permission to install CRDs**,
+which is a higher bar than installing an ordinary application. Better said here
+than discovered at `helm install`.
+
+`scripts/cnpg-install.sh` does step 1 pinned and idempotently, and leaves an
+operator somebody else installed completely alone.
+
+**Skipping step 1 currently fails silently.** Helm reports success, the
+Deployment goes Ready, and the Role grants rights over an API group that does not
+exist — Kubernetes permits that without complaint. The chart cannot check for
+you: `lookup` is banned by `scripts/chart-determinism-test.sh`, and
+`.Capabilities.APIVersions` is the same mistake with a friendlier name, since it
+answers from the renderer rather than the cluster. `scripts/smoke.sh` checks
+against a live cluster, and
+[#80](https://github.com/drigolabs/drigodb/issues/80) makes the API report itself
+unready when the operator it provisions through is missing.
+
 
 ## What it installs
 

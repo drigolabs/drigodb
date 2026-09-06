@@ -10,6 +10,10 @@ related:
 
 # Running drigodb on a laptop
 
+For the step-by-step, including every other way to install drigodb, start at
+[getting-started.md](getting-started.md). This page is the *why* behind the
+local path: which loop to use, and the four things a laptop cannot tell you.
+
 ```bash
 bash scripts/kind-up.sh
 KUBE_CONTEXT=kind-drigodb bash scripts/smoke.sh

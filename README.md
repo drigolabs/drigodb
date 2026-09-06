@@ -88,6 +88,9 @@ a hosted database is a CNPG `Cluster`, per
 `scripts/deploy.sh` installs it; `scripts/cnpg-install.sh` does it on its own,
 pinned, and leaves one somebody else installed alone.
 
+**New here? [docs/getting-started.md](docs/getting-started.md)** — kind on a
+laptop, a cluster you already have, or DigitalOcean from nothing, step by step.
+
 **Building an application against drigodb?** [docs/consuming-drigodb.md](docs/consuming-drigodb.md)
 documents the pod-side contract — the half that is not HTTP. It leads with the
 `drigodb.io/allow-database` label, because forgetting it produces a connection that hangs with no
