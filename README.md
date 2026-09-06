@@ -55,6 +55,16 @@ The network layer is deliberately trusted least. It fails open if its selector s
 `kubectl port-forward` bypasses it entirely, and a CNI that does not implement NetworkPolicy makes it a
 silent no-op. The other two hold without it.
 
+**All three protect data. None protects the control plane, and that is a real gap.** There is one API
+token per installation and every holder of it can enumerate, rotate and destroy *every* database, not
+only their own. drigodb is carefully multi-tenant at the data plane and single-tenant at the control
+plane.
+
+That is fine while the operator and the consumer are the same party. It is not fine for two consumers
+sharing an installation, so do not do that yet. The missing fourth layer is
+[#72](https://github.com/drigolabs/drigodb/issues/72) — a database belonging to the token that created
+it — on top of [#62](https://github.com/drigolabs/drigodb/issues/62).
+
 ## API
 
 ```

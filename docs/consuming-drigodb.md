@@ -170,7 +170,10 @@ spec:
 - **No connection pooling.** One PostgreSQL instance per database, `max_connections` at the server default. Pool in your application.
 - **No schema management.** `_drigodb` is drigodb's; `public` is yours.
 - **No automatic hibernation.** Nothing decides your database is idle.
-- **No accounts or quotas.** One token per installation, and every holder can do everything.
+- **No accounts or quotas.** One token per installation, and every holder can do everything —
+  including to databases they did not create. If you are not also the operator, you are trusting
+  everyone else who holds that token. See
+  [#72](https://github.com/drigolabs/drigodb/issues/72).
 
 ## When something is wrong
 
