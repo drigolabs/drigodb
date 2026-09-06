@@ -41,6 +41,41 @@ export const ALLOW_LABEL = "drigodb.io/allow-database";
 // would change the hash it records, and every wake would roll the pod forever.
 export const TEMPLATE_HASH_ANNOTATION = "drigodb.io/template-hash";
 
+// Which tier a database is on. On the StatefulSet, because the live PVC is the
+// truth and reading a PVC to answer "how big is this database" is a second API
+// call for something a label already knows.
+//
+// A StatefulSet's volumeClaimTemplates is immutable, so after a resize the
+// template permanently disagrees with the PVC. That is not drift to reconcile,
+// it is Kubernetes — and the label is how the API reports size without anyone
+// having to know that.
+export const TIER_LABEL = "drigodb.io/tier";
+
+// A tier is a floor, not a quota. Nothing stops a database filling its volume.
+//
+// max_wal_size scales with the tier for performance rather than correctness: it
+// is a checkpoint trigger, not a cap on database size. A 20Gi database runs
+// correctly at 256MB, it simply checkpoints more often than it needs to.
+export const TIERS = {
+  small: { storage: "1Gi", maxWalSize: "256MB" },
+  medium: { storage: "5Gi", maxWalSize: "1GB" },
+  large: { storage: "20Gi", maxWalSize: "2GB" },
+} as const;
+
+export type Tier = keyof typeof TIERS;
+export const TIER_ORDER: Tier[] = ["small", "medium", "large"];
+
+// Databases provisioned before tiers existed carry no label. They are small:
+// that is what they were given, and it is what their PVC still says.
+export function tierOf(labels: Record<string, string> | undefined): Tier {
+  const t = labels?.[TIER_LABEL];
+  return t && t in TIERS ? (t as Tier) : "small";
+}
+
+export function pvcName(id: string): string {
+  return `${DATA_VOLUME}-${statefulSetName(id)}-0`;
+}
+
 export const CONFIG_MAP_NAME = "drigodb-config";
 export const CONFIG_MOUNT_PATH = "/drigodb-config";
 
@@ -169,7 +204,11 @@ export function buildSecret(id: string, externalId: string, password: string): V
 // reconciles exactly this — it is the only part of a StatefulSet's spec that is
 // mutable in a way that matters here, and the only part that carries the
 // data-plane images.
-export function buildPodTemplate(id: string, externalId: string): V1PodTemplateSpec {
+export function buildPodTemplate(
+  id: string,
+  externalId: string,
+  tier: Tier = "small",
+): V1PodTemplateSpec {
   const labels = labelsFor(id, externalId);
   return {
     metadata: { labels },
@@ -199,6 +238,11 @@ export function buildPodTemplate(id: string, externalId: string): V1PodTemplateS
             { name: "APP_DB_USER", value: DB_USER },
             { name: "APP_DB_CONF_DIR", value: CONFIG_MOUNT_PATH },
             { name: "APP_DB_MIGRATIONS_DIR", value: MIGRATIONS_MOUNT_PATH },
+            // Per-database, so it cannot come from drigodb-config — that is one
+            // ConfigMap mounted by every database. bootstrap.sh writes it into
+            // an include file inside PGDATA, ordered after the mounted config so
+            // it wins.
+            { name: "DRIGODB_MAX_WAL_SIZE", value: TIERS[tier].maxWalSize },
             {
               name: "APP_DB_PASSWORD",
               valueFrom: {
@@ -392,8 +436,11 @@ export function buildRestoreJob(
 // Keys are sorted before hashing so the fingerprint tracks content rather than
 // the order this file happens to declare things in. Reordering a field here
 // would otherwise roll every database in the fleet for no reason.
-export function templateHash(id: string, externalId: string): string {
-  return createHash("sha256").update(canonical(buildPodTemplate(id, externalId))).digest("hex").slice(0, 16);
+export function templateHash(id: string, externalId: string, tier: Tier = "small"): string {
+  return createHash("sha256")
+    .update(canonical(buildPodTemplate(id, externalId, tier)))
+    .digest("hex")
+    .slice(0, 16);
 }
 
 function canonical(value: unknown): string {
@@ -405,8 +452,8 @@ function canonical(value: unknown): string {
   return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
 }
 
-export function buildStatefulSet(id: string, externalId: string): V1StatefulSet {
-  const labels = labelsFor(id, externalId);
+export function buildStatefulSet(id: string, externalId: string, tier: Tier = "small"): V1StatefulSet {
+  const labels = { ...labelsFor(id, externalId), [TIER_LABEL]: tier };
   return {
     apiVersion: "apps/v1",
     kind: "StatefulSet",
@@ -416,7 +463,7 @@ export function buildStatefulSet(id: string, externalId: string): V1StatefulSet 
       labels,
       // Stamped at birth so a database created by this build is already
       // current, and its first wake reconciles nothing.
-      annotations: { [TEMPLATE_HASH_ANNOTATION]: templateHash(id, externalId) },
+      annotations: { [TEMPLATE_HASH_ANNOTATION]: templateHash(id, externalId, tier) },
     },
     spec: {
       serviceName: serviceName(id),
@@ -425,7 +472,7 @@ export function buildStatefulSet(id: string, externalId: string): V1StatefulSet 
       selector: { matchLabels: { [DB_ID_LABEL]: id } },
       // Stated explicitly: the alternative silently deletes a customer's data.
       persistentVolumeClaimRetentionPolicy: { whenScaled: "Retain", whenDeleted: "Retain" },
-      template: buildPodTemplate(id, externalId),
+      template: buildPodTemplate(id, externalId, tier),
       volumeClaimTemplates: [
         {
           metadata: { name: DATA_VOLUME, labels },
@@ -438,7 +485,10 @@ export function buildStatefulSet(id: string, externalId: string): V1StatefulSet 
             // EKS and GKE each have their own default, and drigodb should not
             // need to know which.
             ...(config.storageClass ? { storageClassName: config.storageClass } : {}),
-            resources: { requests: { storage: config.storageSize } },
+            // The tier's size at creation. Immutable afterwards, which is why
+            // a resize patches the PVC directly and this permanently disagrees
+            // with it. The PVC is the truth.
+            resources: { requests: { storage: TIERS[tier].storage } },
           },
         },
       ],

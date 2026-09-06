@@ -30,10 +30,24 @@ which is what makes this work on kind, EKS and GKE without being told which. Set
 it only if the cluster has no default, or the default is the wrong one.
 DigitalOcean is `do-block-storage`; kind is `standard`.
 
-**`database.storageSize`** — 1Gi, deliberately small. A PVC can be expanded in
-place and can never be shrunk, and a StatefulSet's `volumeClaimTemplates` is
-immutable, so this is permanent for every database created under it. Too small
-is a patch; too large is forever.
+**`database.defaultTier` and `database.maxTier`** — which tier a database is
+created on, and how far its owner may grow it.
+
+| tier | volume | `max_wal_size` | ~rows |
+|---|---|---|---|
+| small | 1Gi | 256MB | ~2 M |
+| medium | 5Gi | 1GB | ~11 M |
+| large | 20Gi | 2GB | ~50 M |
+
+A volume can be expanded in place and can never be shrunk, so a tier only ever
+goes up. `maxTier` is the approval: `POST /v1/databases/{id}/resize` is granted
+automatically as long as it stays within it, and nothing grows a database on its
+own.
+
+Growing needs a StorageClass with `allowVolumeExpansion: true`. kind's
+`local-path` does not have it, so resize is one of the things a laptop cannot
+test — the API returns a `409` saying exactly that rather than failing
+obscurely.
 
 **`api.existingSecret` or `api.token`** — one is required, and the chart will not
 invent a credential.

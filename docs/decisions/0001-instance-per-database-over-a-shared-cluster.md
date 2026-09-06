@@ -90,7 +90,7 @@ tracks concurrent ones.
 ## Consequences
 
 - Provisioning stays ~12s and wake stays ~8s; sub-second provisioning is not available.
-- Storage stays the dominant cost per idle database. `DRIGODB_STORAGE_SIZE` stays at 1Gi, deliberately
+- Storage stays the dominant cost per idle database. The default tier stays at 1Gi, deliberately
   at the small end: a PVC can be expanded in place and never shrunk, and a StatefulSet's
   `volumeClaimTemplates` is immutable, so the default is permanent for every database created under it.
 - Removing the gateway returns its 50m CPU and 32Mi memory request per pod, which is a direct density

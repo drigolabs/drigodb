@@ -64,6 +64,7 @@ GET    /v1/databases/{id}       status and endpoint
 POST   /v1/databases/{id}/wake       → 202
 POST   /v1/databases/{id}/hibernate  → 202
 POST   /v1/databases/{id}/credentials  → 200 + a new connection_uri
+POST   /v1/databases/{id}/resize      { tier }  → 202
 GET    /v1/databases/{id}/backups      what can be restored
 DELETE /v1/databases/{id}       destroys the data
 ```
@@ -387,8 +388,22 @@ stored.
 **Volume expansion is online.** Patching a PVC from 1Gi to 2Gi grew the filesystem from 974M to 2.0G
 with the database still running, no restart, and no `FileSystemResizePending` condition — so a resize
 is invisible to a tenant rather than costing them a pod cycle. That settles the open question in
-[docs/storage-tiers.md](docs/storage-tiers.md) and removes a required step from
-[#10](https://github.com/drigolabs/drigodb/issues/10).
+[docs/storage-tiers.md](docs/storage-tiers.md), and it is why a resize costs a tenant nothing for the
+volume itself.
+
+**Growing a database is expansion in place, not a migration.** `POST /v1/databases/{id}/resize` takes a
+tier — `small` 1Gi, `medium` 5Gi, `large` 20Gi — grows the volume, raises `max_wal_size` to match, and
+cycles the pod once. Volumes never shrink, so a tier only goes up, and `DRIGODB_MAX_TIER` is the ceiling
+an owner is granted automatically within.
+
+The volume grows **before** the WAL ceiling rises, and that order is load-bearing rather than tidy:
+raising `max_wal_size` on a volume that has not grown is how PostgreSQL fills its disk, and a full disk
+is a PANIC rather than a slowdown. There is no transaction across the two, so the order is also what
+makes a partial failure survivable — it leaves a larger volume running the old ceiling, which is merely
+wasteful.
+
+Growing needs a StorageClass with `allowVolumeExpansion: true`. Without one the API returns a `409`
+saying so, which is what a laptop gets: kind's `local-path` cannot expand.
 
 ### How many databases fit on a node
 

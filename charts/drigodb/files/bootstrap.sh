@@ -27,8 +27,31 @@ CRED_MARKER="${PGDATA}/.drigodb-credential"
 # A restored volume or a hand-edited file would desync this marker, and the
 # ledger is what stops that from mattering.
 MIG_MARKER="${PGDATA}/.drigodb-migrations"
+# Per-database settings, which cannot come from the mounted config: drigodb-config
+# is one ConfigMap that every database mounts, so it cannot carry a per-tier
+# max_wal_size. Written here and included AFTER the mounted file, so it wins.
+TIER_CONF="${PGDATA}/drigodb-tier.conf"
 
 log() { printf '[bootstrap] %s\n' "$1"; }
+
+# Rewritten on every start, so a resize takes effect on the cycle that follows
+# it. Cheap enough to do unconditionally — it is two lines and a compare.
+write_tier_conf() {
+  [ -n "${DRIGODB_MAX_WAL_SIZE:-}" ] || return 0
+  printf '# Written by bootstrap.sh from DRIGODB_MAX_WAL_SIZE. Per-database, so\n' > "${TIER_CONF}"
+  printf '# it cannot live in the ConfigMap every database shares.\n' >> "${TIER_CONF}"
+  printf 'max_wal_size = %s\n' "${DRIGODB_MAX_WAL_SIZE}" >> "${TIER_CONF}"
+  chmod 0600 "${TIER_CONF}"
+}
+
+# Idempotent, and needed on the RESTART path as well as at init: every database
+# created before tiers existed has a PGDATA whose postgresql.conf includes the
+# mounted config and nothing else.
+ensure_tier_include() {
+  grep -qF "include = 'drigodb-tier.conf'" "${PGDATA}/postgresql.conf" 2>/dev/null && return 0
+  printf "\ninclude = 'drigodb-tier.conf'\n" >> "${PGDATA}/postgresql.conf"
+  log "added the per-database config include"
+}
 
 credential_fingerprint() { printf '%s' "${APP_DB_PASSWORD:-}" | sha256sum | cut -d' ' -f1; }
 
@@ -127,6 +150,10 @@ if [ ! -s "${PGDATA}/PG_VERSION" ]; then
   # Include rather than append, so a change to the mounted config takes effect
   # on the next restart instead of being frozen into PGDATA at init time.
   printf "\ninclude = '%s/postgresql.conf'\n" "${CONF_SRC}" >> "${PGDATA}/postgresql.conf"
+  # ORDER MATTERS. Last include wins, so the per-database file must come after
+  # the shared one or the tier's max_wal_size is silently overridden by it.
+  write_tier_conf
+  ensure_tier_include
 
   cp "${CONF_SRC}/pg_hba.conf" "${PGDATA}/"
   chmod 0600 "${PGDATA}/pg_hba.conf"
@@ -171,6 +198,12 @@ else
   log "existing cluster, refreshing auth files"
   cp "${CONF_SRC}/pg_hba.conf" "${PGDATA}/"
   chmod 0600 "${PGDATA}/pg_hba.conf"
+
+  # A resize changes DRIGODB_MAX_WAL_SIZE on the pod template and then cycles the
+  # pod; this is where the new value lands. The include is ensured here too,
+  # because a database created before tiers existed has never had one.
+  write_tier_conf
+  ensure_tier_include
 
   # Both of these need a running server, and an ordinary wake needs neither.
   # Deciding first, then starting once, is what keeps a wake at the cost of an

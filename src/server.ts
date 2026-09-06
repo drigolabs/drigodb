@@ -32,7 +32,8 @@ function main(): void {
     console.log(`[drigodb] listening on :${info.port}`);
     console.log(`[drigodb] provisioning into namespace ${config.databaseNamespace}`);
     console.log(`[drigodb] postgres image ${config.pgImage}`);
-    console.log(`[drigodb] storage class  ${config.storageClass} @ ${config.storageSize}`);
+    console.log(`[drigodb] storage class  ${config.storageClass || "cluster default"}`);
+    console.log(`[drigodb] tiers         default ${config.defaultTier}, up to ${config.maxTier}`);
   });
 }
 
