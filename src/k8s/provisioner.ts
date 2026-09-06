@@ -44,6 +44,7 @@ import {
   buildRestoreJob,
   buildCluster,
   buildMigrationJob,
+  buildMigratorSecret,
   buildSecret,
   buildService,
   buildStatefulSet,
@@ -57,6 +58,7 @@ import {
   serviceName,
   clusterName,
   migrationJobName,
+  migratorSecretName,
   statefulSetName,
   templateHash,
 } from "./manifests.js";
@@ -282,7 +284,15 @@ export class Provisioner {
     // status exists. It is also why no URI is issued for one — see create().
     const migration = await this.jobFor(migrationJobName(id));
     if (migration) {
-      if ((migration.status?.failed ?? 0) > 0) return "failed";
+      // The Job's own verdict, not its failed-pod count. A Job with a
+      // backoffLimit has failed pods on the way to succeeding — the migration
+      // runner's first attempt routinely fails because it starts before the
+      // server is accepting connections — and reading the count would mark a
+      // database permanently `failed` for a retry that then worked.
+      const givenUp = (migration.status?.conditions ?? []).some(
+        (c) => c.type === "Failed" && c.status === "True",
+      );
+      if (givenUp) return "failed";
       if ((migration.status?.succeeded ?? 0) === 0) return ready > 0 ? "migrating" : "provisioning";
     }
 
@@ -447,6 +457,15 @@ export class Provisioner {
     // password nobody will ever be told, and then returns without using it.
     await this.ensure(() =>
       this.core.createNamespacedSecret({ namespace: ns, body: buildSecret(id, externalId, password) }),
+    );
+    // The migration runner's own credential, never issued to anyone. Written
+    // here for the same reason as the one above: managed.roles reconciles the
+    // role against it, so it has to exist before the Cluster does.
+    await this.ensure(() =>
+      this.core.createNamespacedSecret({
+        namespace: ns,
+        body: buildMigratorSecret(id, externalId, newPassword()),
+      }),
     );
 
     // The Cluster is the lock, exactly as the StatefulSet was: whichever caller
@@ -853,13 +872,26 @@ export class Provisioner {
     };
 
     await ignoreMissing(() =>
-      this.apps.deleteNamespacedStatefulSet({ name: statefulSetName(id), namespace: ns }),
+      this.objects.deleteNamespacedCustomObject({
+        group: CNPG_GROUP,
+        version: "v1",
+        namespace: ns,
+        plural: CLUSTERS_PLURAL,
+        name: clusterName(id),
+      }),
     );
     await ignoreMissing(() => this.core.deleteNamespacedService({ name: serviceName(id), namespace: ns }));
     await ignoreMissing(() =>
       this.net.deleteNamespacedNetworkPolicy({ name: statefulSetName(id), namespace: ns }),
     );
     await ignoreMissing(() => this.core.deleteNamespacedSecret({ name: secretName(id), namespace: ns }));
+    // The migrator's credential too. Left behind, it would be a live password
+    // for a role in a database that no longer exists — and then get adopted by
+    // the next database to take this id, since ids are derived from external_id
+    // and therefore reused.
+    await ignoreMissing(() =>
+      this.core.deleteNamespacedSecret({ name: migratorSecretName(id), namespace: ns }),
+    );
     // A failed restore Job outlives its TTL on purpose, so DELETE is what
     // finally removes it — along with the pod holding its logs.
     if (serverAuthEnabled()) {

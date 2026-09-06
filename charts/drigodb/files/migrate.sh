@@ -11,17 +11,25 @@
 # applied is frozen. Editing one would leave every database that already ran it
 # describing a schema it no longer has.
 #
-# WHAT CHANGED, and it is a real weakening: bootstrap.sh ran as `postgres` over
-# a Unix socket, so `_drigodb` was owned by a superuser and the application role
-# could read the ledger but not write it — which stopped an application from
-# convincing this runner that a migration it never ran had already been applied.
-# This runs as the application role, so it owns the ledger and can forge it.
+# Runs as drigodb_migrator, NOT as the application role, and that is the whole
+# reason a third role exists.
 #
-# The alternative was worse: reaching postgres means enabling CNPG's superuser
-# access, which puts a superuser password in a Secret in the database namespace.
-# That is a larger prize than the one it protects, and the protection was already
-# thin — the application owns its whole database and can DROP SCHEMA _drigodb
-# outright whether or not it can write to the ledger.
+# bootstrap.sh ran as postgres over a Unix socket, so _drigodb was owned by a
+# superuser: the application could read the ledger and not write it. Over TCP the
+# runner has to be somebody, and the two obvious candidates were both wrong.
+#
+# As the application: it would own its own ledger. Dropping the schema is loud
+# and self-correcting — the next run finds nothing applied and re-runs
+# everything — but forging a row is silent, and it lets a tenant DECLINE a
+# migration aimed at them, including one that tightens a permission.
+#
+# As postgres: CNPG superuser access puts a superuser password in the database
+# namespace beside every application password, and PostgreSQL superuser includes
+# COPY TO PROGRAM. That trades a ledger integrity problem for code execution in
+# every database pod.
+#
+# So: a role that owns _drigodb, holds CREATE on the database and nothing else,
+# and whose credential appears in no connection URI.
 set -euo pipefail
 
 MIGRATIONS_DIR="${MIGRATIONS_DIR:-/drigodb-migrations}"
@@ -34,11 +42,23 @@ psql_app() { psql -v ON_ERROR_STOP=1 -q "$@"; }
 
 [ -d "${MIGRATIONS_DIR}" ] || { log "no migrations directory at ${MIGRATIONS_DIR}; nothing to do"; exit 0; }
 
-# The database may report ready a moment before it accepts connections, and a
-# Job that fails on the first attempt costs a backoff rather than a retry.
-for attempt in $(seq 1 30); do
-  psql -tAc 'select 1' >/dev/null 2>&1 && break
-  [ "$attempt" = "30" ] && { log "FATAL: could not connect after 30 attempts"; exit 1; }
+# This starts as soon as the Cluster object exists, which is well before the
+# server is up: initdb runs, then the operator reconciles the managed roles that
+# set this password. Three minutes covers both with room, and the Job's
+# backoffLimit covers anything longer.
+#
+# The last error is kept and printed on giving up. The first version of this loop
+# discarded it and reported only "could not connect", which turned an
+# authentication failure, a missing role and an unroutable Service into one
+# indistinguishable message — and the Service really was unroutable.
+last_error=""
+for attempt in $(seq 1 90); do
+  if last_error="$(psql -tAc 'select 1' 2>&1)"; then break; fi
+  if [ "$attempt" = "90" ]; then
+    log "FATAL: could not connect after 90 attempts over 3 minutes"
+    log "last error: ${last_error}"
+    exit 1
+  fi
   sleep 2
 done
 
@@ -80,5 +100,17 @@ for f in $(cd "${MIGRATIONS_DIR}" && LC_ALL=C ls -1 ./*.sql 2>/dev/null | sed 's
   } | psql_app -1 -v mig_file="${f}" -v mig_sha="${file_sha}" -f -
   applied=$((applied + 1))
 done
+
+# Role wiring, not schema: the application role's NAME is a deployment parameter,
+# so it cannot live in a migration file that has no way to know it.
+#
+# The application may read what version its database is at. It may not write the
+# ledger — a role that could would be able to convince this runner that a
+# migration it never ran had already been applied, which is the property the
+# separate migrator role exists to keep.
+psql_app -v role="${APP_USER}" -f - <<'SQL'
+GRANT USAGE ON SCHEMA _drigodb TO :"role";
+GRANT SELECT ON _drigodb.schema_migrations TO :"role";
+SQL
 
 log "migrations up to date at $(psql -tAc 'SELECT _drigodb.version()') (${applied} applied this run)"

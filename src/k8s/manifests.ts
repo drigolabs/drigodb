@@ -162,6 +162,28 @@ export const BACKUP_KEY_SECRET_KEY = "access_key";
 export const BACKUP_SECRET_SECRET_KEY = "secret_key";
 
 export const DB_USER = "appuser";
+
+// The role that owns _drigodb and applies migrations. Separate from the
+// application, and that separation is the whole point.
+//
+// bootstrap.sh ran as postgres over a Unix socket, so the migration ledger was
+// owned by a superuser and the application could read it but not write it —
+// which stopped an application from claiming a migration had already run when it
+// had not. Under CloudNativePG there is no entrypoint of ours to run as
+// postgres, so the runner authenticates over TCP like anything else.
+//
+// Running it as the application would have handed the application ownership of
+// its own ledger. That is not merely untidy: dropping the schema is loud and
+// self-correcting, but forging a row is silent and lets a tenant DECLINE a
+// migration aimed at them — including one that tightens a permission.
+//
+// Running it as postgres would have meant enabling CNPG superuser access, which
+// puts a superuser password in the database namespace beside every application
+// password. PostgreSQL superuser is COPY TO PROGRAM, so that trades a ledger
+// integrity problem for code execution in every database pod.
+//
+// A third role costs one credential and neither of those.
+export const MIGRATOR_USER = "drigodb_migrator";
 export const DB_NAME = "app";
 export const PASSWORD_SECRET_KEY = "password";
 
@@ -198,6 +220,10 @@ export function serviceName(id: string): string {
 
 export function secretName(id: string): string {
   return `db-${id}-credentials`;
+}
+
+export function migratorSecretName(id: string): string {
+  return `db-${id}-migrator`;
 }
 
 export function restoreJobName(id: string): string {
@@ -673,6 +699,24 @@ export function buildCluster(id: string, externalId: string, tier: Tier = "small
         initdb: {
           database: DB_NAME,
           owner: DB_USER,
+          // Creates the migration role and gives it the one privilege it needs:
+          // CREATE on the database, so it can own _drigodb. Its password is set
+          // by managed.roles below, which reconciles after bootstrap.
+          //
+          // These run as postgres in the application database — verified, not
+          // assumed; CNPG logs the user it used and it is not the owner.
+          //
+          // Dollar-quoted with a TAG. Plain `$$` arrives here as a single `$`
+          // and fails to parse, which is the same mangling that stopped
+          // migrations from being carried this way at all. A tag survives it.
+          postInitApplicationSQL: [
+            `DO $mig$ BEGIN
+               IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${MIGRATOR_USER}') THEN
+                 CREATE ROLE ${MIGRATOR_USER} LOGIN;
+               END IF;
+             END $mig$`,
+            `GRANT CREATE ON DATABASE ${DB_NAME} TO ${MIGRATOR_USER}`,
+          ],
           // drigodb's own credential, not one CNPG invents. The URI is issued
           // from this Secret, so the server has to be created with it.
           //
@@ -697,6 +741,16 @@ export function buildCluster(id: string, externalId: string, tier: Tier = "small
             name: DB_USER,
             login: true,
             passwordSecret: { name: secretName(id) },
+          },
+          // Declared as well as created above: bootstrap makes the role exist,
+          // this is what gives it a password and keeps it in step with the
+          // Secret. Neither alone is enough — a role with no password cannot log
+          // in, and a declared role that does not exist yet cannot be granted to
+          // at bootstrap.
+          {
+            name: MIGRATOR_USER,
+            login: true,
+            passwordSecret: { name: migratorSecretName(id) },
           },
         ],
       },
@@ -740,12 +794,16 @@ export function buildMigrationJob(id: string, externalId: string): V1Job {
                 { name: "PGHOST", value: endpointHost(id) },
                 { name: "PGPORT", value: String(POSTGRES_PORT) },
                 { name: "PGDATABASE", value: DB_NAME },
-                { name: "PGUSER", value: DB_USER },
+                { name: "PGUSER", value: MIGRATOR_USER },
+                // Who to hand read access to once the ledger exists. The runner
+                // owns _drigodb; the application gets USAGE and SELECT and
+                // nothing more, which is what it had before this moved.
+                { name: "APP_USER", value: DB_USER },
                 { name: "PGSSLMODE", value: "require" },
                 {
                   name: "PGPASSWORD",
                   valueFrom: {
-                    secretKeyRef: { name: secretName(id), key: PASSWORD_SECRET_KEY },
+                    secretKeyRef: { name: migratorSecretName(id), key: PASSWORD_SECRET_KEY },
                   },
                 },
                 { name: "MIGRATIONS_DIR", value: MIGRATIONS_MOUNT_PATH },
@@ -764,6 +822,22 @@ export function buildMigrationJob(id: string, externalId: string): V1Job {
         },
       },
     },
+  };
+}
+
+// The migration runner's credential. Never leaves drigodb: it is not in any
+// connection URI and no consumer is told it exists.
+export function buildMigratorSecret(id: string, externalId: string, password: string): V1Secret {
+  return {
+    apiVersion: "v1",
+    kind: "Secret",
+    metadata: {
+      name: migratorSecretName(id),
+      namespace: config.databaseNamespace,
+      labels: labelsFor(id, externalId),
+    },
+    type: "kubernetes.io/basic-auth",
+    stringData: { [USERNAME_SECRET_KEY]: MIGRATOR_USER, [PASSWORD_SECRET_KEY]: password },
   };
 }
 
@@ -797,7 +871,16 @@ export function buildService(id: string, externalId: string): V1Service {
         {
           name: POSTGRES_PORT_NAME,
           port: POSTGRES_PORT,
-          targetPort: POSTGRES_PORT_NAME,
+          // The NUMBER, not the name. drigodb used to own the pod template and
+          // could rely on the port being called what it called it; CloudNativePG
+          // owns it now and calls it `postgresql`. A named targetPort that does
+          // not resolve produces no endpoints at all, so every connection to a
+          // database hangs until TCP gives up — the same symptom as a
+          // NetworkPolicy drop, and just as silent.
+          //
+          // CNPG's own -rw Service targets the number for the same reason: a
+          // port name is somebody else's contract, and a number is not.
+          targetPort: POSTGRES_PORT,
           protocol: "TCP",
         },
       ],
