@@ -1,10 +1,13 @@
 # What must be true before anything merges.
 #
-# Nothing here pushes an image or touches a cluster — it only proves the three
-# images build and that the two whose failure modes are silent actually work.
-# Building the postgres image says the package installed; it does not say the
-# extension loads. The smoke and integration tests are what say that, and they
-# are the reason this workflow is slower than a typecheck-and-test job.
+# Three jobs, and branch protection requires all three by exact name. Renaming
+# one blocks every pull request on a check that never reports, so a rename is a
+# coordinated change: update the protection rule first, then merge.
+#
+# The slow one stands a real cluster up and provisions a database on it. That is
+# deliberate — everything cheaper than that passed while hibernation silently did
+# nothing, credential rotation left the old password working, and a Service with
+# an unresolvable port name hung every connection.
 name: ci
 
 on:
@@ -34,6 +37,11 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      # No cluster, a second to run, and it is what stops a template reaching for
+      # a cluster or a clock again. The last one rotated every consumer's bearer
+      # token on every Argo sync while reporting Synced.
+      - name: The chart renders the same bytes every time
+        run: bash scripts/chart-determinism-test.sh
 
   # The only job that proves drigodb actually provisions a database. The others
   # prove the images build, the units pass, the chart renders deterministically,
@@ -161,26 +169,3 @@ jobs:
           push: false
           cache-from: type=gha,scope=api-amd64
           cache-to: type=gha,mode=max,scope=api-amd64
-
-  # Name kept exactly as it is: branch protection on main requires the check
-  # "data-plane images work". Renaming it needs the protection rule updated in
-  # the same breath, or every pull request blocks on a check that never reports.
-  data-plane-images:
-    name: data-plane images work
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Read the pinned upstream versions
-        # grep, not cat: $GITHUB_ENV rejects any line that is not NAME=value,
-        # and versions.env is commented.
-        run: grep -E '^[A-Z_]+=' images/versions.env >> "$GITHUB_ENV"
-
-
-      # No cluster, a second to run, and it is what stops a template reaching for
-      # a cluster or a clock again. The last one rotated every consumer's bearer
-      # token on every Argo sync while reporting Synced.
-      - name: The chart renders the same bytes every time
-        run: bash scripts/chart-determinism-test.sh
-
