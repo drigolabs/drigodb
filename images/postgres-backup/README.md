@@ -76,13 +76,21 @@ this repo replaces the generated file outright, which is why it must be restated
 |---|---|
 | `once` | one backup, then exit |
 | `run` | back up whenever one is due, forever |
+| `list` | print every object key, oldest first |
 | `latest` | print the newest object key, if any |
-| `restore KEY` | unpack a backup into an empty `PGDATA` |
+| `restore KEY` | load a dump into the app database, over the local socket |
+| `restore-remote` | load `DRIGODB_RESTORE_SOURCE` over TCP, once — how a database is provisioned from a backup |
 
-`restore` refuses a `PGDATA` that already holds a cluster. A physical restore
-replaces a data directory rather than loading into a running server, so the
-target is always a fresh instance — which the architecture forces anyway, since
-`pg_cron` binds to one database per cluster.
+**Both restores refuse a database that already holds tables.** A logical restore
+loads into a running server rather than replacing a data directory, so unlike the
+physical one it does not need an empty instance — but it also does not replace
+what is there. Loading a dump over a populated database leaves a mixture of both,
+which is worse than either.
+
+`restore` overrides with `DRIGODB_RESTORE_FORCE=1`. `restore-remote` skips
+instead of failing, because Kubernetes retries a Job and a restore that already
+succeeded must not make the next attempt look like a failure, nor load a second
+copy over the first.
 
 ## Configuration
 
@@ -93,6 +101,8 @@ target is always a fresh instance — which the architecture forces anyway, sinc
 | `DRIGODB_BACKUP_ENDPOINT` | `https://fra1.digitaloceanspaces.com`, or a MinIO URL |
 | `DRIGODB_BACKUP_KEY` / `_SECRET` | credentials |
 | `DRIGODB_BACKUP_INTERVAL` | seconds between backups, default 86400 |
+| `DRIGODB_RESTORE_SOURCE` | `<database-id>/<key>` to restore from (`restore-remote`) |
+| `DRIGODB_RESTORE_FORCE` | `1` to load into a non-empty database (`restore`) |
 
 `rclone` is configured entirely from the environment, so no credential is
 written to disk. `force_path_style` is set, which MinIO needs and Spaces
