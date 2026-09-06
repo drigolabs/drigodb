@@ -192,27 +192,47 @@ step "Is the network policy actually enforced?"
 # policies and enforces nothing, with no error anywhere. Every other assertion in
 # this script passes identically either way, which is exactly why this one exists.
 #
-# The same pod, with the label removed and put back. One variable.
+# From `default`, not from drigodb-databases, because that is the shape of a real
+# consumer — the policy pairs `namespaceSelector: {}` with a podSelector, so it
+# admits a labelled pod from ANY namespace, and probing from inside the database
+# namespace would never exercise that.
+#
+# One pod, relabelled between attempts, so the label is the only variable.
+NP_NS=default
 NP_POD="smoke-np-$$"
-k run "$NP_POD" -n drigodb-databases --restart=Never --quiet \
+np_try() { # returns 0 if it connected
+  k exec -n "$NP_NS" "$NP_POD" -- psql "${URI}&connect_timeout=10" -tAc "select 1" >/dev/null 2>&1
+}
+k run "$NP_POD" -n "$NP_NS" --restart=Never --quiet \
   --image="${SMOKE_PG_IMAGE:-ghcr.io/cloudnative-pg/postgresql:18}" \
   --command -- sleep 300 >/dev/null 2>&1
-if k wait -n drigodb-databases --for=condition=Ready "pod/$NP_POD" --timeout=120s >/dev/null 2>&1; then
-  if k exec -n drigodb-databases "$NP_POD" -- \
-       psql "${URI}&connect_timeout=10" -tAc "select 1" >/dev/null 2>&1; then
-    warn "an UNLABELLED pod reached the database — this cluster does not enforce NetworkPolicy"
-    warn "the policies exist and drop nothing; one of drigodb's three isolation layers is decorative here"
+if k wait -n "$NP_NS" --for=condition=Ready "pod/$NP_POD" --timeout=120s >/dev/null 2>&1; then
+  if np_try; then
+    warn "an UNLABELLED pod in ${NP_NS} reached the database"
+    warn "this cluster does not enforce NetworkPolicy — the policies exist and drop nothing,"
+    warn "so one of drigodb's three isolation layers is decorative here"
   else
-    ok "an unlabelled pod cannot reach it"
-    k label pod -n drigodb-databases "$NP_POD" "drigodb.io/allow-database=${DB_ID}" >/dev/null 2>&1
-    if k exec -n drigodb-databases "$NP_POD" -- psql "$URI" -tAc "select 1" >/dev/null 2>&1; then
-      ok "the same pod reaches it once labelled — the policy is load-bearing"
+    ok "an unlabelled pod in ${NP_NS} cannot reach it"
+
+    # The sharpest assertion: a label naming a DIFFERENT database must not work.
+    # Without this, a policy that admitted any drigodb consumer at all would pass
+    # the test above and still be broken in the way that matters.
+    k label pod -n "$NP_NS" "$NP_POD" "drigodb.io/allow-database=not-this-one" >/dev/null 2>&1
+    if np_try; then
+      fail "a pod labelled for a DIFFERENT database reached this one — isolation is not per-database"
+      exit 1
+    fi
+    ok "a pod labelled for another database cannot reach it either"
+
+    k label pod -n "$NP_NS" "$NP_POD" "drigodb.io/allow-database=${DB_ID}" --overwrite >/dev/null 2>&1
+    if np_try; then
+      ok "the same pod reaches it with the right label — the policy is load-bearing"
     else
-      fail "labelling the pod did not let it through; something other than the policy is blocking"
+      fail "labelling the pod correctly did not let it through"
       exit 1
     fi
   fi
-  k delete pod -n drigodb-databases "$NP_POD" --wait=false >/dev/null 2>&1
+  k delete pod -n "$NP_NS" "$NP_POD" --wait=false >/dev/null 2>&1
 else
   note "could not start a probe pod; skipping the NetworkPolicy check"
 fi

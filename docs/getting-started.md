@@ -499,10 +499,16 @@ A NetworkPolicy denies by **dropping packets**, not by refusing the connection.
 Your client hangs until it gives up. If an application cannot reach its database
 and there is no error to read, this label is the first thing to check.
 
+Two things worth knowing about that policy. It admits a labelled pod from **any
+namespace**, so your application does not have to live anywhere in particular.
+And it is **per database**: a pod labelled with a different database's id is
+blocked, so one tenant's application cannot reach another's by carrying the wrong
+label. A database pod cannot reach a neighbouring database either.
+
 If step 6 connects *without* the label, your cluster's CNI is not enforcing
 NetworkPolicy — the policies exist and do nothing. That is a property of the
 cluster rather than of drigodb, and it is worth knowing before you rely on the
-isolation.
+isolation. `scripts/smoke.sh` checks all of this and says so plainly.
 
 ### 7. Clean up
 
