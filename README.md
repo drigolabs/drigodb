@@ -88,6 +88,11 @@ a hosted database is a CNPG `Cluster`, per
 `scripts/deploy.sh` installs it; `scripts/cnpg-install.sh` does it on its own,
 pinned, and leaves one somebody else installed alone.
 
+drigodb will not report itself ready on a cluster missing the operator or a
+usable StorageClass — both fail silently otherwise, and a green install that
+cannot provision is worse than one that refuses to start. `GET /readyz` says
+which. `GET /healthz` stays liveness only.
+
 **New here? [docs/getting-started.md](docs/getting-started.md)** — kind on a
 laptop, a cluster you already have, or DigitalOcean from nothing, step by step.
 

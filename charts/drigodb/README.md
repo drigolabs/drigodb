@@ -44,15 +44,23 @@ than discovered at `helm install`.
 `scripts/cnpg-install.sh` does step 1 pinned and idempotently, and leaves an
 operator somebody else installed completely alone.
 
-**Skipping step 1 currently fails silently.** Helm reports success, the
-Deployment goes Ready, and the Role grants rights over an API group that does not
-exist — Kubernetes permits that without complaint. The chart cannot check for
-you: `lookup` is banned by `scripts/chart-determinism-test.sh`, and
-`.Capabilities.APIVersions` is the same mistake with a friendlier name, since it
-answers from the renderer rather than the cluster. `scripts/smoke.sh` checks
-against a live cluster, and
-[#80](https://github.com/drigolabs/drigodb/issues/80) makes the API report itself
-unready when the operator it provisions through is missing.
+**Skipping step 1 cannot produce a green install.** The API checks for the
+operator — and for a usable StorageClass — and reports itself **unready** when
+either is missing, so `helm install --wait` fails and `kubectl get pods` shows
+`0/1` with the reason in the logs. The pod stays up and goes Ready on its own
+once the gap is filled, with nothing to restart.
+
+The *chart* still cannot check: `lookup` is banned by
+`scripts/chart-determinism-test.sh`, and `.Capabilities.APIVersions` is the same
+mistake with a friendlier name, since it answers from the renderer rather than
+the cluster. The API can, because it is in the cluster. See `src/k8s/preflight.ts`.
+
+That is why this chart creates one cluster-scoped, read-only ClusterRole over
+StorageClasses: they are cluster-scoped resources, so there is no namespaced way
+to ask whether a default exists. The namespaced Role is unchanged — drigodb
+still cannot read a Secret outside the database namespace — and a cluster that
+declines the ClusterRole still runs drigodb, with that one check reported as
+`unverified` rather than failed.
 
 
 ## What it installs

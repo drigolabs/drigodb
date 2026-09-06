@@ -26,7 +26,11 @@ If that passes, drigodb works.
 
 ## What drigodb needs from a cluster
 
-Three things, and two of them fail quietly if they are missing.
+Three things. drigodb checks the first two itself and **refuses to become ready
+without them**, so a cluster missing either cannot produce a green install —
+`helm install --wait` fails, and `kubectl get pods` shows `0/1` with the reason
+in the logs. The pod stays up and goes Ready on its own once the gap is filled,
+with nothing to restart.
 
 **The CloudNativePG operator.** A hosted database is a CNPG `Cluster`
 ([decision 0004](decisions/0004-cloudnativepg-for-the-data-plane.md)). Without
@@ -39,9 +43,29 @@ either, every database sits `Pending` with no error anywhere — the PVC is simp
 never bound. `kubectl get storageclass` should show one marked `(default)`.
 
 **A CNI that implements NetworkPolicy**, if you want drigodb's network isolation
-to be real. kind's default CNI does not, and it fails silently: the policies are
-created and enforce nothing. See [what a laptop cannot tell
-you](local-development.md#what-a-laptop-cannot-tell-you).
+to be real. This is the third thing, and the one drigodb does **not** check —
+there is no reliable way to ask a cluster whether its CNI enforces policy short
+of sending a packet and seeing whether it arrives. kind's default CNI does not,
+and it fails silently: the policies are created and enforce nothing. See [what a
+laptop cannot tell you](local-development.md#what-a-laptop-cannot-tell-you).
+
+You can see what drigodb thinks of your cluster at any time:
+
+```bash
+kubectl -n drigodb-system port-forward svc/drigodb-api 8080:80 &
+curl -s localhost:8080/readyz | jq
+```
+
+```json
+{"ready": true,
+ "checks": [{"name": "cloudnativepg", "status": "ok", "detail": "postgresql.cnpg.io is served by this cluster"},
+            {"name": "storageclass",  "status": "ok", "detail": "cluster default is standard"}]}
+```
+
+A check can also come back `unverified`, which means drigodb was not permitted
+to look rather than that the thing is missing — a cluster that declines the
+read-only ClusterRole over StorageClasses still runs drigodb, it just cannot
+warn you about that one.
 
 ---
 
@@ -215,12 +239,14 @@ it wrong looks like a hang rather than a denial.
 
 | symptom | cause |
 |---|---|
-| provisioning returns an error mentioning `clusters.postgresql.cnpg.io` | the CloudNativePG operator is not installed — `kubectl get crd clusters.postgresql.cnpg.io` |
-| a database sits `provisioning` forever, PVC `Pending` | no default StorageClass. `kubectl get storageclass`, then set `database.storageClass` |
+| the pod is `0/1`, logs mention `cloudnativepg` | the CloudNativePG operator is not installed. `bash scripts/cnpg-install.sh` |
+| the pod is `0/1`, logs mention `storageclass` | no default StorageClass. `kubectl get storageclass`, then set `database.storageClass` |
+| a database sits `provisioning` forever, PVC `Pending` | a StorageClass exists but cannot bind — often `WaitForFirstConsumer` plus an unschedulable pod. `kubectl -n drigodb-databases describe pvc` |
 | your client hangs with no error | the pod is missing `drigodb.io/allow-database: <id>`. A NetworkPolicy denies by dropping packets |
 | `401` on every call | the token. `kubectl -n drigodb-system get secret drigodb-api-token -o jsonpath='{.data.token}' \| base64 -d` |
 | everything green on kind, isolation not enforced | expected. kind's CNI does not implement NetworkPolicy |
-| `helm install` succeeds and provisioning fails later | the operator was never installed. `scripts/smoke.sh` catches this; the chart cannot |
+| the pod is `0/1` and never becomes Ready | preflight failed. `kubectl -n drigodb-system logs deploy/drigodb-api \| grep preflight` names which check and why |
+| `helm install --wait` times out on `Available: 0/1` | the same thing, seen from the installer. The cluster is missing the operator or a StorageClass |
 
 `bash scripts/smoke.sh` is the fastest way to find out which of these it is —
 it checks the operator, the RBAC, and then the whole lifecycle in order.
