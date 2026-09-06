@@ -71,6 +71,11 @@ DELETE /v1/databases/{id}       destroys the data
 
 Bearer token on everything except `/healthz`.
 
+**Building an application against drigodb?** [docs/consuming-drigodb.md](docs/consuming-drigodb.md)
+documents the pod-side contract — the half that is not HTTP. It leads with the
+`drigodb.io/allow-database` label, because forgetting it produces a connection that hangs with no
+error anywhere rather than a refusal you can read.
+
 **Provisioning is asynchronous** — roughly 12 seconds, so `POST` returns `202` and a status to poll.
 
 **`POST /v1/databases` is idempotent on `external_id`.** A repeat returns the existing database rather
