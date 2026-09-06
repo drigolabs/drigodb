@@ -52,6 +52,23 @@ export const config = {
   // The DNS suffix used to build connection endpoints. In-cluster for v0.0.1.
   endpointSuffix: envOr("DRIGODB_ENDPOINT_SUFFIX", "svc.cluster.local"),
 
+  // Server authentication. Off unless an issuer is named, and drigodb works
+  // without it — bootstrap.sh self-signs and the URI says sslmode=require.
+  // What this adds is the client being able to tell it is talking to the
+  // database it asked for.
+  tls: {
+    issuer: envOr("DRIGODB_TLS_ISSUER", ""),
+    issuerKind: envOr("DRIGODB_TLS_ISSUER_KIND", "Issuer"),
+    // The DATABASE namespace, because cert-manager writes a Certificate's Secret
+    // beside the Certificate and the pod that mounts it lives there. An Issuer
+    // beside the control plane would put every Secret one namespace away from
+    // the only thing that needs it.
+    issuerNamespace: envOr("DRIGODB_TLS_ISSUER_NAMESPACE", "drigodb-databases"),
+    duration: envOr("DRIGODB_TLS_DURATION", "2160h"),
+    renewBefore: envOr("DRIGODB_TLS_RENEW_BEFORE", "360h"),
+    caSecret: envOr("DRIGODB_TLS_CA_SECRET", "drigodb-api-ca"),
+  },
+
   // Backups. Off unless a bucket and an endpoint are configured — with neither,
   // no sidecar is added and a database is exactly what it was before. That
   // matters because a half-configured backup must not be the reason a database
@@ -77,6 +94,13 @@ export const config = {
 } as const;
 
 // Backups are configured only when there is somewhere to put them.
+// A named issuer is the switch. Without one there is nothing to ask for a
+// certificate, so the URI must say require rather than promise verification a
+// client cannot perform.
+export function serverAuthEnabled(): boolean {
+  return config.tls.issuer !== "";
+}
+
 export function backupsEnabled(): boolean {
   return config.backup.bucket !== "" && config.backup.endpoint !== "";
 }

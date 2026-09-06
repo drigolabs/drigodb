@@ -9,6 +9,7 @@ import { randomBytes } from "node:crypto";
 import {
   AppsV1Api,
   BatchV1Api,
+  CustomObjectsApi,
   CoreV1Api,
   KubeConfig,
   NetworkingV1Api,
@@ -18,7 +19,7 @@ import {
 import type { V1Job, V1StatefulSet } from "@kubernetes/client-node";
 import type { Tier } from "./manifests.js";
 
-import { backupsEnabled, config } from "../config.js";
+import { backupsEnabled, config, serverAuthEnabled } from "../config.js";
 import type { BackupObject } from "../backups/s3.js";
 import { BackupStorageError, listObjects, regionFromEndpoint } from "../backups/s3.js";
 import {
@@ -35,6 +36,7 @@ import {
   TEMPLATE_HASH_ANNOTATION,
   buildNetworkPolicy,
   buildPodTemplate,
+  buildCertificate,
   buildRestoreJob,
   buildSecret,
   buildService,
@@ -44,6 +46,7 @@ import {
   pvcName,
   restoreJobName,
   tierOf,
+  tlsSecretName,
   secretName,
   serviceName,
   statefulSetName,
@@ -141,6 +144,12 @@ function newPassword(): string {
   return randomBytes(24).toString("base64url");
 }
 
+function isAlreadyExists(err: unknown): boolean {
+  const code = (err as { code?: number; statusCode?: number })?.code
+    ?? (err as { statusCode?: number })?.statusCode;
+  return code === 409;
+}
+
 function isNotFound(err: unknown): boolean {
   const code = (err as { code?: number; statusCode?: number })?.code
     ?? (err as { statusCode?: number })?.statusCode;
@@ -153,6 +162,7 @@ export class Provisioner {
     private readonly core: CoreV1Api,
     private readonly net: NetworkingV1Api,
     private readonly batch: BatchV1Api,
+    private readonly objects: CustomObjectsApi,
   ) {}
 
   static fromCluster(): Provisioner {
@@ -178,6 +188,7 @@ export class Provisioner {
       kc.makeApiClient(CoreV1Api),
       kc.makeApiClient(NetworkingV1Api),
       kc.makeApiClient(BatchV1Api),
+      kc.makeApiClient(CustomObjectsApi),
     );
   }
 
@@ -307,6 +318,12 @@ export class Provisioner {
     // path, so the wake path is exercised on every single create — including
     // its reconcile, which lands on the no-op branch because the StatefulSet
     // was just built from the template it is about to be compared against.
+    // Before the wake, so cert-manager has the whole provisioning window to
+    // issue. The mount is optional and bootstrap.sh self-signs, so a slow
+    // issuance costs the database a certificate on its first start and not its
+    // availability — it picks the real one up on its next cycle.
+    if (serverAuthEnabled()) await this.ensureCertificate(id, externalId);
+
     await this.wake(id);
 
     // After the wake, because the Job connects over TCP to a server that has to
@@ -355,6 +372,13 @@ export class Provisioner {
     const id = labels[DB_ID_LABEL];
     const externalId = labels[EXTERNAL_ID_LABEL];
     if (!id || !externalId) return;
+
+    // Waking is how everything else reaches an existing database — a rebuilt
+    // image, a new migration, a resized volume — and a certificate is no
+    // different. Without this, turning server authentication on would give it
+    // only to databases created afterwards, and the fleet would divide silently
+    // into verifiable and not.
+    if (serverAuthEnabled()) await this.ensureCertificate(id, externalId);
 
     // Only on the way up from hibernation. Callers wake speculatively — that is
     // what the endpoint is for — and a wake on a database that is already
@@ -604,6 +628,27 @@ export class Provisioner {
     return await this.get(id);
   }
 
+  // Ask cert-manager for a certificate naming this database's Service DNS.
+  //
+  // Never fatal. A database that cannot get a certificate must still provision:
+  // bootstrap.sh self-signs, the URI still works with the sslmode it was issued
+  // for, and the alternative is an installation where a broken cert-manager
+  // stops anyone creating a database at all.
+  private async ensureCertificate(id: string, externalId: string): Promise<void> {
+    try {
+      await this.objects.createNamespacedCustomObject({
+        group: "cert-manager.io",
+        version: "v1",
+        namespace: config.tls.issuerNamespace,
+        plural: "certificates",
+        body: buildCertificate(id, externalId),
+      });
+    } catch (err) {
+      if (isAlreadyExists(err)) return;
+      console.error(`[drigodb] could not request a certificate for ${id}:`, err);
+    }
+  }
+
   async delete(id: string): Promise<void> {
     const ns = config.databaseNamespace;
     const sts = await this.statefulSetFor(id);
@@ -627,6 +672,20 @@ export class Provisioner {
     await ignoreMissing(() => this.core.deleteNamespacedSecret({ name: secretName(id), namespace: ns }));
     // A failed restore Job outlives its TTL on purpose, so DELETE is what
     // finally removes it — along with the pod holding its logs.
+    if (serverAuthEnabled()) {
+      // The Certificate, not just its Secret: cert-manager would reissue the
+      // Secret it owns, leaving a certificate for a database that no longer
+      // exists renewing itself indefinitely.
+      await ignoreMissing(() =>
+        this.objects.deleteNamespacedCustomObject({
+          group: "cert-manager.io",
+          version: "v1",
+          namespace: config.tls.issuerNamespace,
+          plural: "certificates",
+          name: tlsSecretName(id),
+        }),
+      );
+    }
     await ignoreMissing(() =>
       this.batch.deleteNamespacedJob({
         name: restoreJobName(id),
@@ -650,6 +709,30 @@ export class Provisioner {
         );
       }
     }
+  }
+
+  // The CA certificate consumers need to verify a database.
+  //
+  // A CA certificate is public by definition — it is what a server presents a
+  // chain to, and every client that verifies anything already holds a pile of
+  // them. Serving it over the API is the only path that does not require a
+  // consumer to read a Secret in a namespace it has no business in.
+  async caCertificate(): Promise<string> {
+    if (!serverAuthEnabled()) {
+      throw new BackupsDisabledError(
+        "server authentication is not configured; connection URIs use sslmode=require",
+      );
+    }
+    const secret = await this.core.readNamespacedSecret({
+      name: config.tls.caSecret,
+      namespace: config.tls.issuerNamespace,
+    });
+    // ca.crt on a CA Certificate's Secret; tls.crt is the same material for a
+    // self-signed root, but ca.crt is the one that stays correct if the root is
+    // ever replaced by an intermediate.
+    const raw = secret.data?.["ca.crt"] ?? secret.data?.["tls.crt"];
+    if (!raw) throw new NotFoundError("the CA secret holds no certificate yet");
+    return Buffer.from(raw, "base64").toString("utf8");
   }
 
   // Every backup this database has, newest first.

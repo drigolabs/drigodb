@@ -60,6 +60,32 @@ database:
   # The DNS suffix used to build connection endpoints.
   endpointSuffix: svc.cluster.local
 
+# Server authentication for hosted databases.
+#
+# Off by default, and drigodb works without it: bootstrap.sh generates a
+# self-signed certificate and connection URIs say sslmode=require. Traffic is
+# encrypted either way — what this adds is the client being able to tell it is
+# talking to the database it asked for.
+#
+# cert-manager is a PREREQUISITE, not a dependency. Most clusters already run
+# one, and installing a second for someone who has one is worse than asking.
+tls:
+  certManager:
+    enabled: false
+    # Empty means the chart creates a CA of its own, rooted in a self-signed
+    # issuer. Point this at an existing ClusterIssuer or Issuer to use one you
+    # already run — the names being signed are in-cluster and unresolvable
+    # outside it, so a public issuer could never sign them and a private CA is
+    # the only thing that fits rather than a compromise.
+    issuerRef:
+      name: ""
+      kind: ClusterIssuer
+    # How long a database's certificate lives, and when cert-manager renews it.
+    # A renewed certificate reaches a running database on its next restart, so
+    # the window wants to be comfortable rather than tight.
+    duration: 2160h    # 90 days
+    renewBefore: 360h  # 15 days
+
 # Off unless a bucket and an endpoint are set. With neither, no sidecar is added
 # at all — a database is exactly what it was before, rather than one carrying a
 # container that cannot do its job.

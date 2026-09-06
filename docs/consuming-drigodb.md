@@ -136,10 +136,34 @@ to find a non-empty target and skip.
 Any PostgreSQL driver. The URI names the `app` database and carries
 `sslmode=require`.
 
-**`require`, not `verify-full`** — the server presents a self-signed certificate
-generated at first start, so traffic is encrypted but the certificate cannot be
-verified. A real issuer is [#9](https://github.com/drigolabs/drigodb/issues/9),
-and it is the one thing here that will change.
+**Read the `sslmode` in the URI you were given — it tells you what you can
+verify.**
+
+`verify-full` means the installation runs cert-manager and each database serves a
+certificate for its own Service name. Fetch the CA once and point your client at
+it:
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" \
+  http://drigodb-api.drigodb-system.svc.cluster.local/v1/ca > ca.crt
+```
+
+```
+postgres://…?sslmode=verify-full&sslrootcert=/path/to/ca.crt
+```
+
+A CA certificate is not a secret — it is what your client checks a chain
+against — so mount it however you mount any other config.
+
+`require` means the server self-signs. Traffic is encrypted, but you cannot tell
+you are talking to the database you asked for. That is the installation's choice
+and not something you can fix from the client.
+
+**`kubectl port-forward` breaks `verify-full`, inherently.** Through a tunnel you
+are connecting to `localhost`, and no certificate for a Service name will ever
+match that. Use `sslmode=require` for tunnelled debugging — that is what
+`scripts/smoke.sh` does — and keep `verify-full` for the in-cluster path that
+production actually uses.
 
 ## Hibernation
 
@@ -198,5 +222,5 @@ spec:
 | connection hangs, status is `ready` | the `drigodb.io/allow-database` label — start here |
 | `401` | wrong or missing bearer token |
 | database is empty after a restore | connected while `restoring` |
-| `certificate verify failed` | using `verify-full`; the server self-signs — see #9 |
+| `certificate verify failed` | no `sslrootcert`, or connecting through a port-forward — see above |
 | stuck `provisioning` | usually no node has room, or the StorageClass has no default |

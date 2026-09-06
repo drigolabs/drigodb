@@ -20,7 +20,7 @@ import type {
   V1StatefulSet,
 } from "@kubernetes/client-node";
 
-import { backupsEnabled, config } from "../config.js";
+import { backupsEnabled, config, serverAuthEnabled } from "../config.js";
 
 export const DB_ID_LABEL = "drigodb.io/database-id";
 export const EXTERNAL_ID_LABEL = "drigodb.io/external-id";
@@ -115,6 +115,17 @@ export const DATA_VOLUME = "data";
 export const DATA_MOUNT_PATH = "/var/lib/postgresql/data";
 export const PGDATA = `${DATA_MOUNT_PATH}/pgdata`;
 
+// Where cert-manager's Secret is mounted, and what bootstrap.sh looks for.
+// Read-only and owned by root, so bootstrap.sh copies rather than points
+// PostgreSQL at it: a server key must be 0600 and owned by the running user,
+// which a projected Secret cannot be.
+export const TLS_VOLUME = "server-tls";
+export const TLS_MOUNT_PATH = "/drigodb-tls";
+
+export function tlsSecretName(id: string): string {
+  return `db-${id}-tls`;
+}
+
 export const POSTGRES_PORT = 5432;
 export const POSTGRES_PORT_NAME = "postgres";
 
@@ -177,12 +188,15 @@ export function endpointHost(id: string): string {
 }
 
 export function connectionUri(id: string, password: string): string {
+  // The URI has to tell the truth about what the client can verify. With an
+  // issuer configured each database serves a certificate for its own Service
+  // name, so verify-full is honest; without one bootstrap.sh self-signs, and
+  // promising verification a client cannot perform would only teach it to turn
+  // verification off.
+  const sslmode = serverAuthEnabled() ? "verify-full" : "require";
   return (
     `postgres://${DB_USER}:${encodeURIComponent(password)}@${endpointHost(id)}:${POSTGRES_PORT}/${DB_NAME}` +
-    // require, not verify-full: bootstrap.sh generates a self-signed
-    // certificate, so a client can encrypt but cannot verify. A real issuer is
-    // issue #9, and it is what turns this into verify-full.
-    `?sslmode=require`
+    `?sslmode=${sslmode}`
   );
 }
 
@@ -257,6 +271,9 @@ export function buildPodTemplate(
             { name: SOCKET_VOLUME, mountPath: SOCKET_MOUNT_PATH },
             { name: "config", mountPath: CONFIG_MOUNT_PATH, readOnly: true },
             { name: "migrations", mountPath: MIGRATIONS_MOUNT_PATH, readOnly: true },
+            ...(serverAuthEnabled()
+              ? [{ name: TLS_VOLUME, mountPath: TLS_MOUNT_PATH, readOnly: true }]
+              : []),
           ],
           readinessProbe: {
             exec: { command: ["pg_isready", "-U", "postgres", "-d", DB_NAME] },
@@ -323,6 +340,12 @@ export function buildPodTemplate(
       ],
       volumes: [
         { name: SOCKET_VOLUME, emptyDir: {} },
+        // optional: the pod must start before cert-manager has issued anything,
+        // or a database would wait on a certificate to serve traffic it could
+        // serve without one. bootstrap.sh falls back to self-signing.
+        ...(serverAuthEnabled()
+          ? [{ name: TLS_VOLUME, secret: { secretName: tlsSecretName(id), optional: true, defaultMode: 0o640 } }]
+          : []),
         {
           name: "config",
           // 0640 rather than 0644: these files are read by the pod's own UID
@@ -418,6 +441,50 @@ export function buildRestoreJob(
             },
           ],
         },
+      },
+    },
+  };
+}
+
+// A cert-manager Certificate for one database.
+//
+// The name it signs is the Service DNS a consumer is handed in its connection
+// URI, so verify-full compares like with like. Anything else — the pod name,
+// the StatefulSet name — would produce a certificate that validates against
+// nothing a client actually connects to.
+//
+// Lives beside the control plane rather than beside the database: a namespaced
+// Issuer can only be used from its own namespace, and the alternative is a
+// ClusterIssuer that anything in the cluster could ask for a certificate from.
+// The Secret is then mirrored into the database namespace by the provisioner.
+export function buildCertificate(id: string, externalId: string): Record<string, unknown> {
+  return {
+    apiVersion: "cert-manager.io/v1",
+    kind: "Certificate",
+    metadata: {
+      name: tlsSecretName(id),
+      namespace: config.tls.issuerNamespace,
+      labels: labelsFor(id, externalId),
+    },
+    spec: {
+      secretName: tlsSecretName(id),
+      commonName: endpointHost(id),
+      // The Service DNS in full, plus the short forms Kubernetes also resolves
+      // it by — a consumer that connects by the shorter name is still
+      // connecting to the same Service and should not fail verification for it.
+      dnsNames: [
+        endpointHost(id),
+        `${serviceName(id)}.${config.databaseNamespace}.svc`,
+        `${serviceName(id)}.${config.databaseNamespace}`,
+      ],
+      duration: config.tls.duration,
+      renewBefore: config.tls.renewBefore,
+      privateKey: { algorithm: "ECDSA", size: 256 },
+      usages: ["server auth"],
+      issuerRef: {
+        name: config.tls.issuer,
+        kind: config.tls.issuerKind,
+        group: "cert-manager.io",
       },
     },
   };

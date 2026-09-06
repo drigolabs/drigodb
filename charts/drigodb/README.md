@@ -79,6 +79,32 @@ kubectl create secret generic drigodb-backup-credentials -n drigodb-databases \
   --from-literal=access_key=... --from-literal=secret_key=...
 ```
 
+## Server authentication
+
+Off by default. drigodb works without it — `bootstrap.sh` self-signs and
+connection URIs say `sslmode=require`, so traffic is encrypted but a client
+cannot tell it reached the database it asked for.
+
+```yaml
+tls:
+  certManager:
+    enabled: true
+```
+
+**cert-manager is a prerequisite, not a dependency.** Most clusters already run
+one, and installing a second for someone who has one is worse than asking. With
+it enabled the chart creates a private CA and each database gets a certificate
+for its own Service name; connection URIs then say `verify-full`, and consumers
+fetch the CA from `GET /v1/ca`.
+
+Point `tls.certManager.issuerRef` at a CA you already run if you have one. A
+public issuer cannot help here — the names are in-cluster and unresolvable
+outside it, so nothing public could ever sign them.
+
+A renewed certificate reaches a running database on its **next restart**, which
+is why the default lifetime is 90 days with 15 days of headroom rather than
+something tight.
+
 ## Trying it on kind
 
 ```bash

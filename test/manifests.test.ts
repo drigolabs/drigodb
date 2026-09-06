@@ -365,3 +365,52 @@ describe("storage tiers", () => {
     expect(m.pvcName(ID)).toBe(`data-db-${ID}-0`);
   });
 });
+
+describe("server authentication", () => {
+  afterEach(() => { vi.unstubAllEnvs(); vi.resetModules(); });
+
+  async function withIssuer() {
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_TLS_ISSUER", "drigodb-api-issuer");
+    return await import("../src/k8s/manifests.js");
+  }
+
+  it("promises only what a client can actually verify", async () => {
+    // Without an issuer the certificate is self-signed, so verify-full would be
+    // a promise the client cannot keep — and the only thing it could do about it
+    // is turn verification off, which is the habit this exists to break.
+    vi.resetModules();
+    const off = await import("../src/k8s/manifests.js");
+    expect(off.connectionUri(ID, "pw")).toContain("sslmode=require");
+
+    const on = await withIssuer();
+    expect(on.connectionUri(ID, "pw")).toContain("sslmode=verify-full");
+  });
+
+  it("signs the name the connection URI actually names", async () => {
+    // A certificate for the pod or the StatefulSet would validate against
+    // nothing a consumer ever connects to.
+    const m = await withIssuer();
+    const cert = m.buildCertificate(ID, EXT) as { spec: { commonName: string; dnsNames: string[] } };
+    expect(cert.spec.commonName).toBe(m.endpointHost(ID));
+    expect(cert.spec.dnsNames).toContain(m.endpointHost(ID));
+  });
+
+  it("mounts the certificate optionally, so issuance cannot delay a start", async () => {
+    // cert-manager may not have issued yet. A database waiting on a certificate
+    // to serve traffic it could serve without one is worse than one that
+    // self-signs and picks the real certificate up on its next cycle.
+    const m = await withIssuer();
+    const spec = m.buildStatefulSet(ID, EXT).spec?.template.spec;
+    const vol = (spec?.volumes ?? []).find((v) => v.name === "server-tls");
+    expect(vol?.secret?.optional).toBe(true);
+    expect(vol?.secret?.secretName).toBe(m.tlsSecretName(ID));
+  });
+
+  it("adds nothing at all when there is no issuer", async () => {
+    vi.resetModules();
+    const m = await import("../src/k8s/manifests.js");
+    const spec = m.buildStatefulSet(ID, EXT).spec?.template.spec;
+    expect((spec?.volumes ?? []).map((v) => v.name)).not.toContain("server-tls");
+  });
+});

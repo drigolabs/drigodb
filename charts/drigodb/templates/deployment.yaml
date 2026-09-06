@@ -48,6 +48,20 @@ spec:
               value: {{ .Values.database.image | quote }}
             - name: DRIGODB_ENDPOINT_SUFFIX
               value: {{ .Values.database.endpointSuffix | quote }}
+            # Server authentication. Empty issuer means the feature is off, which
+            # is what makes the URI say require rather than verify-full.
+            - name: DRIGODB_TLS_ISSUER
+              value: {{ if .Values.tls.certManager.enabled }}{{ include "drigodb.issuerName" . }}{{ else }}""{{ end }}
+            - name: DRIGODB_TLS_ISSUER_KIND
+              value: {{ if .Values.tls.certManager.enabled }}{{ include "drigodb.issuerKind" . }}{{ else }}""{{ end }}
+            - name: DRIGODB_TLS_ISSUER_NAMESPACE
+              value: {{ .Values.databaseNamespace | quote }}
+            - name: DRIGODB_TLS_DURATION
+              value: {{ .Values.tls.certManager.duration | quote }}
+            - name: DRIGODB_TLS_RENEW_BEFORE
+              value: {{ .Values.tls.certManager.renewBefore | quote }}
+            - name: DRIGODB_TLS_CA_SECRET
+              value: {{ include "drigodb.caSecret" . | quote }}
             - name: DRIGODB_BACKUP_IMAGE
               value: {{ .Values.backup.image | quote }}
             # Backups are off until a bucket AND an endpoint are set. Empty here

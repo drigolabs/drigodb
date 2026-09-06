@@ -49,6 +49,15 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get", "list", "delete"]
+{{- if .Values.tls.certManager.enabled }}
+  # One Certificate per database, in this namespace, so each serves a certificate
+  # for its own Service name and its Secret lands where the pod mounts it.
+  # Granted only when the feature is on: an installation without cert-manager has
+  # no reason to hold rights over CRDs that are not installed.
+  - apiGroups: ["cert-manager.io"]
+    resources: ["certificates"]
+    verbs: ["create", "get", "list", "delete"]
+{{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

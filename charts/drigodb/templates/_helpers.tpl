@@ -38,3 +38,24 @@ the chart made from an explicit value. Never one the chart invented.
 {{- printf "%s-token" (include "drigodb.fullname" .) -}}
 {{- end -}}
 {{- end -}}
+
+{{- define "drigodb.caSecret" -}}
+{{- printf "%s-ca" (include "drigodb.fullname" .) -}}
+{{- end -}}
+
+{{/* The issuer per-database Certificates reference: one supplied, or the chart's own. */}}
+{{- define "drigodb.issuerName" -}}
+{{- if .Values.tls.certManager.issuerRef.name -}}
+{{- .Values.tls.certManager.issuerRef.name -}}
+{{- else -}}
+{{- printf "%s-issuer" (include "drigodb.fullname" .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "drigodb.issuerKind" -}}
+{{- if .Values.tls.certManager.issuerRef.name -}}
+{{- .Values.tls.certManager.issuerRef.kind -}}
+{{- else -}}
+Issuer
+{{- end -}}
+{{- end -}}
