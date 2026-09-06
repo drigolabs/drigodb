@@ -16,6 +16,7 @@ import {
   setHeaderOptions,
 } from "@kubernetes/client-node";
 import type { V1Job, V1StatefulSet } from "@kubernetes/client-node";
+import type { Tier } from "./manifests.js";
 
 import { backupsEnabled, config } from "../config.js";
 import type { BackupObject } from "../backups/s3.js";
@@ -23,6 +24,9 @@ import { BackupStorageError, listObjects, regionFromEndpoint } from "../backups/
 import {
   BACKUP_KEY_SECRET_KEY,
   BACKUP_SECRET_SECRET_KEY,
+  TIERS,
+  TIER_LABEL,
+  TIER_ORDER,
   DB_ID_LABEL,
   EXTERNAL_ID_LABEL,
   MANAGED_BY_LABEL,
@@ -37,7 +41,9 @@ import {
   buildStatefulSet,
   connectionUri,
   endpointHost,
+  pvcName,
   restoreJobName,
+  tierOf,
   secretName,
   serviceName,
   statefulSetName,
@@ -59,6 +65,7 @@ export type Database = {
   id: string;
   external_id: string;
   status: DatabaseStatus;
+  tier: Tier;
   endpoint: string;
   port: number;
   created_at?: string;
@@ -73,6 +80,10 @@ export class NotFoundError extends Error {}
 // "Backups are off" is a different answer from "there are none", and a caller
 // acting on the second when the first is true would be wrong.
 export class BackupsDisabledError extends Error {}
+// The storage layer refused to grow the volume. Almost always a StorageClass
+// with allowVolumeExpansion: false, which is the operator's to change and not
+// something drigodb can work around.
+export class ResizeRefusedError extends Error {}
 
 // Object keys are written by this service, so anything that is not one of ours
 // is a caller mistake or an attempt to read another prefix. Both are 400s.
@@ -96,6 +107,20 @@ export function validateRestoreFrom(
     throw new ValidationError("restore_from.key must be a backup key, e.g. 20260905T040000Z.sql.gz");
   }
   return { databaseId: dbId, key };
+}
+
+// Falls back rather than throwing on a bad value: a typo in an operator's env
+// must not stop every provision, and small is the safe direction to be wrong in.
+function defaultTier(): Tier {
+  const t = config.defaultTier;
+  return TIER_ORDER.includes(t as Tier) ? (t as Tier) : "small";
+}
+
+export function validateTier(value: unknown): Tier {
+  if (typeof value !== "string" || !TIER_ORDER.includes(value as Tier)) {
+    throw new ValidationError(`tier must be one of ${TIER_ORDER.join(", ")}`);
+  }
+  return value as Tier;
 }
 
 export function validateExternalId(value: unknown): string {
@@ -208,6 +233,7 @@ export class Provisioner {
       id,
       external_id: labels[EXTERNAL_ID_LABEL] ?? "",
       status,
+      tier: tierOf(labels),
       endpoint: endpointHost(id),
       port: POSTGRES_PORT,
       created_at: sts.metadata?.creationTimestamp?.toISOString(),
@@ -272,7 +298,10 @@ export class Provisioner {
     await this.core.createNamespacedSecret({ namespace: ns, body: buildSecret(id, externalId, password) });
     await this.core.createNamespacedService({ namespace: ns, body: buildService(id, externalId) });
     await this.net.createNamespacedNetworkPolicy({ namespace: ns, body: buildNetworkPolicy(id, externalId) });
-    await this.apps.createNamespacedStatefulSet({ namespace: ns, body: buildStatefulSet(id, externalId) });
+    await this.apps.createNamespacedStatefulSet({
+      namespace: ns,
+      body: buildStatefulSet(id, externalId, defaultTier()),
+    });
 
     // Created hibernated, then woken: provisioning and waking are the same code
     // path, so the wake path is exercised on every single create — including
@@ -334,7 +363,14 @@ export class Provisioner {
     // that is already awake reconciles on its next hibernate/wake cycle.
     if ((sts.spec?.replicas ?? 0) > 0) return;
 
-    const want = templateHash(id, externalId);
+    // From the StatefulSet's own label, not from configuration. A resized
+    // database is on a tier this installation may not create by default, and
+    // rebuilding its template from config.defaultTier would silently move it
+    // back — undoing a resize on the next wake, with the PVC left large and
+    // max_wal_size dropped underneath it.
+    const tier = tierOf(labels);
+
+    const want = templateHash(id, externalId, tier);
     if (sts.metadata?.annotations?.[TEMPLATE_HASH_ANNOTATION] === want) return;
 
     await this.apps.patchNamespacedStatefulSet(
@@ -347,7 +383,7 @@ export class Provisioner {
           // volumeClaimTemplates are immutable, so anything wider than this is
           // rejected outright; replicas is left out so the patch cannot fight
           // the scale that follows it.
-          spec: { template: buildPodTemplate(id, externalId) },
+          spec: { template: buildPodTemplate(id, externalId, tier) },
         },
       },
       // A merge patch, not the strategic merge the client would otherwise send.
@@ -454,6 +490,118 @@ export class Provisioner {
       }
     }
     throw lastErr;
+  }
+
+  // Grow a database onto a bigger tier.
+  //
+  // Owner-initiated and automatically granted, provided the target is a real
+  // tier no larger than the configured ceiling. Nothing watches usage and grows
+  // a database on its own.
+  //
+  // ORDER MATTERS, and getting it wrong fills a disk. The volume grows first;
+  // max_wal_size rises only after. Raising the WAL ceiling on a volume that has
+  // not grown is how PostgreSQL PANICs on a full disk — and a full PVC is not a
+  // quick recovery.
+  async resize(id: string, target: Tier): Promise<Database> {
+    const sts = await this.statefulSetFor(id);
+    if (!sts) throw new NotFoundError(`no database with id ${id}`);
+
+    const current = tierOf(sts.metadata?.labels);
+    const externalId = sts.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "";
+    const at = TIER_ORDER.indexOf(current);
+    const to = TIER_ORDER.indexOf(target);
+    const ceiling = TIER_ORDER.indexOf(config.maxTier as Tier);
+
+    // A volume can be expanded in place and can never be shrunk. This is not a
+    // policy choice; the storage layer refuses, and it refuses late.
+    if (to < at) {
+      throw new ValidationError(
+        `cannot shrink: ${id} is on ${current} and volumes do not shrink`,
+      );
+    }
+    if (to > ceiling) {
+      throw new ValidationError(
+        `${target} exceeds the maximum tier for this installation (${config.maxTier})`,
+      );
+    }
+    if (to === at) return await this.get(id);
+
+    const ns = config.databaseNamespace;
+
+    // 1. The volume. Expansion is online — measured on DigitalOcean 2026-09-05,
+    //    974M to 2.0G with the database serving and no restart — so this alone
+    //    costs a tenant nothing.
+    try {
+      await this.core.patchNamespacedPersistentVolumeClaim(
+        {
+          name: pvcName(id),
+          namespace: ns,
+          body: { spec: { resources: { requests: { storage: TIERS[target].storage } } } },
+        },
+        // Same reason the StatefulSet patch sets this: without it the client
+        // sends a JSON Patch, which expects an array of operations and rejects
+        // this object outright with "cannot unmarshal object into Go value of
+        // type []handlers.jsonPatchOp". A mocked client cannot notice that.
+        setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+      );
+    } catch (err) {
+      // The common cause is a StorageClass with allowVolumeExpansion: false —
+      // kind's local-path, and plenty of others. Kubernetes says so clearly and
+      // the caller should hear it, rather than the "internal error" a 500 gives
+      // them for something they can actually fix.
+      // The client puts the API server's Status object in `body`, sometimes as
+      // a string. Pull the message out of either — a caller who chose a
+      // StorageClass without allowVolumeExpansion can act on that, and cannot
+      // act on "internal error".
+      const raw = (err as { body?: unknown })?.body;
+      let detail: string | undefined;
+      if (typeof raw === "string") {
+        try { detail = (JSON.parse(raw) as { message?: string }).message; } catch { detail = raw; }
+      } else if (raw && typeof raw === "object") {
+        detail = (raw as { message?: string }).message;
+      }
+      if (detail) throw new ResizeRefusedError(`could not grow the volume: ${detail}`);
+      throw err;
+    }
+
+    // 2. The template and the label, together. The pod template carries
+    //    DRIGODB_MAX_WAL_SIZE, which bootstrap.sh writes into PGDATA at start —
+    //    so this takes effect on the cycle below, after the volume has grown.
+    await this.apps.patchNamespacedStatefulSet(
+      {
+        name: statefulSetName(id),
+        namespace: ns,
+        body: {
+          metadata: {
+            labels: { [TIER_LABEL]: target },
+            annotations: { [TEMPLATE_HASH_ANNOTATION]: templateHash(id, externalId, target) },
+          },
+          spec: { template: buildPodTemplate(id, externalId, target) },
+        },
+      },
+      // Every patch this service sends needs this. Without it the client sends a
+      // JSON Patch, which wants an array of operations and rejects an object —
+      // and a mocked client in a unit test cannot tell the difference, which is
+      // why both of these got it wrong until a real cluster said so.
+      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+    );
+
+    // There is no transaction across these two, and the order is what makes that
+    // survivable: a failure between them leaves a LARGER volume still running
+    // the old max_wal_size, which is merely wasteful. Reversed, it would leave a
+    // raised WAL ceiling on a volume that never grew — and PostgreSQL on a full
+    // disk does not degrade, it PANICs and will not restart until space is
+    // freed. Observed exactly once during development, in the safe direction.
+
+    // 3. The cycle, which is what the WAL change needs and the volume does not.
+    //    Skipped for a hibernated database: it will pick both up when it wakes,
+    //    and waking one to change a setting it is not using would be rude.
+    if ((sts.spec?.replicas ?? 0) > 0) {
+      await this.scale(id, 0);
+      await this.wake(id);
+    }
+
+    return await this.get(id);
   }
 
   async delete(id: string): Promise<void> {

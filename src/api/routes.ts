@@ -1,15 +1,18 @@
-// HTTP surface. Seven operations, designed against one real consumer.
+// HTTP surface. Eight operations, designed against one real consumer.
 
 import { Hono } from "hono";
 
 import {
   BackupsDisabledError,
   NotFoundError,
+  ResizeRefusedError,
   Provisioner,
   ValidationError,
   validateExternalId,
   validateRestoreFrom,
+  validateTier,
 } from "../k8s/provisioner.js";
+import type { Tier } from "../k8s/manifests.js";
 
 export function buildRoutes(provisioner: Provisioner): Hono {
   const app = new Hono();
@@ -67,6 +70,21 @@ export function buildRoutes(provisioner: Provisioner): Hono {
   // Answers for a hibernated database too, which is the point: that is when
   // "what can I restore?" gets asked, and it is exactly when there is no pod to
   // ask. See issue #39.
+  // Growing is owner-initiated and automatically granted, provided the target
+  // is a real tier no larger than the installation's ceiling. 202, because the
+  // volume grows online but the WAL change needs the pod cycled behind it.
+  app.post("/v1/databases/:id/resize", async (c) => {
+    let tier: Tier;
+    try {
+      const body = await c.req.json().catch(() => ({}));
+      tier = validateTier((body as { tier?: unknown }).tier);
+    } catch (err) {
+      if (err instanceof ValidationError) return c.json({ error: err.message }, 400);
+      throw err;
+    }
+    return c.json(await provisioner.resize(c.req.param("id"), tier), 202);
+  });
+
   app.get("/v1/databases/:id/backups", async (c) => {
     const backups = await provisioner.listBackups(c.req.param("id"));
     return c.json({
@@ -87,6 +105,9 @@ export function buildRoutes(provisioner: Provisioner): Hono {
     // conflated them would conclude its data was unprotected when it is, or
     // that it is protected when it is not.
     if (err instanceof BackupsDisabledError) return c.json({ error: err.message }, 409);
+    // 409, not 500: the volume could not grow, the caller can read why, and an
+    // operator can fix it by choosing a StorageClass that allows expansion.
+    if (err instanceof ResizeRefusedError) return c.json({ error: err.message }, 409);
     console.error("[drigodb] unhandled error:", err);
     return c.json({ error: "internal error" }, 500);
   });

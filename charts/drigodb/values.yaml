@@ -41,11 +41,17 @@ database:
   #   kind          standard
   storageClass: ""
 
-  # Deliberately at the small end. A PVC can be expanded in place and can never
-  # be shrunk, and a StatefulSet's volumeClaimTemplates is immutable — so this
-  # value is permanent for every database created under it. Too small is a
-  # patch; too large is forever.
-  storageSize: 1Gi
+  # Which tier a database is created on, and how far its owner may grow it.
+  #
+  #   small   1Gi   max_wal_size 256MB    ~2 million rows
+  #   medium  5Gi   max_wal_size 1GB      ~11 million
+  #   large   20Gi  max_wal_size 2GB      ~50 million
+  #
+  # A volume can be expanded in place and can never be shrunk, so a tier only
+  # ever goes up. maxTier is the approval: a resize is granted automatically as
+  # long as it stays within it, and nothing grows a database on its own.
+  defaultTier: small
+  maxTier: large
 
   # The PostgreSQL a hosted database runs. CNPG's official image; drigodb does
   # not build one.

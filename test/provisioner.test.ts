@@ -20,6 +20,7 @@ import {
   Provisioner,
   ValidationError,
   validateRestoreFrom,
+  validateTier,
 } from "../src/k8s/provisioner.js";
 
 const ID = "a1b2c3d4e5f6";
@@ -314,5 +315,107 @@ describe("restore_from validation", () => {
   it("refuses a malformed body", () => {
     expect(() => validateRestoreFrom("nope")).toThrow(ValidationError);
     expect(() => validateRestoreFrom({})).toThrow(ValidationError);
+  });
+});
+
+describe("tier validation", () => {
+  it("accepts the three tiers", () => {
+    for (const t of ["small", "medium", "large"]) expect(validateTier(t)).toBe(t);
+  });
+
+  it("rejects anything else", () => {
+    for (const t of ["", "huge", "SMALL", 1, null, undefined, {}]) {
+      expect(() => validateTier(t)).toThrow(ValidationError);
+    }
+  });
+});
+
+// Growing a database. The assertion that earns its place is the ORDER: the
+// volume must grow before max_wal_size rises, because raising the WAL ceiling on
+// a volume that has not grown is how PostgreSQL PANICs on a full disk.
+describe("resize", () => {
+  function resizableProvisioner(tier: string, replicas = 1) {
+    const order: string[] = [];
+    const sts = {
+      metadata: {
+        name: "db-a1b2c3d4e5f6",
+        labels: {
+          "drigodb.io/database-id": "a1b2c3d4e5f6",
+          "drigodb.io/external-id": "app",
+          "drigodb.io/tier": tier,
+        },
+        annotations: {},
+      },
+      spec: { replicas },
+      status: { readyReplicas: replicas },
+    };
+    const apps = {
+      readNamespacedStatefulSet: async () => sts,
+      patchNamespacedStatefulSet: async () => { order.push("statefulset"); return sts; },
+      readNamespacedStatefulSetScale: async () => ({ spec: { replicas: sts.spec.replicas } }),
+      replaceNamespacedStatefulSetScale: async () => { order.push("scale"); return {}; },
+    };
+    const core = {
+      listNamespacedPod: async () => ({ items: [] }),
+      patchNamespacedPersistentVolumeClaim: async () => { order.push("pvc"); return {}; },
+    };
+    return {
+      order,
+      provisioner: new Provisioner(apps as never, core as never, {} as never, noRestoreJob as never),
+    };
+  }
+
+  it("grows the volume before it raises max_wal_size", async () => {
+    const { provisioner, order } = resizableProvisioner("small");
+    await provisioner.resize("a1b2c3d4e5f6", "medium");
+    expect(order.indexOf("pvc")).toBeGreaterThanOrEqual(0);
+    expect(order.indexOf("pvc")).toBeLessThan(order.indexOf("statefulset"));
+  });
+
+  it("cycles the pod, because the WAL change lands at start and not on a patch", async () => {
+    const { provisioner, order } = resizableProvisioner("small");
+    await provisioner.resize("a1b2c3d4e5f6", "medium");
+    expect(order.filter((o) => o === "scale").length).toBeGreaterThan(0);
+    expect(order.indexOf("statefulset")).toBeLessThan(order.lastIndexOf("scale"));
+  });
+
+  it("does not wake a hibernated database to change a setting it is not using", async () => {
+    const { provisioner, order } = resizableProvisioner("small", 0);
+    await provisioner.resize("a1b2c3d4e5f6", "large");
+    expect(order).toContain("pvc");
+    expect(order).toContain("statefulset");
+    expect(order).not.toContain("scale");
+  });
+
+  it("refuses to shrink, because volumes do not", async () => {
+    const { provisioner } = resizableProvisioner("large");
+    await expect(provisioner.resize("a1b2c3d4e5f6", "small")).rejects.toThrow(ValidationError);
+  });
+
+  it("is a no-op at the same tier rather than a pointless pod cycle", async () => {
+    const { provisioner, order } = resizableProvisioner("medium");
+    await provisioner.resize("a1b2c3d4e5f6", "medium");
+    expect(order).toEqual([]);
+  });
+
+  it("refuses a tier above the installation's ceiling — that ceiling is the approval", async () => {
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_MAX_TIER", "medium");
+    const m = await import("../src/k8s/provisioner.js");
+    const sts = {
+      metadata: { labels: { "drigodb.io/database-id": "a1b2c3d4e5f6", "drigodb.io/tier": "small" }, annotations: {} },
+      spec: { replicas: 1 }, status: { readyReplicas: 1 },
+    };
+    const apps = {
+      readNamespacedStatefulSet: async () => sts,
+      patchNamespacedStatefulSet: async () => sts,
+      readNamespacedStatefulSetScale: async () => ({ spec: { replicas: 1 } }),
+      replaceNamespacedStatefulSetScale: async () => ({}),
+    };
+    const core = { listNamespacedPod: async () => ({ items: [] }), patchNamespacedPersistentVolumeClaim: async () => ({}) };
+    const p = new m.Provisioner(apps as never, core as never, {} as never, noRestoreJob as never);
+    await expect(p.resize("a1b2c3d4e5f6", "large")).rejects.toThrow(m.ValidationError);
+    vi.unstubAllEnvs();
+    vi.resetModules();
   });
 });

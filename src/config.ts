@@ -37,16 +37,17 @@ export const config = {
   // installable somewhere that is not DigitalOcean. The chart sets it only when
   // someone names one.
   storageClass: envOr("DRIGODB_STORAGE_CLASS", ""),
-  // 1Gi, against a measured floor of 73 MB and 365 bytes per document — about
-  // two million documents once config/postgresql.conf bounds the WAL. 2Gi was
-  // an unexamined default, and half of it was reserved for write-ahead log
-  // nobody had chosen.
+  // Which tier a database is created on, and how far an owner may grow it.
   //
-  // Deliberately the small end: a PVC can be expanded in place and can never be
-  // shrunk, and a StatefulSet's volumeClaimTemplates is immutable, so this
-  // value is permanent for every database created under it. Too small is a
-  // patch; too large is forever.
-  storageSize: envOr("DRIGODB_STORAGE_SIZE", "1Gi"),
+  // storageSize is gone: a tier IS a size, and a second setting that no longer
+  // decided anything would be a decoy — this repository has already had one pin
+  // rot at 0.0.1 for seven releases because nothing read it.
+  //
+  // The ceiling is the approval. A resize is owner-initiated and automatically
+  // granted, provided the target is a real tier no larger than this; nothing
+  // watches usage and grows on its own.
+  defaultTier: envOr("DRIGODB_DEFAULT_TIER", "small"),
+  maxTier: envOr("DRIGODB_MAX_TIER", "large"),
 
   // The DNS suffix used to build connection endpoints. In-cluster for v0.0.1.
   endpointSuffix: envOr("DRIGODB_ENDPOINT_SUFFIX", "svc.cluster.local"),

@@ -314,3 +314,54 @@ describe("storage class portability", () => {
     expect(claim?.spec?.storageClassName).toBe("do-block-storage");
   });
 });
+
+describe("storage tiers", () => {
+  afterEach(() => { vi.unstubAllEnvs(); vi.resetModules(); });
+
+  it("only ever goes up, and the sizes are the tiers", async () => {
+    const m = await import("../src/k8s/manifests.js");
+    expect(m.TIER_ORDER).toEqual(["small", "medium", "large"]);
+    const sizes = m.TIER_ORDER.map((t) => m.TIERS[t].storage);
+    expect(sizes).toEqual(["1Gi", "5Gi", "20Gi"]);
+  });
+
+  it("treats a database with no tier label as small", async () => {
+    // Every database provisioned before tiers existed. It is what they were
+    // given and what their PVC still says.
+    const m = await import("../src/k8s/manifests.js");
+    expect(m.tierOf(undefined)).toBe("small");
+    expect(m.tierOf({})).toBe("small");
+    expect(m.tierOf({ [m.TIER_LABEL]: "nonsense" })).toBe("small");
+    expect(m.tierOf({ [m.TIER_LABEL]: "large" })).toBe("large");
+  });
+
+  it("carries max_wal_size per database, since the ConfigMap cannot", async () => {
+    // drigodb-config is one ConfigMap mounted by every database, so a per-tier
+    // value has to travel on the pod template instead.
+    const m = await import("../src/k8s/manifests.js");
+    const walOf = (t: "small" | "medium" | "large") =>
+      m.buildPodTemplate(ID, EXT, t).spec?.containers?.[0]?.env
+        ?.find((e) => e.name === "DRIGODB_MAX_WAL_SIZE")?.value;
+    expect(walOf("small")).toBe("256MB");
+    expect(walOf("medium")).toBe("1GB");
+    expect(walOf("large")).toBe("2GB");
+  });
+
+  it("changes the template hash, so a resize reconciles on the cycle after it", async () => {
+    const m = await import("../src/k8s/manifests.js");
+    expect(m.templateHash(ID, EXT, "medium")).not.toBe(m.templateHash(ID, EXT, "small"));
+  });
+
+  it("labels the StatefulSet, because the PVC is the truth and reading it is a second call", async () => {
+    const m = await import("../src/k8s/manifests.js");
+    const sts = m.buildStatefulSet(ID, EXT, "medium");
+    expect(sts.metadata?.labels?.[m.TIER_LABEL]).toBe("medium");
+    expect(sts.spec?.volumeClaimTemplates?.[0]?.spec?.resources?.requests?.storage).toBe("5Gi");
+  });
+
+  it("names the PVC the way the StatefulSet controller does", async () => {
+    // Wrong here and a resize patches nothing, silently.
+    const m = await import("../src/k8s/manifests.js");
+    expect(m.pvcName(ID)).toBe(`data-db-${ID}-0`);
+  });
+});
