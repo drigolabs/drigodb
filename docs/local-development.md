@@ -57,12 +57,19 @@ tests make rather than a new one. Backups, listing and restore all work.
 
 Worth knowing before trusting a green run.
 
-**NetworkPolicy is a silent no-op.** kind's default CNI does not implement it,
-so one of drigodb's three isolation layers is simply absent — and absent
-quietly, which is the dangerous kind. `scripts/smoke.sh` still labels its client
-pod with `drigodb.io/allow-database`, so the test stays honest about what a real
-consumer must do, but nothing here is enforcing it. Install Calico if that is
-what you are testing.
+**NetworkPolicy — this one changed, and the warning that used to be here was
+wrong.** kindnet did not implement NetworkPolicy for years, so this page said one
+of drigodb's three isolation layers was silently absent locally. It is not, as of
+the kindnet that kind v0.33 ships: removing `drigodb.io/allow-database` from a
+running client pod makes its connection time out, and putting it back makes the
+connection work, on the same pod.
+
+Which is a better outcome and a worse habit. The claim had never been tested, and
+a stale "this does not work locally" is how a real policy bug gets dismissed as a
+known limitation. `scripts/smoke.sh` now checks rather than either of us
+assuming: it connects from an unlabelled pod, expects to fail, then labels the
+same pod and expects to succeed — and says plainly if a cluster turns out not to
+enforce the policies it happily created.
 
 **Volumes cannot be expanded.** kind's `local-path` provisioner reports
 `allowVolumeExpansion: false`, so storage resize is untestable. That question

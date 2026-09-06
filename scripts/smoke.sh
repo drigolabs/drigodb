@@ -37,9 +37,9 @@ jqf() { python3 -c "import json,sys; d=json.load(sys.stdin); print(d$1)"; }
 # the API handed out. This needs no psql on the host either.
 #
 # The pod carries drigodb.io/allow-database, which is how a consumer opts through
-# the database's NetworkPolicy. On kind that policy is unenforced, but carrying
-# the label keeps this honest about what a real consumer must do — and on DOKS it
-# is the difference between connecting and not.
+# the database's NetworkPolicy — which is what a real consumer must do, and the
+# difference between connecting and not. Whether this cluster ENFORCES that is
+# checked separately below rather than assumed either way.
 PSQL_RUN=0
 psql_in_cluster() { # uri sql
   local name out phase
@@ -185,6 +185,37 @@ esac
 PG_RUNNING="$(k get pod -n drigodb-databases -l "drigodb.io/database-id=${DB_ID}" \
   -o jsonpath='{.items[0].spec.containers[?(@.name=="postgres")].image}')"
 ok "running ${PG_RUNNING}"
+
+step "Is the network policy actually enforced?"
+# The label is one of drigodb's three isolation layers and the only one that can
+# be silently absent: a CNI that does not implement NetworkPolicy creates the
+# policies and enforces nothing, with no error anywhere. Every other assertion in
+# this script passes identically either way, which is exactly why this one exists.
+#
+# The same pod, with the label removed and put back. One variable.
+NP_POD="smoke-np-$$"
+k run "$NP_POD" -n drigodb-databases --restart=Never --quiet \
+  --image="${SMOKE_PG_IMAGE:-ghcr.io/cloudnative-pg/postgresql:18}" \
+  --command -- sleep 300 >/dev/null 2>&1
+if k wait -n drigodb-databases --for=condition=Ready "pod/$NP_POD" --timeout=120s >/dev/null 2>&1; then
+  if k exec -n drigodb-databases "$NP_POD" -- \
+       psql "${URI}&connect_timeout=10" -tAc "select 1" >/dev/null 2>&1; then
+    warn "an UNLABELLED pod reached the database — this cluster does not enforce NetworkPolicy"
+    warn "the policies exist and drop nothing; one of drigodb's three isolation layers is decorative here"
+  else
+    ok "an unlabelled pod cannot reach it"
+    k label pod -n drigodb-databases "$NP_POD" "drigodb.io/allow-database=${DB_ID}" >/dev/null 2>&1
+    if k exec -n drigodb-databases "$NP_POD" -- psql "$URI" -tAc "select 1" >/dev/null 2>&1; then
+      ok "the same pod reaches it once labelled — the policy is load-bearing"
+    else
+      fail "labelling the pod did not let it through; something other than the policy is blocking"
+      exit 1
+    fi
+  fi
+  k delete pod -n drigodb-databases "$NP_POD" --wait=false >/dev/null 2>&1
+else
+  note "could not start a probe pod; skipping the NetworkPolicy check"
+fi
 
 step "Rotating credentials"
 # The recovery path: the connection URI is handed out on creation and never

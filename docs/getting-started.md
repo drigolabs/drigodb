@@ -162,11 +162,13 @@ either, every database sits `Pending` with no error anywhere — the PVC is simp
 never bound. `kubectl get storageclass` should show one marked `(default)`.
 
 **A CNI that implements NetworkPolicy**, if you want drigodb's network isolation
-to be real. This is the third thing, and the one drigodb does **not** check —
-there is no reliable way to ask a cluster whether its CNI enforces policy short
-of sending a packet and seeing whether it arrives. kind's default CNI does not,
-and it fails silently: the policies are created and enforce nothing. See [what a
-laptop cannot tell you](local-development.md#what-a-laptop-cannot-tell-you).
+to be real. This is the third thing, and the one the API does **not** check at
+startup — there is no way to ask a cluster whether its CNI enforces policy short
+of sending a packet and seeing whether it arrives. So `scripts/smoke.sh` sends
+one: it connects from an unlabelled pod and expects to fail. [Step
+6](#6-prove-the-label-is-doing-something) below does the same by hand. Recent
+kind enforces it; older kind did not, and a cluster that does not will create
+every policy and drop nothing.
 
 You can see what drigodb thinks of your cluster at any time:
 
@@ -372,31 +374,149 @@ costs the node price every month whether or not anything uses it.
 
 ---
 
-## Your first database
+## Your first database, end to end
 
-Same on every path. With the API reachable on `localhost:8080` and `$TOKEN` set:
+Same on every path. Getting a connection URI is not proof of anything — this
+section ends with you reading a row back out of a real database.
+
+With the API reachable on `localhost:8080`:
 
 ```bash
-curl -XPOST localhost:8080/v1/databases \
+TOKEN=$(kubectl -n drigodb-system get secret drigodb-api-token -o jsonpath='{.data.token}' | base64 -d)
+kubectl -n drigodb-system port-forward svc/drigodb-api 8080:80 &
+```
+
+### 1. Provision it
+
+```bash
+RESP=$(curl -s -XPOST localhost:8080/v1/databases \
   -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-  -d '{"external_id":"my-app"}'
+  -d '{"external_id":"my-app"}')
+
+DB_ID=$(echo "$RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+DB_URI=$(echo "$RESP" | python3 -c 'import json,sys; print(json.load(sys.stdin)["connection_uri"])')
+
+echo "$DB_ID"
 ```
 
-```json
-{"id":"a1b2c3d4e5f6","status":"provisioning",
- "connection_uri":"postgres://appuser:…@db-a1b2c3d4e5f6…:5432/app?sslmode=require"}
+**`DB_URI` is the only copy of that password.** It is returned here and on
+rotation, never from a `GET`, so a leaked read token cannot leak database
+credentials. Lose it and the only way back into a live database is
+`POST /v1/databases/{id}/credentials`, which issues a new URI and invalidates
+this one. In a real application, write it to a Secret or a vault before doing
+anything else.
+
+### 2. Wait for it
+
+Provisioning is asynchronous — roughly 10 to 20 seconds.
+
+```bash
+until [ "$(curl -s -H "Authorization: Bearer $TOKEN" localhost:8080/v1/databases/$DB_ID \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')" = "ready" ]; do
+  printf '.'; sleep 2
+done; echo " ready"
 ```
 
-**Store `connection_uri` now.** It is returned here and on rotation, never from
-a `GET`. A URI you did not persist is gone, and the only way back into a live
-database is `POST /v1/databases/{id}/credentials`, which issues a new one and
-invalidates the old.
+### 3. Get a client that is allowed to reach it
 
-Poll `GET /v1/databases/{id}` until `status` is `ready`, then connect — **from a
-pod carrying `drigodb.io/allow-database: a1b2c3d4e5f6`**, or the NetworkPolicy
-drops your packets with no error. [consuming-drigodb.md](consuming-drigodb.md) is
-the full contract, and that label is the step worth leading with because getting
-it wrong looks like a hang rather than a denial.
+Each database has a NetworkPolicy admitting only pods labelled
+`drigodb.io/allow-database: <its id>`. So the client is a pod, and it carries
+that label:
+
+```bash
+kubectl -n drigodb-databases run psql-client --restart=Never \
+  --image=ghcr.io/cloudnative-pg/postgresql:18 \
+  --labels="drigodb.io/allow-database=$DB_ID" \
+  --command -- sleep 3600
+
+kubectl -n drigodb-databases wait --for=condition=Ready pod/psql-client --timeout=120s
+```
+
+A pod running `sleep`, rather than `kubectl run --rm -it -- psql`, on purpose.
+A one-shot pod can finish before `kubectl` finishes attaching to it, and then
+the SQL runs, succeeds, and prints **nothing at all** — which looks exactly like
+failure. Keeping a client around and `exec`-ing into it has no such race, and
+you can go back into it as often as you like.
+
+### 4. Use it
+
+```bash
+kubectl -n drigodb-databases exec psql-client -- psql "$DB_URI" \
+  -c "create table hello (id serial primary key, said text)" \
+  -c "insert into hello (said) values ('it works')" \
+  -c "select * from hello"
+```
+
+```
+CREATE TABLE
+INSERT 0 1
+ id |   said
+----+----------
+  1 | it works
+(1 row)
+```
+
+**That row is the thing you came for.** A real PostgreSQL instance, its own
+volume, its own credentials, provisioned by an API call about thirty seconds ago.
+
+For an interactive session, add `-it` and drop the `-c` flags:
+
+```bash
+kubectl -n drigodb-databases exec -it psql-client -- psql "$DB_URI"
+```
+
+### 5. Check the connection is actually encrypted
+
+The URI says `sslmode=require`. Confirm the server agrees rather than trusting
+the string:
+
+```bash
+kubectl -n drigodb-databases exec psql-client -- psql "$DB_URI" -tAc \
+  "select ssl, version from pg_stat_ssl join pg_stat_activity using (pid) where pid = pg_backend_pid()"
+```
+
+```
+t|TLSv1.3
+```
+
+### 6. Prove the label is doing something
+
+The most valuable thirty seconds in this document, because getting this wrong
+in an application produces a hang rather than an error. Toggle the label on the
+client you already have:
+
+```bash
+kubectl -n drigodb-databases label pod psql-client "drigodb.io/allow-database-"
+kubectl -n drigodb-databases exec psql-client -- psql "${DB_URI}&connect_timeout=10" -tAc "select 1"
+# psql: error: ... timeout expired
+
+kubectl -n drigodb-databases label pod psql-client "drigodb.io/allow-database=$DB_ID"
+kubectl -n drigodb-databases exec psql-client -- psql "$DB_URI" -tAc "select 1"
+# 1
+```
+
+A NetworkPolicy denies by **dropping packets**, not by refusing the connection.
+Your client hangs until it gives up. If an application cannot reach its database
+and there is no error to read, this label is the first thing to check.
+
+If step 6 connects *without* the label, your cluster's CNI is not enforcing
+NetworkPolicy — the policies exist and do nothing. That is a property of the
+cluster rather than of drigodb, and it is worth knowing before you rely on the
+isolation.
+
+### 7. Clean up
+
+```bash
+kubectl -n drigodb-databases delete pod psql-client
+curl -XDELETE -H "Authorization: Bearer $TOKEN" localhost:8080/v1/databases/$DB_ID
+```
+
+`DELETE` removes the volume too. That is the point at which the data actually
+goes, and there is no undo.
+
+[consuming-drigodb.md](consuming-drigodb.md) is the full contract for an
+application: the label, the statuses, hibernation, and what to do about the URI
+you must not lose.
 
 ## When it does not work
 
