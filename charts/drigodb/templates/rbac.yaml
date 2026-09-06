@@ -49,6 +49,17 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
     verbs: ["create", "get", "list", "delete"]
+  # A hosted database is a CloudNativePG Cluster (decision 0004), so these are
+  # the verbs that provision, hibernate, wake and delete one. The operator does
+  # the rest: it owns the pods, the volumes and the Services, and drigodb never
+  # names them.
+  #
+  # No `update`. Hibernation is an annotation and a resize is a storage size, so
+  # every change drigodb makes to a live Cluster is a patch — and the
+  # whole-object verb would let a bug replace a database's spec wholesale.
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["clusters"]
+    verbs: ["create", "get", "list", "watch", "patch", "delete"]
 {{- if .Values.tls.certManager.enabled }}
   # One Certificate per database, in this namespace, so each serves a certificate
   # for its own Service name and its Secret lands where the pod mounts it.
@@ -58,6 +69,50 @@ rules:
     resources: ["certificates"]
     verbs: ["create", "get", "list", "delete"]
 {{- end }}
+---
+{{/*
+The one cluster-scoped grant drigodb takes, and it is read-only over a resource
+that holds no secrets.
+
+StorageClasses are cluster-scoped, so there is no namespaced way to ask "does
+this cluster have a default". Without the answer, an installation with no
+default StorageClass installs green and every database then sits in
+provisioning forever with an unbound volume and no error anywhere — see
+src/k8s/preflight.ts.
+
+The Role above stays deliberately namespaced and that property is unchanged:
+the API still cannot read a Secret anywhere outside the database namespace.
+This adds `get, list, watch` on StorageClasses and nothing else.
+
+If a cluster declines to grant it, drigodb still runs — the check reports
+itself unverified rather than failed, because "I was not allowed to look" is
+not "it is missing".
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "drigodb.fullname" . }}-preflight
+  labels:
+    {{- include "drigodb.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "drigodb.fullname" . }}-preflight
+  labels:
+    {{- include "drigodb.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "drigodb.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "drigodb.fullname" . }}-preflight
+  apiGroup: rbac.authorization.k8s.io
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -15,7 +15,9 @@
 # matches desired and there is nothing left to report.
 #
 # Removing `lookup` fixed that once. This test is what stops the next one:
-# `lookup`, `randAlphaNum`, `now`, `uuidv4`, `randAlphaNum` behind a conditional.
+# `lookup`, `randAlphaNum`, `now`, `uuidv4`, `randAlphaNum` behind a conditional,
+# and `.Capabilities.APIVersions` — which is the same mistake with a friendlier
+# name, since it answers from the renderer rather than from the cluster.
 # Any of them fails here rather than in somebody's cluster.
 #
 #   scripts/chart-determinism-test.sh
@@ -79,6 +81,15 @@ for f in sorted(pathlib.Path(sys.argv[1], "templates").rglob("*")):
         for fn in ("lookup", "randAlphaNum", "randAlpha", "randNumeric", "randAscii", "uuidv4", "now"):
             if re.search(r"\{\{[^}]*\b" + fn + r"\b", line):
                 bad.append(f"{f.name}:{n}: {fn} — {line.strip()[:70]}")
+        # .Capabilities.APIVersions is lookup wearing a different name. It
+        # reports what the RENDERER knows about: a built-in default list under
+        # helm template, the live cluster under helm install. So a template
+        # asking whether CloudNativePG is installed renders one way in CI and
+        # another way in Argo, which is the exact failure #63 fixed.
+        #
+        # An apostrophe in this comment would break the enclosing heredoc.
+        if re.search(r"\{\{[^}]*\.Capabilities\.APIVersions", line):
+            bad.append(f"{f.name}:{n}: .Capabilities.APIVersions — {line.strip()[:70]}")
 print("\n".join(bad))
 PYEOF
 )"

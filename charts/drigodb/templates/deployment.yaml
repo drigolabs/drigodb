@@ -78,9 +78,28 @@ spec:
               value: {{ .Values.backup.intervalSeconds | quote }}
             - name: DRIGODB_BACKUP_SECRET
               value: {{ .Values.backup.credentialsSecret | quote }}
+          # /readyz, not /healthz. Readiness asks whether drigodb can do its job
+          # on this cluster, which is a different question from whether the
+          # process is running — and both things it checks (the CloudNativePG
+          # operator, a usable StorageClass) fail silently when they are absent.
+          # Without this, `helm install` on a cluster missing either reports
+          # success and the first consumer finds out instead.
+          #
+          # failureThreshold is generous because this is a cluster-shaped
+          # problem, not a flaky one: it will not fix itself between probes, and
+          # nothing is gained by declaring it quickly.
           readinessProbe:
-            httpGet: { path: /healthz, port: http }
+            httpGet: { path: /readyz, port: http }
             initialDelaySeconds: 2
             periodSeconds: 5
+            failureThreshold: 3
+          # Liveness stays on /healthz. A cluster missing an operator is not a
+          # reason to restart a working process, and a readiness probe that
+          # doubles as liveness would crash-loop the pod for something no
+          # restart can fix.
+          livenessProbe:
+            httpGet: { path: /healthz, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 20
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}

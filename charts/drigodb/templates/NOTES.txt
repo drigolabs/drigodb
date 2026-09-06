@@ -1,5 +1,17 @@
 drigodb {{ .Values.image.tag | default .Chart.AppVersion }} is installed as {{ .Release.Name }}.
 
+REQUIRES CloudNativePG. A hosted database is a CNPG Cluster, and this chart does
+not install the operator — CRDs are cluster-scoped and belong to the cluster
+rather than to one application. Nothing here can check for you: a template that
+asks the renderer is the bug scripts/chart-determinism-test.sh exists to stop.
+
+  kubectl get crd clusters.postgresql.cnpg.io
+
+If that says NotFound, install it before provisioning anything:
+
+  kubectl apply --server-side -f \
+    https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.27/releases/cnpg-1.27.0.yaml
+
 Read the API token — it is returned here and nowhere else:
 
   kubectl -n {{ .Release.Namespace }} get secret {{ include "drigodb.fullname" . }}-token \

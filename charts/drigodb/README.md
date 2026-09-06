@@ -4,13 +4,64 @@ PostgreSQL databases, provisioned through an API. Each one is a separate
 PostgreSQL instance with its own volume, credentials and network policy, and
 they hibernate when idle — zero compute, storage only.
 
+## Getting started
+
+Two commands, and the first one is the part people skip:
+
 ```bash
+# 1. The operator drigodb provisions through.
+kubectl apply --server-side -f \
+  https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.27/releases/cnpg-1.27.0.yaml
+
+# 2. drigodb itself.
 helm install drigodb oci://ghcr.io/drigolabs/charts/drigodb \
-  --namespace drigodb-system --create-namespace
+  --namespace drigodb-system --create-namespace \
+  --set api.token="$(head -c 32 /dev/urandom | base64 | tr -d '=+/' | cut -c1-40)"
 ```
 
-Then read the token the chart generated, port-forward, and provision a database
-— `helm status drigodb` prints the exact commands.
+From a clone of this repository, `bash scripts/deploy.sh` does both plus the
+token, against whatever `kubectl` context is current, and is the same script the
+maintainers use on DigitalOcean.
+
+Then `helm status drigodb` prints how to read the token and provision a database.
+
+**[docs/getting-started.md](../../docs/getting-started.md)** has the complete
+step-by-step for each way in — kind, a cluster you already have, and
+DigitalOcean from nothing — plus what to check when it does not work.
+
+## Why the chart does not install CloudNativePG
+
+CRDs are cluster-scoped. A cluster already running CloudNativePG for something
+else would find drigodb trying to own its CRDs, and Helm installs a subchart's
+`crds/` directory once and never upgrades it — so the CRD would freeze at
+whatever version got there first. Installing an operator is a cluster decision,
+not an application one.
+
+The honest consequence: **installing drigodb needs permission to install CRDs**,
+which is a higher bar than installing an ordinary application. Better said here
+than discovered at `helm install`.
+
+`scripts/cnpg-install.sh` does step 1 pinned and idempotently, and leaves an
+operator somebody else installed completely alone.
+
+**Skipping step 1 cannot produce a green install.** The API checks for the
+operator — and for a usable StorageClass — and reports itself **unready** when
+either is missing, so `helm install --wait` fails and `kubectl get pods` shows
+`0/1` with the reason in the logs. The pod stays up and goes Ready on its own
+once the gap is filled, with nothing to restart.
+
+The *chart* still cannot check: `lookup` is banned by
+`scripts/chart-determinism-test.sh`, and `.Capabilities.APIVersions` is the same
+mistake with a friendlier name, since it answers from the renderer rather than
+the cluster. The API can, because it is in the cluster. See `src/k8s/preflight.ts`.
+
+That is why this chart creates one cluster-scoped, read-only ClusterRole over
+StorageClasses: they are cluster-scoped resources, so there is no namespaced way
+to ask whether a default exists. The namespaced Role is unchanged — drigodb
+still cannot read a Secret outside the database namespace — and a cluster that
+declines the ClusterRole still runs drigodb, with that one check reported as
+`unverified` rather than failed.
+
 
 ## What it installs
 

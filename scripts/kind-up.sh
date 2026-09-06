@@ -112,6 +112,10 @@ printf "${GREEN}${BOLD}drigodb is running on kind.${RESET}  context: ${BOLD}${CT
 printf "  Prove it:   ${BOLD}KUBE_CONTEXT=%s bash scripts/smoke.sh${RESET}\n" "$CTX"
 printf "  Tear down:  bash scripts/kind-down.sh\n"
 echo
-warn "NetworkPolicy is a silent no-op here — kind's default CNI does not implement it,"
-warn "so one of drigodb's three isolation layers is absent. Volumes cannot be expanded"
-warn "either. Neither is the chart's doing; see charts/drigodb/README.md."
+warn "Volumes cannot be expanded here — kind's local-path provisioner reports"
+warn "allowVolumeExpansion: false, so resize is untestable. Not the chart's doing;"
+warn "see charts/drigodb/README.md."
+warn ""
+warn "NetworkPolicy used to be a no-op on kind and no longer is: kindnet enforces it"
+warn "as of the version kind v0.33 ships. scripts/smoke.sh proves it either way"
+warn "rather than either of us assuming."

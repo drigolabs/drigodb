@@ -82,6 +82,20 @@ DELETE /v1/databases/{id}       destroys the data
 
 Bearer token on everything except `/healthz`.
 
+Requires the [CloudNativePG](https://cloudnative-pg.io) operator on the cluster —
+a hosted database is a CNPG `Cluster`, per
+[decision 0004](docs/decisions/0004-cloudnativepg-for-the-data-plane.md).
+`scripts/deploy.sh` installs it; `scripts/cnpg-install.sh` does it on its own,
+pinned, and leaves one somebody else installed alone.
+
+drigodb will not report itself ready on a cluster missing the operator or a
+usable StorageClass — both fail silently otherwise, and a green install that
+cannot provision is worse than one that refuses to start. `GET /readyz` says
+which. `GET /healthz` stays liveness only.
+
+**New here? [docs/getting-started.md](docs/getting-started.md)** — kind on a
+laptop, a cluster you already have, or DigitalOcean from nothing, step by step.
+
 **Building an application against drigodb?** [docs/consuming-drigodb.md](docs/consuming-drigodb.md)
 documents the pod-side contract — the half that is not HTTP. It leads with the
 `drigodb.io/allow-database` label, because forgetting it produces a connection that hangs with no

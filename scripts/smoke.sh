@@ -37,9 +37,9 @@ jqf() { python3 -c "import json,sys; d=json.load(sys.stdin); print(d$1)"; }
 # the API handed out. This needs no psql on the host either.
 #
 # The pod carries drigodb.io/allow-database, which is how a consumer opts through
-# the database's NetworkPolicy. On kind that policy is unenforced, but carrying
-# the label keeps this honest about what a real consumer must do — and on DOKS it
-# is the difference between connecting and not.
+# the database's NetworkPolicy — which is what a real consumer must do, and the
+# difference between connecting and not. Whether this cluster ENFORCES that is
+# checked separately below rather than assumed either way.
 PSQL_RUN=0
 psql_in_cluster() { # uri sql
   local name out phase
@@ -80,6 +80,32 @@ step "Target"
 ok "context ${CTX}"
 TOKEN="$(k get secret drigodb-api-token -n drigodb-system -o jsonpath='{.data.token}' | base64 -d)"
 ok "API token read from the cluster"
+
+step "The operator drigodb provisions through"
+# Decision 0004 makes a hosted database a CloudNativePG Cluster. Two things have
+# to be true and both fail silently in different ways: a missing CRD makes every
+# provision fail at runtime with a message nobody reads until a consumer
+# complains, and a missing RBAC rule does the same one layer further in.
+#
+# `auth can-i --as` asks the API server the same question it will ask itself,
+# which is the only way to check a Role without exercising the thing it guards.
+if k get crd clusters.postgresql.cnpg.io >/dev/null 2>&1; then
+  ok "clusters.postgresql.cnpg.io present"
+  # Read from the Deployment rather than assumed. The chart's fullname is
+  # `drigodb-api`, not `drigodb`, and a hardcoded guess made this check report a
+  # missing permission that was actually present — a false alarm in a preflight
+  # is worse than no preflight, because the next person disables it.
+  SA="system:serviceaccount:drigodb-system:$(k -n drigodb-system get deploy drigodb-api -o jsonpath='{.spec.template.spec.serviceAccountName}')"
+  if [ "$(k auth can-i create clusters.postgresql.cnpg.io --as "$SA" -n drigodb-databases 2>/dev/null)" = "yes" ]; then
+    ok "the API may create a Cluster in drigodb-databases"
+  else
+    fail "the API service account cannot create Clusters — provisioning will fail"
+    exit 1
+  fi
+else
+  fail "clusters.postgresql.cnpg.io is missing; run scripts/cnpg-install.sh"
+  exit 1
+fi
 
 step "Reaching the API"
 start_pf svc/drigodb-api "$API_PORT" drigodb-system 80 /tmp/drigodb-smoke-api.log || exit 1
@@ -159,6 +185,57 @@ esac
 PG_RUNNING="$(k get pod -n drigodb-databases -l "drigodb.io/database-id=${DB_ID}" \
   -o jsonpath='{.items[0].spec.containers[?(@.name=="postgres")].image}')"
 ok "running ${PG_RUNNING}"
+
+step "Is the network policy actually enforced?"
+# The label is one of drigodb's three isolation layers and the only one that can
+# be silently absent: a CNI that does not implement NetworkPolicy creates the
+# policies and enforces nothing, with no error anywhere. Every other assertion in
+# this script passes identically either way, which is exactly why this one exists.
+#
+# From `default`, not from drigodb-databases, because that is the shape of a real
+# consumer — the policy pairs `namespaceSelector: {}` with a podSelector, so it
+# admits a labelled pod from ANY namespace, and probing from inside the database
+# namespace would never exercise that.
+#
+# One pod, relabelled between attempts, so the label is the only variable.
+NP_NS=default
+NP_POD="smoke-np-$$"
+np_try() { # returns 0 if it connected
+  k exec -n "$NP_NS" "$NP_POD" -- psql "${URI}&connect_timeout=10" -tAc "select 1" >/dev/null 2>&1
+}
+k run "$NP_POD" -n "$NP_NS" --restart=Never --quiet \
+  --image="${SMOKE_PG_IMAGE:-ghcr.io/cloudnative-pg/postgresql:18}" \
+  --command -- sleep 300 >/dev/null 2>&1
+if k wait -n "$NP_NS" --for=condition=Ready "pod/$NP_POD" --timeout=120s >/dev/null 2>&1; then
+  if np_try; then
+    warn "an UNLABELLED pod in ${NP_NS} reached the database"
+    warn "this cluster does not enforce NetworkPolicy — the policies exist and drop nothing,"
+    warn "so one of drigodb's three isolation layers is decorative here"
+  else
+    ok "an unlabelled pod in ${NP_NS} cannot reach it"
+
+    # The sharpest assertion: a label naming a DIFFERENT database must not work.
+    # Without this, a policy that admitted any drigodb consumer at all would pass
+    # the test above and still be broken in the way that matters.
+    k label pod -n "$NP_NS" "$NP_POD" "drigodb.io/allow-database=not-this-one" >/dev/null 2>&1
+    if np_try; then
+      fail "a pod labelled for a DIFFERENT database reached this one — isolation is not per-database"
+      exit 1
+    fi
+    ok "a pod labelled for another database cannot reach it either"
+
+    k label pod -n "$NP_NS" "$NP_POD" "drigodb.io/allow-database=${DB_ID}" --overwrite >/dev/null 2>&1
+    if np_try; then
+      ok "the same pod reaches it with the right label — the policy is load-bearing"
+    else
+      fail "labelling the pod correctly did not let it through"
+      exit 1
+    fi
+  fi
+  k delete pod -n "$NP_NS" "$NP_POD" --wait=false >/dev/null 2>&1
+else
+  note "could not start a probe pod; skipping the NetworkPolicy check"
+fi
 
 step "Rotating credentials"
 # The recovery path: the connection URI is handed out on creation and never
