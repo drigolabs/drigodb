@@ -28,6 +28,32 @@ If that passes, drigodb works.
 **A takes about fifteen minutes from nothing**, including installing the tools,
 and costs nothing. If you are not sure which row you are, you are A.
 
+## Contents
+
+- [0. Install the tools](#0-install-the-tools)
+  - [macOS](#macos)
+  - [Linux (Debian / Ubuntu)](#linux-debian--ubuntu)
+  - [Windows](#windows)
+  - [Give Docker enough memory](#give-docker-enough-memory)
+  - [Check it worked](#check-it-worked)
+- [What drigodb needs from a cluster](#what-drigodb-needs-from-a-cluster)
+- [A. Local, with kind](#a-local-with-kind)
+- [B. Local, developing drigodb](#b-local-developing-drigodb)
+- [C. A remote cluster](#c-a-remote-cluster)
+  - [C1. From a clone — one command](#c1-from-a-clone--one-command)
+  - [C2. Helm only — no clone](#c2-helm-only--no-clone)
+- [D. DigitalOcean from scratch](#d-digitalocean-from-scratch)
+- [Your first database, end to end](#your-first-database-end-to-end)
+  - [1. Provision it](#1-provision-it)
+  - [2. Wait for it](#2-wait-for-it)
+  - [3. Get a client that is allowed to reach it](#3-get-a-client-that-is-allowed-to-reach-it)
+  - [4. Use it](#4-use-it)
+  - [5. Check the connection is actually encrypted](#5-check-the-connection-is-actually-encrypted)
+  - [6. Prove the label is doing something](#6-prove-the-label-is-doing-something)
+  - [7. Clean up](#7-clean-up)
+- [Connecting from your own machine](#connecting-from-your-own-machine)
+- [When it does not work](#when-it-does-not-work)
+
 ## 0. Install the tools
 
 Skip to [what drigodb needs from a cluster](#what-drigodb-needs-from-a-cluster)
@@ -465,40 +491,6 @@ For an interactive session, add `-it` and drop the `-c` flags:
 kubectl -n drigodb-databases exec -it psql-client -- psql "$DB_URI"
 ```
 
-### From your own machine, with your own psql
-
-A client outside the cluster can reach a database through a port-forward. The
-URI is issued for the in-cluster hostname, so the host has to be rewritten and
-nothing else:
-
-```bash
-kubectl -n drigodb-databases port-forward svc/db-$DB_ID 15432:5432 &
-
-# the URI as issued, with only the host and port changed
-LOCAL_URI=$(echo "$DB_URI" | sed "s#@db-$DB_ID\.drigodb-databases\.svc\.cluster\.local:5432#@localhost:15432#")
-psql "$LOCAL_URI" -c "select 1"
-```
-
-Two things to know before relying on this.
-
-**It bypasses the NetworkPolicy completely.** A port-forward is not pod-to-pod
-traffic — it goes through the API server to the kubelet — so no label is
-involved and the isolation you tested in step 6 does not apply. Anyone who can
-port-forward in that namespace can reach any database, and the password is the
-only thing left in the way. That is fine for a human debugging with `kubectl`
-and it is not a connection path to build an application on.
-
-**It breaks if server authentication is on.** With cert-manager configured, the
-URI is issued with `sslmode=verify-full` and the certificate names the Service
-DNS name — which `localhost` is not, so verification fails. Map the real name to
-`127.0.0.1` in `/etc/hosts` and forward on `5432` if you need this, or connect
-from a pod as above.
-
-Also worth knowing why `scripts/smoke.sh` does **not** do this: rewriting the
-host means the string being tested is no longer the string the API handed out.
-It used to work this way, and the test could not have caught a bad hostname in
-an issued URI.
-
 ### 5. Check the connection is actually encrypted
 
 The URI says `sslmode=require`. Confirm the server agrees rather than trusting
@@ -557,6 +549,44 @@ goes, and there is no undo.
 [consuming-drigodb.md](consuming-drigodb.md) is the full contract for an
 application: the label, the statuses, hibernation, and what to do about the URI
 you must not lose.
+
+## Connecting from your own machine
+
+Everything above connects from inside the cluster, which is what an application
+does. For poking at a database by hand, a client on your own machine works too —
+for any database, not just the one above.
+
+A client outside the cluster can reach a database through a port-forward. The
+URI is issued for the in-cluster hostname, so the host has to be rewritten and
+nothing else:
+
+```bash
+kubectl -n drigodb-databases port-forward svc/db-$DB_ID 15432:5432 &
+
+# the URI as issued, with only the host and port changed
+LOCAL_URI=$(echo "$DB_URI" | sed "s#@db-$DB_ID\.drigodb-databases\.svc\.cluster\.local:5432#@localhost:15432#")
+psql "$LOCAL_URI" -c "select 1"
+```
+
+Two things to know before relying on this.
+
+**It bypasses the NetworkPolicy completely.** A port-forward is not pod-to-pod
+traffic — it goes through the API server to the kubelet — so no label is
+involved and the isolation you tested in step 6 does not apply. Anyone who can
+port-forward in that namespace can reach any database, and the password is the
+only thing left in the way. That is fine for a human debugging with `kubectl`
+and it is not a connection path to build an application on.
+
+**It breaks if server authentication is on.** With cert-manager configured, the
+URI is issued with `sslmode=verify-full` and the certificate names the Service
+DNS name — which `localhost` is not, so verification fails. Map the real name to
+`127.0.0.1` in `/etc/hosts` and forward on `5432` if you need this, or connect
+from a pod as above.
+
+Also worth knowing why `scripts/smoke.sh` does **not** do this: rewriting the
+host means the string being tested is no longer the string the API handed out.
+It used to work this way, and the test could not have caught a bad hostname in
+an issued URI.
 
 ## When it does not work
 
