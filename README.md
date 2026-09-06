@@ -76,6 +76,7 @@ POST   /v1/databases/{id}/hibernate  → 202
 POST   /v1/databases/{id}/credentials  → 200 + a new connection_uri
 POST   /v1/databases/{id}/resize      { tier }  → 202
 GET    /v1/databases/{id}/backups      what can be restored
+GET    /v1/ca                         the CA consumers verify against
 DELETE /v1/databases/{id}       destroys the data
 ```
 
@@ -452,8 +453,7 @@ Decisions taken along the way are logged in [docs/decisions/](docs/decisions/).
 Built: per-database topology, isolation, the control-plane API, DigitalOcean deployment, and logical
 backups behind a configured bucket.
 
-Not built: public endpoints (databases are in-cluster only), TLS from a real issuer — the server
-self-signs, so clients pass `sslmode=require` rather than `verify-full` — accounts, quotas, billing,
+Not built: public endpoints (databases are in-cluster only), accounts, quotas, billing,
 restore as an API operation, backup retention, and vertical or storage autoscaling.
 
 ## Licence

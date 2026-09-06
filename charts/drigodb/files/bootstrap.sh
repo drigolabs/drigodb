@@ -31,8 +31,33 @@ MIG_MARKER="${PGDATA}/.drigodb-migrations"
 # is one ConfigMap that every database mounts, so it cannot carry a per-tier
 # max_wal_size. Written here and included AFTER the mounted file, so it wins.
 TIER_CONF="${PGDATA}/drigodb-tier.conf"
+# Where an issued certificate is mounted, when there is one. Copied rather than
+# pointed at: PostgreSQL refuses to start on a key it does not own.
+TLS_SRC="${DRIGODB_TLS_DIR:-/drigodb-tls}"
 
 log() { printf '[bootstrap] %s\n' "$1"; }
+
+# An issued certificate if there is one, a self-signed one otherwise.
+#
+# The fallback is not a nicety. A database must not fail to start because
+# cert-manager is absent, or slow, or has not issued yet, and drigodb has to stay
+# installable on a cluster that runs neither.
+install_certificate() {
+  if [ -s "${TLS_SRC}/tls.crt" ] && [ -s "${TLS_SRC}/tls.key" ]; then
+    cp "${TLS_SRC}/tls.crt" "${PGDATA}/server.crt"
+    cp "${TLS_SRC}/tls.key" "${PGDATA}/server.key"
+    chmod 0600 "${PGDATA}/server.key"
+    chmod 0644 "${PGDATA}/server.crt"
+    log "installed the issued certificate"
+    return 0
+  fi
+  [ -s "${PGDATA}/server.crt" ] && return 0
+  log "no issued certificate; generating a self-signed one"
+  openssl req -new -x509 -days 3650 -nodes -text \
+    -out "${PGDATA}/server.crt" -keyout "${PGDATA}/server.key" \
+    -subj "/CN=drigodb" >/dev/null 2>&1
+  chmod 0600 "${PGDATA}/server.key"
+}
 
 # Rewritten on every start, so a resize takes effect on the cycle that follows
 # it. Cheap enough to do unconditionally — it is two lines and a compare.
@@ -170,11 +195,7 @@ if [ ! -s "${PGDATA}/PG_VERSION" ]; then
   # memberships — so relying on it would mean pinning supplementalGroups to an
   # image-specific gid. Generating our own costs one openssl call at first start
   # and nothing afterwards.
-  log "generating a self-signed certificate"
-  openssl req -new -x509 -days 3650 -nodes -text \
-    -out "${PGDATA}/server.crt" -keyout "${PGDATA}/server.key" \
-    -subj "/CN=drigodb" >/dev/null 2>&1
-  chmod 0600 "${PGDATA}/server.key"
+  install_certificate
 
   log "creating database ${APP_DB_NAME} and role ${APP_DB_USER}"
   pg_ctl -D "${PGDATA}" -w start >/dev/null
@@ -210,6 +231,10 @@ else
   # because a database created before tiers existed has never had one.
   write_tier_conf
   ensure_tier_include
+  # Picks up a renewed certificate, and gives one to a database created before
+  # server authentication existed. cert-manager rotates the Secret in place, so
+  # a restart is what carries the new material into PGDATA.
+  install_certificate
 
   # Both of these need a running server, and an ordinary wake needs neither.
   # Deciding first, then starting once, is what keeps a wake at the cost of an

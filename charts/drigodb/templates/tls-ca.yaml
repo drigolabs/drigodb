@@ -1,0 +1,67 @@
+{{/*
+The CA that signs every hosted database's certificate.
+
+Only when tls.certManager.enabled and no issuerRef.name was supplied — pointing
+at a CA you already run is the better answer if you have one, and this is the
+fallback for installations that do not.
+
+Two objects and a bootstrap: a self-signed Issuer exists solely to sign the CA
+certificate, and the CA Issuer signs everything after that. cert-manager has no
+other way to root a private CA.
+*/}}
+{{- if and .Values.tls.certManager.enabled (not .Values.tls.certManager.issuerRef.name) }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "drigodb.fullname" . }}-selfsign
+  namespace: {{ .Values.databaseNamespace }}
+  labels:
+    {{- include "drigodb.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "drigodb.fullname" . }}-ca
+  namespace: {{ .Values.databaseNamespace }}
+  labels:
+    {{- include "drigodb.labels" . | nindent 4 }}
+spec:
+  isCA: true
+  commonName: drigodb-ca
+  secretName: {{ include "drigodb.caSecret" . }}
+  # Long, because rotating a CA means every consumer that pinned it has to be
+  # told. Shorter would be a recurring outage disguised as good hygiene.
+  duration: 87600h    # 10 years
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: {{ include "drigodb.fullname" . }}-selfsign
+    kind: Issuer
+    group: cert-manager.io
+---
+{{/*
+In the DATABASE namespace, not the release namespace, and that is the whole
+reason this works without mirroring Secrets across namespaces.
+
+A namespaced Issuer can only be used from its own namespace, and cert-manager
+writes a Certificate's Secret beside the Certificate. Put the Issuer next to the
+control plane and every database's Secret lands in the wrong namespace to be
+mounted; put it next to the databases and it lands exactly where the pod needs
+it. The alternative is a ClusterIssuer, which anything in the cluster could ask
+for a certificate from.
+*/}}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "drigodb.issuerName" . }}
+  namespace: {{ .Values.databaseNamespace }}
+  labels:
+    {{- include "drigodb.labels" . | nindent 4 }}
+spec:
+  ca:
+    secretName: {{ include "drigodb.caSecret" . }}
+{{- end }}

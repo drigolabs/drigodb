@@ -1,4 +1,4 @@
-// HTTP surface. Eight operations, designed against one real consumer.
+// HTTP surface. Nine operations, designed against one real consumer.
 
 import { Hono } from "hono";
 
@@ -84,6 +84,16 @@ export function buildRoutes(provisioner: Provisioner): Hono {
     }
     return c.json(await provisioner.resize(c.req.param("id"), tier), 202);
   });
+
+  // The CA a consumer needs to verify a database, as PEM.
+  //
+  // Not secret — a CA certificate is what a server proves a chain against, and
+  // withholding it would only mean every consumer turning verification off.
+  // 409 when server authentication is not configured, because handing back
+  // nothing would look like an empty CA rather than a feature that is off.
+  app.get("/v1/ca", async (c) =>
+    c.text(await provisioner.caCertificate(), 200, { "content-type": "application/x-pem-file" }),
+  );
 
   app.get("/v1/databases/:id/backups", async (c) => {
     const backups = await provisioner.listBackups(c.req.param("id"));

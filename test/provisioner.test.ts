@@ -77,12 +77,19 @@ function provisionerFor(sts: ReturnType<typeof statefulSet>) {
 
   // The constructor takes its clients, so the whole path is exercisable without
   // a cluster.
-  const provisioner = new Provisioner(apps as never, core as never, {} as never, noRestoreJob as never);
+  const provisioner = new Provisioner(apps as never, core as never, {} as never, noRestoreJob as never, noCertificates as never);
   return { provisioner, patch };
 }
 
 // Most databases were never restored into, so "no such Job" is the ordinary
 // answer and the one every existing test wants.
+// Server authentication is off in these tests, so nothing here is called — but
+// the constructor takes the client, so it has to be handed one.
+const noCertificates = {
+  createNamespacedCustomObject: async () => ({}),
+  deleteNamespacedCustomObject: async () => ({}),
+};
+
 const noRestoreJob = {
   readNamespacedJob: async () => {
     const err = new Error("not found") as Error & { code: number };
@@ -171,7 +178,7 @@ describe("wake", () => {
         throw Object.assign(new Error("not found"), { code: 404 });
       },
     };
-    const provisioner = new Provisioner(apps as never, {} as never, {} as never, noRestoreJob as never);
+    const provisioner = new Provisioner(apps as never, {} as never, {} as never, noRestoreJob as never, noCertificates as never);
 
     await expect(provisioner.wake(ID)).rejects.toBeInstanceOf(NotFoundError);
   });
@@ -226,7 +233,7 @@ function rotatableFor(sts: ReturnType<typeof statefulSet>) {
     replaceNamespacedSecret: replaceSecret,
     listNamespacedPod: async () => ({ items: sts.spec.replicas > 0 ? [{}] : [] }),
   };
-  const provisioner = new Provisioner(apps as never, core as never, {} as never, noRestoreJob as never);
+  const provisioner = new Provisioner(apps as never, core as never, {} as never, noRestoreJob as never, noCertificates as never);
   return { provisioner, replaceSecret };
 }
 
@@ -275,7 +282,7 @@ describe("credential rotation", () => {
         throw Object.assign(new Error("not found"), { code: 404 });
       },
     };
-    const provisioner = new Provisioner(apps as never, {} as never, {} as never, noRestoreJob as never);
+    const provisioner = new Provisioner(apps as never, {} as never, {} as never, noRestoreJob as never, noCertificates as never);
 
     await expect(provisioner.rotateCredentials(ID)).rejects.toBeInstanceOf(NotFoundError);
   });
@@ -361,7 +368,7 @@ describe("resize", () => {
     };
     return {
       order,
-      provisioner: new Provisioner(apps as never, core as never, {} as never, noRestoreJob as never),
+      provisioner: new Provisioner(apps as never, core as never, {} as never, noRestoreJob as never, noCertificates as never),
     };
   }
 
@@ -413,7 +420,7 @@ describe("resize", () => {
       replaceNamespacedStatefulSetScale: async () => ({}),
     };
     const core = { listNamespacedPod: async () => ({ items: [] }), patchNamespacedPersistentVolumeClaim: async () => ({}) };
-    const p = new m.Provisioner(apps as never, core as never, {} as never, noRestoreJob as never);
+    const p = new m.Provisioner(apps as never, core as never, {} as never, noRestoreJob as never, noCertificates as never);
     await expect(p.resize("a1b2c3d4e5f6", "large")).rejects.toThrow(m.ValidationError);
     vi.unstubAllEnvs();
     vi.resetModules();
