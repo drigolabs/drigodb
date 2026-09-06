@@ -31,6 +31,7 @@ sequenceDiagram
     autonumber
     participant App as Your pod
     participant API as drigodb-api<br/>drigodb-system
+    participant Store as Your secret store<br/>(Secret, SOPS, Vault…)
     participant K8s as Kubernetes
     participant DB as db-&lt;id&gt;<br/>drigodb-databases
 
@@ -38,7 +39,11 @@ sequenceDiagram
     Note right of API: Idempotent on external_id.<br/>A retry returns the existing<br/>database rather than a second one.
     API->>K8s: StatefulSet, Service, Secret, NetworkPolicy
     API-->>App: 202 {id, status: "provisioning", connection_uri}
-    Note over App: KEEP THE URI. It is returned here and on<br/>rotation only — never from a GET.
+
+    rect rgba(200,80,80,0.14)
+        App->>Store: PERSIST connection_uri — this is your job
+        Note over App,Store: drigodb does not store it for you. It is returned<br/>here and on rotation, never from a GET.<br/>Lose it and the ONLY way back into a live<br/>database is POST /credentials, which issues a<br/>new one and invalidates this one.
+    end
 
     loop until status is "ready"
         App->>API: GET /v1/databases/{id}
@@ -47,7 +52,8 @@ sequenceDiagram
 
     Note over App,DB: Your pod must carry<br/>drigodb.io/allow-database: &lt;id&gt;<br/>or the NetworkPolicy drops the packets
 
-    App->>DB: connect with connection_uri (TLS)
+    Store-->>App: connection_uri
+    App->>DB: connect (TLS)
     DB-->>App: rows
 
     Note over App,API: Later, if it may have hibernated
@@ -75,10 +81,20 @@ POST /v1/databases  {"external_id": "my-app"}
        "connection_uri": "postgres://appuser:…@db-a1b2c3d4e5f6…:5432/app?sslmode=require"}
 ```
 
-**Store it before you do anything else.** A plain `GET` never returns it, so a
-leaked read token does not leak database credentials. If you lose it, the only
-way back in is `POST /v1/databases/{id}/credentials`, which issues a new one and
-invalidates the old.
+**Storing it is your job, and drigodb does not do it for you.** Write it to a
+Secret, SOPS, Vault — wherever your application already keeps credentials —
+before you do anything else with the response.
+
+A plain `GET` never returns it, which is deliberate: a leaked read token does not
+leak database credentials. The cost of that is that **a URI you did not persist
+is gone**. The only way back into a live database is
+`POST /v1/databases/{id}/credentials`, which issues a new URI and invalidates the
+one you lost. The database is still there, still holding your data, still costing
+money — you simply cannot reach it until you rotate.
+
+The most common way to lose it is to hold it in memory, crash before writing it,
+and retry the create — which is idempotent, returns the *existing* database, and
+**does not return the URI again**.
 
 `external_id` is yours and the call is **idempotent on it**. A retry — a failed
 request, a restarted process, a reconcile loop — returns the existing database
