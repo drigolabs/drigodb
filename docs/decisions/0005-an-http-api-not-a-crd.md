@@ -57,11 +57,23 @@ tenancy that matters is OpenVoid's tenants, and they are separated by
 That leaves a real exposure stated wrongly elsewhere.
 [#76](https://github.com/drigolabs/drigodb/pull/76) made database ids derivable
 from `external_id` and named #72 as the control that would replace the
-NetworkPolicy's contribution. It is not, and now it is not coming either. **If
-App Maker runs generated tenant workloads in this cluster, one tenant's pod can
-label itself with another tenant's database id and reach it.** The password
-still holds; the network layer no longer does. A namespace per tenant is the
-fix, and whether it is urgent depends on where generated apps run.
+NetworkPolicy's contribution. It is not, and now it is not coming either.
+
+App Maker's namespaces separate **environments** — platform, data, staging apps,
+production apps — not tenants, so many tenants' applications share a namespace.
+`buildNetworkPolicy` admits any pod in any namespace carrying
+`drigodb.io/allow-database: <id>` (`namespaceSelector: {}`, deliberately, so
+consumers need not live anywhere in particular). Put together: **a pod that can
+set its own labels can reach any database whose `external_id` it can guess.**
+
+What actually holds is the password, which was always the real gate. What holds
+in practice on top of it is that App Maker generates the deployment manifests —
+a tenant who cannot influence its own pod spec cannot set the label, so reaching
+this requires compromising the platform first rather than merely being a tenant.
+
+That is a defensible position and it is not the one the documentation claims.
+`docs/consuming-drigodb.md` presents the label as an access control. It is a
+routing convenience with a security-shaped name.
 
 ## What would reverse this
 
