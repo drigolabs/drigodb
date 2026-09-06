@@ -35,6 +35,81 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
+  # The only job that proves drigodb actually provisions a database. The others
+  # prove the images build, the units pass, the chart renders deterministically,
+  # a backup restores and migrations apply — all true of a drigodb that cannot
+  # hand anyone a database.
+  #
+  # NOT YET A REQUIRED CHECK. Branch protection on main matches three checks by
+  # exact name and this is not one of them, so it reports without gating. Adding
+  # it is #91, and it needs the name below verbatim.
+  #
+  # The name is therefore already its permanent one. Renaming a job that
+  # protection matches by string blocks every pull request on a check that never
+  # reports, so there is no later moment at which this can be tidied up.
+  end-to-end:
+    name: drigodb works end to end
+    runs-on: ubuntu-latest
+    # Runs in about three minutes. The ceiling is here so a hang costs minutes
+    # rather than hours, not because the job is expected to approach it.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      # kubectl, helm and docker are already on ubuntu-latest — this repository
+      # already builds images on these runners. kind is the only addition, and it
+      # is pinned for the same reason every other version here is.
+      - name: Install kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          sudo install -o root -g root -m 0755 kind /usr/local/bin/kind
+          kind version
+
+      - name: What this runner already has
+        run: |
+          echo "docker  $(docker --version)"
+          echo "kubectl $(kubectl version --client -o json | python3 -c 'import json,sys;print(json.load(sys.stdin)["clientVersion"]["gitVersion"])')"
+          echo "helm    $(helm version --short)"
+          echo "memory  $(free -g | awk '/^Mem:/{print $2" GiB"}')"
+
+      # The same script a laptop runs, deliberately. A second path for CI would
+      # drift from the first, which this repository has already been bitten by.
+      - name: Bring up drigodb on kind
+        run: |
+          start=$SECONDS
+          DRIGODB_KIND_CLUSTER=ci bash scripts/kind-up.sh --local
+          echo "KIND_UP_SECONDS=$((SECONDS - start))" >> "$GITHUB_ENV"
+
+      - name: End to end
+        run: |
+          start=$SECONDS
+          KUBE_CONTEXT=kind-ci bash scripts/smoke.sh
+          echo "SMOKE_SECONDS=$((SECONDS - start))" >> "$GITHUB_ENV"
+
+      # A failing end-to-end test that shows only "exit 1" teaches people to
+      # re-run CI rather than read it, which is worse than not having the test.
+      - name: Why it failed
+        if: failure()
+        run: |
+          kubectl --context kind-ci get pods -A -o wide || true
+          kubectl --context kind-ci -n drigodb-system logs -l app.kubernetes.io/name=drigodb --tail=100 || true
+          kubectl --context kind-ci -n drigodb-databases get sts,pvc,svc,networkpolicy || true
+          kubectl --context kind-ci -n drigodb-databases describe pods || true
+          kubectl --context kind-ci -n cnpg-system logs -l app.kubernetes.io/name=cloudnative-pg --tail=50 || true
+
+      # Printed on every run rather than only when something breaks: this job is
+      # the slowest thing in CI, so the moment it starts taking twice as long is
+      # worth being able to see without digging through logs.
+      - name: How long it took
+        if: always()
+        run: |
+          echo "### End to end on kind" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| step | seconds |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| kind up, build, install | ${KIND_UP_SECONDS:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| smoke.sh | ${SMOKE_SECONDS:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
+
   api-image:
     name: api image builds
     runs-on: ubuntu-latest
