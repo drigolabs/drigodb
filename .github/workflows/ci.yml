@@ -86,6 +86,44 @@ jobs:
           KUBE_CONTEXT=kind-ci bash scripts/smoke.sh
           echo "SMOKE_SECONDS=$((SECONDS - start))" >> "$GITHUB_ENV"
 
+      # The readiness gate, tested by breaking the cluster underneath it.
+      #
+      # Last, because it is destructive. It deletes ONLY the Clusters CRD and
+      # leaves CloudNativePG's other eight in place, which is the case that
+      # caught the original check being too weak: the postgresql.cnpg.io group
+      # survives losing any one of its CRDs, so a check that asked whether the
+      # GROUP was served reported everything fine while provisioning was
+      # impossible.
+      - name: A cluster that cannot run a database is not reported ready
+        run: |
+          kubectl --context kind-ci delete crd clusters.postgresql.cnpg.io --timeout=90s
+          test "$(kubectl --context kind-ci api-versions | grep -c postgresql.cnpg.io)" = "1" \
+            || { echo "expected the group to survive its siblings; the test is no longer testing what it thinks"; exit 1; }
+
+          for _ in $(seq 1 40); do
+            ready=$(kubectl --context kind-ci -n drigodb-system get pods \
+              -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null)
+            [ "$ready" = "false" ] && break
+            sleep 2
+          done
+          test "$ready" = "false" || { echo "drigodb stayed Ready with no Clusters resource"; exit 1; }
+          echo "went unready, as it should"
+
+          # And back, without a restart. An operator installed late must not need
+          # anyone to notice and redeploy.
+          KUBE_CONTEXT=kind-ci bash scripts/cnpg-install.sh
+          for _ in $(seq 1 40); do
+            ready=$(kubectl --context kind-ci -n drigodb-system get pods \
+              -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null)
+            [ "$ready" = "true" ] && break
+            sleep 2
+          done
+          test "$ready" = "true" || { echo "drigodb did not recover once the operator returned"; exit 1; }
+          test "$(kubectl --context kind-ci -n drigodb-system get pods \
+            -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')" = "0" \
+            || { echo "it recovered by restarting; readiness and liveness are not separated"; exit 1; }
+          echo "recovered with no restart"
+
       # A failing end-to-end test that shows only "exit 1" teaches people to
       # re-run CI rather than read it, which is worse than not having the test.
       - name: Why it failed

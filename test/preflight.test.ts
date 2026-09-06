@@ -8,10 +8,18 @@
 
 import { describe, expect, it } from "vitest";
 
-import { CNPG_GROUP, PreflightCache, runPreflight } from "../src/k8s/preflight.js";
+import { PreflightCache, runPreflight } from "../src/k8s/preflight.js";
 
-const withCnpg = { getAPIVersions: async () => ({ groups: [{ name: "apps" }, { name: CNPG_GROUP }] }) };
-const withoutCnpg = { getAPIVersions: async () => ({ groups: [{ name: "apps" }] }) };
+// Listing Clusters, not reading API discovery. The group is not the question:
+// CloudNativePG installs nine CRDs in postgresql.cnpg.io, so the group outlives
+// the loss of the one that matters — deleting clusters.postgresql.cnpg.io on a
+// real cluster left discovery reporting the group and drigodb reporting ready.
+const withCnpg = { listNamespacedCustomObject: async () => ({ items: [] }) };
+const err = (code: number) => async () => {
+  throw Object.assign(new Error(`http ${code}`), { code });
+};
+const withoutCnpg = { listNamespacedCustomObject: err(404) };
+const cnpgForbidden = { listNamespacedCustomObject: err(403) };
 
 function storage(items: Array<{ name: string; isDefault?: boolean }>) {
   return {
@@ -52,7 +60,17 @@ describe("preflight", () => {
     const p = await runPreflight(withoutCnpg as never, storage([{ name: "standard", isDefault: true }]) as never);
     expect(p.ready).toBe(false);
     expect(check(p, "cloudnativepg")?.status).toBe("failed");
-    expect(check(p, "cloudnativepg")?.detail).toContain("not installed");
+    expect(check(p, "cloudnativepg")?.detail).toContain("Clusters resource");
+  });
+
+  it("is not ready when the operator is there and drigodb may not drive it", async () => {
+    // Distinct from the operator being absent, and it fails the same way at the
+    // first provision. Discovery could never have seen this: the group is served
+    // whether or not this service account may list anything in it.
+    const p = await runPreflight(cnpgForbidden as never, storage([{ name: "standard", isDefault: true }]) as never);
+    expect(p.ready).toBe(false);
+    expect(check(p, "cloudnativepg")?.status).toBe("failed");
+    expect(check(p, "cloudnativepg")?.detail).toContain("cannot drive it");
   });
 
   it("is not ready when no StorageClass is default and none was named", async () => {
@@ -119,9 +137,9 @@ describe("preflight", () => {
   it("caches, so a probe every five seconds is not two API calls every five seconds", async () => {
     let calls = 0;
     const counting = {
-      getAPIVersions: async () => {
+      listNamespacedCustomObject: async () => {
         calls++;
-        return { groups: [{ name: CNPG_GROUP }] };
+        return { items: [] };
       },
     };
     let now = 0;
