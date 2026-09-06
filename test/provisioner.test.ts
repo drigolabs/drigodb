@@ -16,6 +16,7 @@ import {
   templateHash,
 } from "../src/k8s/manifests.js";
 import {
+  DeletionInFlightError,
   NotFoundError,
   Provisioner,
   ValidationError,
@@ -46,15 +47,21 @@ function statefulSet(replicas: number, hash?: string) {
 // The two shapes the patch call is asserted against. Typed rather than `any`
 // so a change to what the provisioner sends fails at compile time here.
 type PatchRequest = {
-  body: { metadata: { annotations: Record<string, string> }; spec: Record<string, unknown> };
+  body: {
+    metadata: { annotations?: Record<string, string>; labels?: Record<string, string> };
+    spec?: Record<string, unknown>;
+  };
 };
 type PatchOptions = {
   middleware?: Array<{ pre: (ctx: { setHeaderParam: (k: string, v: string) => void }) => unknown }>;
 };
 
 function provisionerFor(sts: ReturnType<typeof statefulSet>) {
-  const patch = vi.fn(async (_req: PatchRequest, _opts?: PatchOptions) => {
-    calls.push("patch");
+  // Two different patches reach this mock and they must not be confused. The
+  // template rewrite is the one these tests are about; scale also patches the
+  // hibernation label, which is metadata only and rolls nothing.
+  const patch = vi.fn(async (req: PatchRequest, _opts?: PatchOptions) => {
+    calls.push(req.body.spec ? "patch" : "label");
     return sts;
   });
 
@@ -78,7 +85,8 @@ function provisionerFor(sts: ReturnType<typeof statefulSet>) {
   // The constructor takes its clients, so the whole path is exercisable without
   // a cluster.
   const provisioner = new Provisioner(apps as never, core as never, {} as never, noRestoreJob as never, noCertificates as never);
-  return { provisioner, patch };
+  const templatePatches = () => patch.mock.calls.filter(([req]) => req.body.spec);
+  return { provisioner, patch, templatePatches };
 }
 
 // Most databases were never restored into, so "no such Job" is the ordinary
@@ -105,33 +113,33 @@ beforeEach(() => {
 describe("wake", () => {
   it("rewrites a stale template before scaling, not after", async () => {
     const sts = statefulSet(0, "0000000000000000");
-    const { provisioner, patch } = provisionerFor(sts);
+    const { provisioner, templatePatches } = provisionerFor(sts);
 
     await provisioner.wake(ID);
 
     // The pod must start once, on the new template. Patching after the scale
     // would start it on the old one and then roll it.
     expect(calls.indexOf("patch")).toBeLessThan(calls.indexOf("scale"));
-    expect(patch).toHaveBeenCalledTimes(1);
+    expect(templatePatches()).toHaveLength(1);
   });
 
   it("patches only the template, and stamps the hash it rendered", async () => {
     const sts = statefulSet(0, "0000000000000000");
-    const { provisioner, patch } = provisionerFor(sts);
+    const { provisioner, templatePatches } = provisionerFor(sts);
 
     await provisioner.wake(ID);
 
-    const body = patch.mock.calls[0]?.[0].body;
-    if (!body) throw new Error("patch was not called");
+    const body = templatePatches()[0]?.[0].body;
+    if (!body?.spec) throw new Error("the template was never patched");
     // selector, serviceName and volumeClaimTemplates are immutable on a
     // StatefulSet; replicas is left out so the patch cannot fight the scale.
     expect(Object.keys(body.spec)).toEqual(["template"]);
-    expect(body.metadata.annotations[TEMPLATE_HASH_ANNOTATION]).toBe(templateHash(ID, EXT));
+    expect(body.metadata.annotations?.[TEMPLATE_HASH_ANNOTATION]).toBe(templateHash(ID, EXT));
   });
 
   it("sends a merge patch, so lists are replaced rather than unioned", async () => {
     const sts = statefulSet(0, "0000000000000000");
-    const { provisioner, patch } = provisionerFor(sts);
+    const { provisioner, templatePatches } = provisionerFor(sts);
 
     await provisioner.wake(ID);
 
@@ -141,7 +149,7 @@ describe("wake", () => {
     // which unions containers by name and env by name — a field this build no
     // longer renders would then survive in the live object forever.
     const headers: Record<string, string> = {};
-    const middleware = patch.mock.calls[0]?.[1]?.middleware ?? [];
+    const middleware = templatePatches()[0]?.[1]?.middleware ?? [];
     expect(middleware.length).toBeGreaterThan(0);
     for (const m of middleware) {
       m.pre({ setHeaderParam: (k: string, v: string) => { headers[k] = v; } });
@@ -152,11 +160,11 @@ describe("wake", () => {
 
   it("does not patch when the live template is already current", async () => {
     const sts = statefulSet(0, templateHash(ID, EXT));
-    const { provisioner, patch } = provisionerFor(sts);
+    const { provisioner, templatePatches } = provisionerFor(sts);
 
     await provisioner.wake(ID);
 
-    expect(patch).not.toHaveBeenCalled();
+    expect(templatePatches()).toHaveLength(0);
     expect(calls).toContain("scale");
   });
 
@@ -165,11 +173,11 @@ describe("wake", () => {
     // StatefulSet rolls the pod and drops every live connection, so a stale
     // hash must still be left alone until the next hibernate/wake cycle.
     const sts = statefulSet(1, "0000000000000000");
-    const { provisioner, patch } = provisionerFor(sts);
+    const { provisioner, templatePatches } = provisionerFor(sts);
 
     await provisioner.wake(ID);
 
-    expect(patch).not.toHaveBeenCalled();
+    expect(templatePatches()).toHaveLength(0);
   });
 
   it("is a 404 rather than a 500 when there is no such database", async () => {
@@ -424,5 +432,172 @@ describe("resize", () => {
     await expect(p.resize("a1b2c3d4e5f6", "large")).rejects.toThrow(m.ValidationError);
     vi.unstubAllEnvs();
     vi.resetModules();
+  });
+});
+
+// Two replicas handling the same external_id at the same moment. Before the
+// StatefulSet's name became the lock, both found nothing and both created —
+// which is exactly the failure idempotency exists to prevent, and it only became
+// reachable with more than one replica.
+describe("concurrent create", () => {
+  function racingCluster() {
+    const created: string[] = [];
+    // Replicas and labels are tracked rather than answered with a constant:
+    // the whole question here is what a caller sees while a create is midway
+    // through, and a fake that always says "one replica, ready" cannot show it.
+    const objects = new Map<string, { labels: Record<string, string>; replicas: number }>();
+    const conflict = () => {
+      const e = new Error("already exists") as Error & { code: number };
+      e.code = 409;
+      return e;
+    };
+    const apps = {
+      createNamespacedStatefulSet: async (req: { body: { metadata: { name: string; labels: Record<string, string> }; spec: { replicas: number } } }) => {
+        const name = req.body.metadata.name;
+        if (objects.has(name)) throw conflict();
+        objects.set(name, { labels: { ...req.body.metadata.labels }, replicas: req.body.spec.replicas });
+        created.push(name);
+        return req.body;
+      },
+      readNamespacedStatefulSet: async (req: { name: string }) => {
+        const o = objects.get(req.name);
+        if (!o) { const e = new Error("nf") as Error & { code: number }; e.code = 404; throw e; }
+        return {
+          metadata: { name: req.name, labels: o.labels },
+          spec: { replicas: o.replicas },
+          status: { readyReplicas: o.replicas },
+        };
+      },
+      readNamespacedStatefulSetScale: async (req: { name: string }) => ({
+        spec: { replicas: objects.get(req.name)?.replicas ?? 0 },
+      }),
+      replaceNamespacedStatefulSetScale: async (req: { name: string; body: { spec: { replicas: number } } }) => {
+        const o = objects.get(req.name);
+        if (o) o.replicas = req.body.spec.replicas;
+        return {};
+      },
+      patchNamespacedStatefulSet: async (req: { name: string; body: { metadata?: { labels?: Record<string, string> } } }) => {
+        const o = objects.get(req.name);
+        if (o) Object.assign(o.labels, req.body.metadata?.labels ?? {});
+        return {};
+      },
+    };
+    // Volumes outlive their StatefulSet by design (the retention policy keeps
+    // them), so a create has to be able to see one left behind by a delete.
+    const pvcs: Array<{ metadata: { name: string } }> = [];
+    const core = {
+      createNamespacedSecret: async () => ({}),
+      createNamespacedService: async () => ({}),
+      listNamespacedPod: async () => ({ items: [] }),
+      listNamespacedPersistentVolumeClaim: async () => ({ items: pvcs }),
+    };
+    const net = { createNamespacedNetworkPolicy: async () => ({}) };
+    return {
+      created,
+      objects,
+      pvcs,
+      provisioner: new Provisioner(apps as never, core as never, net as never, noRestoreJob as never, noCertificates as never),
+    };
+  }
+
+  it("creates one database when two replicas race on the same external_id", async () => {
+    const { provisioner, created } = racingCluster();
+    const [a, b] = await Promise.all([
+      provisioner.create("same-app"),
+      provisioner.create("same-app"),
+    ]);
+    expect(created).toHaveLength(1);
+    expect(a.database.id).toBe(b.database.id);
+    // Exactly one of them owns the password, and only that one may hand back a URI.
+    expect([a.created, b.created].filter(Boolean)).toHaveLength(1);
+    expect([a.uri, b.uri].filter((u) => u !== "")).toHaveLength(1);
+  });
+
+  it("gives the same id for the same external_id, and different ids for different ones", async () => {
+    const { provisioner } = racingCluster();
+    const first = await provisioner.create("app-one");
+    const { provisioner: other } = racingCluster();
+    const again = await other.create("app-one");
+    const different = await other.create("app-two");
+    expect(again.database.id).toBe(first.database.id);
+    expect(different.database.id).not.toBe(first.database.id);
+    expect(first.database.id).toMatch(/^[0-9a-f]{12}$/);
+  });
+
+  // Found on a kind cluster running two API replicas, not in a mock: eight
+  // simultaneous creates of one external_id produced one database, and seven of
+  // the eight callers were told it was hibernated. Zero replicas is what a
+  // create looks like between the StatefulSet and the wake that follows it, and
+  // the losing caller lands in exactly that window every time.
+  it("tells a losing caller the database is provisioning, not hibernated", async () => {
+    const { provisioner, objects } = racingCluster();
+    const { database } = await provisioner.create("mid-create");
+
+    // Back to the state the winner leaves behind before it wakes.
+    objects.get(`db-${database.id}`)!.replicas = 0;
+
+    expect((await provisioner.get(database.id)).status).toBe("provisioning");
+  });
+
+  it("reports hibernated once something asked for it", async () => {
+    const { provisioner } = racingCluster();
+    const { database } = await provisioner.create("put-me-down");
+
+    expect(database.status).toBe("ready");
+    expect((await provisioner.scale(database.id, 0)).status).toBe("hibernated");
+    expect((await provisioner.wake(database.id)).status).toBe("ready");
+  });
+
+  it("still reads a database created before the label as hibernated", async () => {
+    // Nothing rewrites an existing StatefulSet on upgrade. One that predates
+    // the label has no intent recorded, and the replica count is what it was
+    // always judged by — so it must keep answering the way it did.
+    const { provisioner, objects } = racingCluster();
+    const { database } = await provisioner.create("older-than-the-label");
+    const live = objects.get(`db-${database.id}`)!;
+    delete live.labels["drigodb.io/hibernated"];
+    live.replicas = 0;
+
+    expect((await provisioner.get(database.id)).status).toBe("hibernated");
+  });
+
+  // The other edge of a derived id: the name is reused, so the volume name is
+  // reused too. PVC deletion is not instant, and a database created into a
+  // surviving volume comes up on the deleted database's rows behind a password
+  // that does not match the URI just handed out.
+  it("refuses a create landing on a volume that has not finished going", async () => {
+    const { provisioner, objects, pvcs } = racingCluster();
+    const { database } = await provisioner.create("delete-then-recreate");
+
+    objects.delete(`db-${database.id}`);
+    pvcs.push({ metadata: { name: `data-db-${database.id}-0` } });
+
+    await expect(provisioner.create("delete-then-recreate")).rejects.toThrow(DeletionInFlightError);
+
+    // And succeeds once the volume is actually gone.
+    pvcs.length = 0;
+    await expect(provisioner.create("delete-then-recreate")).resolves.toMatchObject({ created: true });
+  });
+
+  it("does not mistake a live database's own volume for one being deleted", async () => {
+    const { provisioner, pvcs } = racingCluster();
+    const { database } = await provisioner.create("still-here");
+    pvcs.push({ metadata: { name: `data-db-${database.id}-0` } });
+
+    const again = await provisioner.create("still-here");
+    expect(again.created).toBe(false);
+    expect(again.database.id).toBe(database.id);
+  });
+
+  it("refuses rather than handing over a database belonging to another external_id", async () => {
+    // A hash collision needs millions of external_ids, and handing one caller
+    // another's database with its credentials is not a failure to find in
+    // production.
+    const { provisioner } = racingCluster();
+    await provisioner.create("app-one");
+    const sts = await (provisioner as never as { statefulSetFor: (id: string) => Promise<{ metadata: { labels: Record<string, string> } }> })
+      .statefulSetFor((await provisioner.create("app-one")).database.id);
+    sts.metadata.labels["drigodb.io/external-id"] = "someone-else";
+    await expect(provisioner.create("app-one")).rejects.toThrow(ValidationError);
   });
 });

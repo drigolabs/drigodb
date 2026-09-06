@@ -10,7 +10,21 @@ image:
   pullPolicy: IfNotPresent
 
 api:
-  replicas: 1
+  # Two, so a rollout or a node drain does not stop provisioning.
+  #
+  # The blast radius of losing the control plane is small and worth stating,
+  # because it is the main argument for this architecture: existing databases are
+  # unaffected. Consumers connect to their own database directly, not through
+  # here, so an outage stops provisioning, waking and hibernating — not serving.
+  # Waking is on the critical path for a hibernated database, though, so a cold
+  # application does stall.
+  replicas: 2
+  # Keeps a voluntary disruption — a drain, an upgrade — from taking both at
+  # once. Set to 0 alongside replicas: 1, or a single-replica install can never
+  # be drained at all.
+  podDisruptionBudget:
+    enabled: true
+    minAvailable: 1
   # The bearer token every API call carries. One of these is required — the
   # chart will not invent a credential, because a template that generates one
   # renders differently every time and silently rotates it under any renderer
