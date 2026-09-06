@@ -1,5 +1,5 @@
 import { serve } from "@hono/node-server";
-import { ApisApi, KubeConfig, StorageV1Api } from "@kubernetes/client-node";
+import { CustomObjectsApi, KubeConfig, StorageV1Api } from "@kubernetes/client-node";
 import { Hono } from "hono";
 
 import { buildRoutes } from "./api/routes.js";
@@ -29,7 +29,7 @@ function main(): void {
   // silently, and this is what stops a broken installation looking green.
   //
   // 503 rather than 500: the pod is fine, the cluster is not ready for it.
-  const preflight = new PreflightCache(kc.makeApiClient(ApisApi), kc.makeApiClient(StorageV1Api));
+  const preflight = new PreflightCache(kc.makeApiClient(CustomObjectsApi), kc.makeApiClient(StorageV1Api));
   app.get("/readyz", async (c) => {
     const result = await preflight.get();
     return c.json(result, result.ready ? 200 : 503);

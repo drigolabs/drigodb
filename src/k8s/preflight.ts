@@ -21,7 +21,7 @@
 // fails honestly, and the moment somebody installs the missing piece it goes
 // Ready on the next probe with nothing to restart.
 
-import { ApisApi, StorageV1Api } from "@kubernetes/client-node";
+import { CustomObjectsApi, StorageV1Api } from "@kubernetes/client-node";
 
 import { config } from "../config.js";
 
@@ -49,29 +49,59 @@ function readyFrom(checks: Check[]): boolean {
   return checks.every((c) => c.status !== "failed");
 }
 
-// API discovery, not the CustomResourceDefinition API. Reading a CRD is a
-// cluster-scoped permission drigodb would have to be granted; discovery is
-// available to every authenticated account through the built-in
-// `system:discovery` ClusterRole. Same answer, no new rights.
-async function checkOperator(apis: ApisApi): Promise<Check> {
+// Ask the exact question provisioning asks: can Clusters be listed in the
+// namespace databases are created in.
+//
+// An earlier version checked API discovery for the `postgresql.cnpg.io` GROUP,
+// which is a weaker question wearing the same clothes. CloudNativePG installs
+// nine CRDs in that group, so the group survives the loss of any one of them —
+// deleting `clusters.postgresql.cnpg.io` outright left discovery still reporting
+// the group as served, and drigodb still reporting itself ready. Found by trying
+// to write a test for the check.
+//
+// Listing also covers the RBAC in the same call, which discovery never could: a
+// correctly installed operator drigodb has no permission to drive fails here,
+// where it used to pass and then fail at the first provision.
+async function checkOperator(objects: CustomObjectsApi): Promise<Check> {
   try {
-    const groups = await apis.getAPIVersions();
-    const found = (groups.groups ?? []).some((g) => g.name === CNPG_GROUP);
-    return found
-      ? { name: "cloudnativepg", status: "ok", detail: `${CNPG_GROUP} is served by this cluster` }
-      : {
-          name: "cloudnativepg",
-          status: "failed",
-          detail:
-            `the CloudNativePG operator is not installed: no ${CNPG_GROUP} API group. ` +
-            "A database is a CNPG Cluster, so provisioning would fail. " +
-            "Install it with scripts/cnpg-install.sh, or see docs/getting-started.md",
-        };
+    await objects.listNamespacedCustomObject({
+      group: CNPG_GROUP,
+      version: "v1",
+      namespace: config.databaseNamespace,
+      plural: "clusters",
+      limit: 1,
+    });
+    return {
+      name: "cloudnativepg",
+      status: "ok",
+      detail: `Clusters are listable in ${config.databaseNamespace}`,
+    };
   } catch (err) {
+    const code = (err as { code?: number })?.code;
+    if (code === 403) {
+      return {
+        name: "cloudnativepg",
+        status: "failed",
+        detail:
+          `not permitted to list ${CNPG_GROUP} Clusters in ${config.databaseNamespace}. ` +
+          "The operator is installed but drigodb cannot drive it, so provisioning would fail",
+      };
+    }
+    if (code === 404) {
+      return {
+        name: "cloudnativepg",
+        status: "failed",
+        detail:
+          `no ${CNPG_GROUP}/v1 Clusters resource, or no ${config.databaseNamespace} namespace. ` +
+          "A database is a CNPG Cluster, so provisioning would fail. " +
+          "Install the operator with scripts/cnpg-install.sh, or see docs/getting-started.md",
+      };
+    }
+    // Anything else is the cluster declining to answer rather than answering no.
     return {
       name: "cloudnativepg",
       status: "unverified",
-      detail: `could not read API discovery: ${(err as Error)?.message ?? err}`,
+      detail: `could not list Clusters: ${(err as Error)?.message ?? err}`,
     };
   }
 }
@@ -148,12 +178,12 @@ async function checkStorageClass(storage: StorageV1Api, want: string): Promise<C
 // the two branches — named class, cluster default — are both reachable from a
 // test without reloading a module to change an environment variable.
 export async function runPreflight(
-  apis: ApisApi,
+  objects: CustomObjectsApi,
   storage: StorageV1Api,
   wantedStorageClass: string = config.storageClass,
 ): Promise<Preflight> {
   const checks = await Promise.all([
-    checkOperator(apis),
+    checkOperator(objects),
     checkStorageClass(storage, wantedStorageClass),
   ]);
   return { ready: readyFrom(checks), checks };
@@ -168,14 +198,14 @@ export class PreflightCache {
   private last?: { at: number; result: Preflight };
 
   constructor(
-    private readonly apis: ApisApi,
+    private readonly objects: CustomObjectsApi,
     private readonly storage: StorageV1Api,
     private readonly now: () => number = Date.now,
   ) {}
 
   async get(): Promise<Preflight> {
     if (this.last && this.now() - this.last.at < TTL_MS) return this.last.result;
-    const result = await runPreflight(this.apis, this.storage, config.storageClass);
+    const result = await runPreflight(this.objects, this.storage, config.storageClass);
     this.last = { at: this.now(), result };
     return result;
   }
