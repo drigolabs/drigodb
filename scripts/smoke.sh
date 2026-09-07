@@ -362,6 +362,76 @@ else
   note "could not start a probe pod; skipping the NetworkPolicy check"
 fi
 
+step "Backup and restore"
+# Skipped when this installation has nowhere to put a backup, which is what the
+# API says rather than something this script infers. An installation without
+# object storage is a supported configuration, not a broken one.
+BACKUPS_STATE="$(api "localhost:${API_PORT}/v1/databases/${DB_ID}" | jqf '["backups"]')"
+if [ "$BACKUPS_STATE" != "enabled" ]; then
+  note "backups are ${BACKUPS_STATE} for this installation; skipping"
+else
+  # A row that exists BEFORE the backup, and one after. Without the second, a
+  # restore that silently returned the live database would pass.
+  psql_in_cluster "$URI" "CREATE TABLE IF NOT EXISTS bk (id int PRIMARY KEY, note text);
+    INSERT INTO bk VALUES (1,'before-backup') ON CONFLICT DO NOTHING;" >/dev/null
+
+  BK_ID="$(api -XPOST "localhost:${API_PORT}/v1/databases/${DB_ID}/backups" | jqf '["id"]')"
+  for _ in $(seq 1 60); do
+    BK_STATE="$(api "localhost:${API_PORT}/v1/databases/${DB_ID}/backups" \
+      | python3 -c "import json,sys;print(next((b['status'] for b in json.load(sys.stdin)['backups'] if b['id']=='${BK_ID}'),'missing'))")"
+    case "$BK_STATE" in completed|failed) break ;; esac
+    sleep 3
+  done
+  [ "$BK_STATE" = "completed" ] || { fail "backup did not complete (${BK_STATE})"; exit 1; }
+  ok "backup ${BK_ID} completed"
+
+  psql_in_cluster "$URI" "INSERT INTO bk VALUES (2,'after-backup') ON CONFLICT DO NOTHING;" >/dev/null
+
+  RESTORED="$(api -XPOST "localhost:${API_PORT}/v1/databases" \
+    -d "{\"external_id\":\"${EXTERNAL_ID}-restored\",\"restore_from\":{\"database_id\":\"${DB_ID}\",\"backup_id\":\"${BK_ID}\"}}")"
+  R_ID="$(echo "$RESTORED" | jqf '["id"]')"
+  R_URI="$(echo "$RESTORED" | jqf '["connection_uri"]')"
+  for _ in $(seq 1 90); do
+    R_STATE="$(api "localhost:${API_PORT}/v1/databases/${R_ID}" | jqf '["status"]')"
+    case "$R_STATE" in ready|failed) break ;; esac
+    sleep 3
+  done
+  [ "$R_STATE" = "ready" ] || { fail "restored database never became ready (${R_STATE})"; exit 1; }
+  ok "restored into ${R_ID}"
+
+  # The assertion the whole feature turns on: the restore is the state AT the
+  # backup, not the state now. A restore that quietly handed back the live
+  # database would look identical without this.
+  SAVED_DB_ID="$DB_ID"; DB_ID="$R_ID"
+  R_ROWS="$(psql_in_cluster "$R_URI" "SELECT string_agg(note, ',' ORDER BY id) FROM bk")"
+  DB_ID="$SAVED_DB_ID"
+  case "$R_ROWS" in
+    *before-backup*after-backup*) fail "the restore contains data written AFTER the backup"; exit 1 ;;
+    *before-backup*) ok "restored to the backup, not to now" ;;
+    *) fail "restored database has no data (${R_ROWS})"; exit 1 ;;
+  esac
+
+  SRC_ROWS="$(psql_in_cluster "$URI" "SELECT string_agg(note, ',' ORDER BY id) FROM bk")"
+  case "$SRC_ROWS" in
+    *before-backup*after-backup*) ok "the source database is untouched" ;;
+    *) fail "the source lost data during a restore (${SRC_ROWS})"; exit 1 ;;
+  esac
+
+  # Restoring someone else's backup is reading their data. A 400 here is a
+  # security property, not a validation nicety.
+  THEFT="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" \
+    -H 'content-type: application/json' -XPOST "localhost:${API_PORT}/v1/databases" \
+    -d "{\"external_id\":\"${EXTERNAL_ID}-theft\",\"restore_from\":{\"database_id\":\"${R_ID}\",\"backup_id\":\"${BK_ID}\"}}")"
+  if [ "$THEFT" = "400" ]; then
+    ok "a backup belonging to another database is refused"
+  else
+    fail "restoring another database's backup returned ${THEFT}, not 400"
+    exit 1
+  fi
+
+  api -XDELETE "localhost:${API_PORT}/v1/databases/${R_ID}" >/dev/null 2>&1 || true
+fi
+
 step "Rotating credentials"
 # The recovery path: the connection URI is handed out on creation and never
 # again, so without rotation a caller that loses one can never reach its
