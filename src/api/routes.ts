@@ -8,6 +8,7 @@ import {
   Provisioner,
   DeletionInFlightError,
   NotConfiguredError,
+  validateRestoreFrom,
   ValidationError,
   validateExternalId,
   validateTier,
@@ -18,17 +19,24 @@ export function buildRoutes(provisioner: Provisioner): Hono {
   const app = new Hono();
 
 
+  // `restore_from` makes this a provision with a source rather than a separate
+  // verb: a restored database is a NEW database, with a new id, its own volume
+  // and its own credentials. The one it was restored from is untouched, which
+  // is what makes this the safe shape — an undo that cannot damage the thing
+  // being undone.
   app.post("/v1/databases", async (c) => {
     let externalId: string;
+    let restoreFrom: { databaseId: string; backupId?: string } | undefined;
     try {
       const body = await c.req.json().catch(() => ({}));
       externalId = validateExternalId((body as { external_id?: unknown }).external_id);
+      restoreFrom = validateRestoreFrom((body as { restore_from?: unknown }).restore_from);
     } catch (err) {
       if (err instanceof ValidationError) return c.json({ error: err.message }, 400);
       throw err;
     }
 
-    const { database, uri, created } = await provisioner.create(externalId);
+    const { database, uri, created } = await provisioner.create(externalId, restoreFrom);
     // 202 on create because provisioning is asynchronous — roughly 12 seconds,
     // too long to hold a request open. 200 on a repeat, which returns the
     // existing database without its credentials.

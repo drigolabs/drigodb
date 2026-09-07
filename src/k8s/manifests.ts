@@ -83,6 +83,10 @@ export const CREDENTIAL_VERSION_ANNOTATION = "drigodb.io/credential-version";
 // further. Point-in-time recovery (#19) is the archive, not the backup.
 export const BARMAN_PLUGIN = "barman-cloud.cloudnative-pg.io";
 
+// The name a restoring Cluster gives the thing it is restoring FROM. Internal
+// to one manifest — nothing outside it ever sees this string.
+export const RESTORE_SOURCE_NAME = "origin";
+
 export const CNPG_NAMESPACE = "cnpg-system";
 export const CNPG_STATUS_PORT = 8000;
 
@@ -339,9 +343,23 @@ export interface CnpgClusterSpec {
   certificates?: { serverCASecret: string; serverTLSSecret: string };
   plugins?: Array<{ name: string; isWALArchiver: boolean; parameters: Record<string, string> }>;
   resources: object;
-  bootstrap: {
-    initdb: { database: string; owner: string; secret: { name: string } };
-  };
+  // One or the other, never both: a Cluster either initialises an empty database
+  // or recovers someone else's backup into a new one.
+  bootstrap:
+    | { initdb: { database: string; owner: string; secret: { name: string } } }
+    | {
+        recovery: {
+          source: string;
+          database: string;
+          owner: string;
+          secret: { name: string };
+          recoveryTarget?: { backupID: string };
+        };
+      };
+  externalClusters?: Array<{
+    name: string;
+    plugin: { name: string; parameters: Record<string, string> };
+  }>;
   managed: {
     roles: Array<{
       name: string;
@@ -361,10 +379,19 @@ export interface CnpgClusterManifest {
   spec: CnpgClusterSpec;
 }
 
+// Where a restored database gets its data from. `sourceCluster` is the source
+// database's Cluster name, which is also its serverName in the bucket;
+// `barmanBackupId` picks one backup rather than the latest.
+export interface RestoreSource {
+  sourceCluster: string;
+  barmanBackupId?: string;
+}
+
 export function buildCluster(
   id: string,
   externalId: string,
   tier: Tier = "small",
+  restore?: RestoreSource,
 ): CnpgClusterManifest {
   const labels = { ...labelsFor(id, externalId), [TIER_LABEL]: tier };
   return {
@@ -479,6 +506,44 @@ export function buildCluster(
         limits: { memory: PG_MEMORY_LIMIT },
       },
 
+      // A restored database is a NEW database — its own id, volume and
+      // credential — reading someone else's backup once at birth. The database
+      // it came from is untouched, which is what makes an undo safe: the thing
+      // being undone cannot be damaged by undoing it.
+      //
+      // `secret` matters as much as the data. Without it CloudNativePG restores
+      // the source's roles and the caller is handed a URI carrying a password
+      // this database never had. With it, the new credential is applied on
+      // recovery, so the URI returned by create is true immediately.
+      ...(restore
+        ? {
+            bootstrap: {
+              recovery: {
+                source: RESTORE_SOURCE_NAME,
+                database: DB_NAME,
+                owner: DB_USER,
+                secret: { name: secretName(id) },
+                ...(restore.barmanBackupId
+                  ? { recoveryTarget: { backupID: restore.barmanBackupId } }
+                  : {}),
+              },
+            },
+            externalClusters: [
+              {
+                name: RESTORE_SOURCE_NAME,
+                plugin: {
+                  name: BARMAN_PLUGIN,
+                  parameters: {
+                    barmanObjectName: config.backup.objectStore,
+                    // The SOURCE's server name, which is how barman finds its
+                    // backups in a bucket shared by every database.
+                    serverName: restore.sourceCluster,
+                  },
+                },
+              },
+            ],
+          }
+        : {
       bootstrap: {
         initdb: {
           database: DB_NAME,
@@ -492,6 +557,7 @@ export function buildCluster(
           secret: { name: secretName(id) },
         },
       },
+          }),
 
       // The rotation path. CNPG reconciles the role against this Secret
       // continuously, so replacing the Secret is what changes the password —

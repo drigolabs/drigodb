@@ -38,6 +38,7 @@ import {
   POSTGRES_PORT,
   buildNetworkPolicy,
   buildCertificate,
+  type RestoreSource,
   buildBackup,
   buildCluster,
   buildSecret,
@@ -181,6 +182,32 @@ export function validateExternalId(value: unknown): string {
 // not get them in: the password is the real gate, and the README already records
 // the network layer as the one trusted least. #72, which makes a database belong
 // to the token that created it, is the control that actually replaces this.
+// What `restore_from` is allowed to say.
+//
+// Both fields are names that end up in a Kubernetes object and in a path inside
+// a bucket, so they are checked rather than trusted. The old shape took a bucket
+// KEY, which had to be checked for `..` to stop one caller reading another
+// database's prefix; there is no path here any more, only two identifiers this
+// service issued itself.
+export function validateRestoreFrom(
+  value: unknown,
+): { databaseId: string; backupId?: string } | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object") {
+    throw new ValidationError("restore_from must be an object");
+  }
+  const v = value as { database_id?: unknown; backup_id?: unknown };
+  if (typeof v.database_id !== "string" || !/^[0-9a-f]{12}$/.test(v.database_id)) {
+    throw new ValidationError("restore_from.database_id must be a database id");
+  }
+  if (v.backup_id !== undefined) {
+    if (typeof v.backup_id !== "string" || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(v.backup_id)) {
+      throw new ValidationError("restore_from.backup_id must be a backup id from GET /backups");
+    }
+  }
+  return { databaseId: v.database_id, ...(v.backup_id ? { backupId: v.backup_id } : {}) };
+}
+
 function idFor(externalId: string): string {
   return createHash("sha256").update(externalId).digest("hex").slice(0, 12);
 }
@@ -462,6 +489,7 @@ export class Provisioner {
   // leak database credentials.
   async create(
     externalId: string,
+    restoreFrom?: { databaseId: string; backupId?: string },
   ): Promise<{ database: Database; uri: string; created: boolean }> {
     const id = idFor(externalId);
     const password = newPassword();
@@ -486,6 +514,11 @@ export class Provisioner {
         `a database for external_id ${externalId} is still being deleted; retry in a moment`,
       );
     }
+
+    // Resolved BEFORE anything is created, so a restore naming a database or a
+    // backup that does not exist fails without leaving a half-made database
+    // behind for someone to find.
+    const restore = restoreFrom ? await this.resolveRestore(restoreFrom) : undefined;
 
     // The Secret BEFORE the Cluster, which is the one ordering CloudNativePG
     // forces and the old data plane did not. bootstrap.initdb.secret is read
@@ -526,7 +559,7 @@ export class Provisioner {
         version: "v1",
         namespace: ns,
         plural: CLUSTERS_PLURAL,
-        body: buildCluster(id, externalId, defaultTier()),
+        body: buildCluster(id, externalId, defaultTier(), restore),
       });
     } catch (err) {
       if (!isAlreadyExists(err)) throw err;
@@ -862,6 +895,60 @@ export class Provisioner {
   // 202, not 200: the operator does the work and reports it in the object's
   // status. This returns as soon as the request exists, which is the only thing
   // drigodb can honestly say has happened.
+  // Turn what a caller was given into what CloudNativePG wants.
+  //
+  // A caller holds the id GET /backups handed them, which is the Backup object's
+  // name. CloudNativePG's recoveryTarget wants BARMAN's id, which only exists
+  // once the backup completed. Translating here means the two identifiers a
+  // consumer sees are the ones drigodb issued, and the operator's is internal.
+  private async resolveRestore(from: {
+    databaseId: string;
+    backupId?: string;
+  }): Promise<RestoreSource> {
+    if (!backupsEnabled()) {
+      throw new NotConfiguredError(
+        "backups are not configured for this installation, so there is nothing to restore from",
+      );
+    }
+    // The source database need not still exist — restoring from a database
+    // somebody deleted is a legitimate thing to want, and its backups outlive
+    // it in the bucket. What must exist is the backup, when one was named.
+    if (!from.backupId) {
+      return { sourceCluster: clusterName(from.databaseId) };
+    }
+    const backup = (await this.objects
+      .getNamespacedCustomObject({
+        group: CNPG_GROUP,
+        version: "v1",
+        namespace: config.databaseNamespace,
+        plural: BACKUPS_PLURAL,
+        name: from.backupId,
+      })
+      .catch((err: unknown) => {
+        if (isNotFound(err)) throw new NotFoundError(`no backup with id ${from.backupId}`);
+        throw err;
+      })) as CnpgBackup;
+
+    // Belongs to the database the caller says it does. Without this a caller
+    // could restore any backup in the installation by naming it, which is
+    // reading another tenant's data through an id they guessed.
+    const owner = (backup as { metadata?: { labels?: Record<string, string> } }).metadata?.labels?.[
+      DB_ID_LABEL
+    ];
+    if (owner !== from.databaseId) {
+      throw new ValidationError(
+        `backup ${from.backupId} does not belong to database ${from.databaseId}`,
+      );
+    }
+    const barmanId = backup.status?.backupId;
+    if (!barmanId) {
+      throw new ValidationError(
+        `backup ${from.backupId} has not completed, so there is nothing to restore from yet`,
+      );
+    }
+    return { sourceCluster: clusterName(from.databaseId), barmanBackupId: barmanId };
+  }
+
   async createBackup(id: string): Promise<DatabaseBackup> {
     const cluster = await this.clusterFor(id);
     if (!cluster) throw new NotFoundError(`no database with id ${id}`);

@@ -221,6 +221,7 @@ spec:
 - **No connection pooling.** One PostgreSQL instance per database, `max_connections` at the server default. Pool in your application.
 - **No schema management.** drigodb puts nothing inside your database — no schema, no table, no extension. It is yours entirely.
 - **No automatic backups.** WAL is archived continuously once an installation configures storage, but a base backup is taken when you ask for one — `POST /v1/databases/{id}/backups`. Nothing takes one on a schedule yet.
+- **No restore in place.** Restoring gives you a *new* database from a backup; it never overwrites the one you have. Point your application at the new URI when you are satisfied with it.
 - **No automatic hibernation.** Nothing decides your database is idle.
 - **No accounts or quotas.** One token per installation, and every holder can do everything —
   including to databases they did not create. If you are not also the operator, you are trusting

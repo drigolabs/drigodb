@@ -285,7 +285,18 @@ DRIGODB_BACKUP_ENDPOINT=https://fra1.digitaloceanspaces.com
 ```
 POST /v1/databases/{id}/backups   → 202, take one now
 GET  /v1/databases/{id}/backups   → what can be restored
+
+POST /v1/databases  { external_id, restore_from: { database_id, backup_id? } }
 ```
+
+**A restored database is a new database** — its own id, its own volume, its own
+credentials — and the one it came from is untouched. That is what makes it a
+safe undo: the thing being undone cannot be damaged by undoing it. Omit
+`backup_id` for the latest backup.
+
+A backup belongs to the database it was taken from, and drigodb refuses a
+`restore_from` that names someone else's — otherwise any backup in the
+installation could be read by guessing its id.
 
 **drigodb never touches object storage.** It names a Secret, and CloudNativePG's
 barman-cloud plugin does the reading, the archiving and the writing. The control
