@@ -45,14 +45,10 @@ was checking passed for seven consecutive releases without ever deploying.
 
 ## Backups
 
-```bash
-bash scripts/kind-up.sh --with-backups
-```
-
-Adds MinIO and points drigodb at it. MinIO is what the backup image's own
-integration test already runs against, so this is the same substitution the
-tests make rather than a new one. Backups, listing and restore all work.
-
+Not available in this release — see
+[decision 0004](decisions/0004-cloudnativepg-for-the-data-plane.md) and
+[#95](https://github.com/drigolabs/drigodb/issues/95). The MinIO that used to
+stand in for object storage went with the sidecar it fed.
 ## What a laptop can tell you now
 
 The network layer, in full — see below. That leaves storage behaviour, timings

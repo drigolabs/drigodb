@@ -20,7 +20,7 @@ import type {
   V1StatefulSet,
 } from "@kubernetes/client-node";
 
-import { backupsEnabled, config, serverAuthEnabled } from "../config.js";
+import { config, serverAuthEnabled } from "../config.js";
 
 export const DB_ID_LABEL = "drigodb.io/database-id";
 export const EXTERNAL_ID_LABEL = "drigodb.io/external-id";
@@ -30,16 +30,6 @@ export const MANAGED_BY_VALUE = "drigodb";
 // A consumer pod carrying this label may reach the named database. It works
 // across namespaces, so consumers need not live anywhere in particular.
 export const ALLOW_LABEL = "drigodb.io/allow-database";
-
-// Which generation of the pod template a database was last built from. Wake
-// compares it against the template this build renders and reconciles when they
-// differ, which is how a patched data-plane image reaches a database that
-// already exists.
-//
-// On the StatefulSet's own metadata, deliberately — never the pod template's.
-// An annotation inside the template is part of the template, so writing it
-// would change the hash it records, and every wake would roll the pod forever.
-export const TEMPLATE_HASH_ANNOTATION = "drigodb.io/template-hash";
 
 // Which tier a database is on. On the StatefulSet, because the live PVC is the
 // truth and reading a PVC to answer "how big is this database" is a second API
@@ -65,6 +55,33 @@ export const TIER_LABEL = "drigodb.io/tier";
 // fallback.
 export const HIBERNATED_LABEL = "drigodb.io/hibernated";
 
+// CloudNativePG's API group. A hosted database is a Cluster in it — decision
+// 0004 — and preflight checks that this cluster can list them before drigodb
+// reports itself able to work.
+export const CNPG_GROUP = "postgresql.cnpg.io";
+export const CLUSTERS_PLURAL = "clusters";
+
+// How CloudNativePG is told to put a database down. An annotation rather than a
+// replica count, and drigodb keeps its own HIBERNATED_LABEL beside it: this one
+// says what the operator was asked to do, the label says what drigodb meant.
+export const CNPG_HIBERNATION_ANNOTATION = "cnpg.io/hibernation";
+
+// Where the operator runs, and the port it reaches each instance on to read its
+// status. drigodb's NetworkPolicy has to admit it, or the operator cannot
+// reconcile the databases it is managing.
+// Which version of the credential Secret drigodb expects the operator to have
+// applied. Written on the Cluster to make rotation actually happen: replacing
+// the Secret alone does not, because CloudNativePG reports the role already
+// `reconciled` and does not look again until something touches the Cluster.
+export const CREDENTIAL_VERSION_ANNOTATION = "drigodb.io/credential-version";
+
+export const CNPG_NAMESPACE = "cnpg-system";
+export const CNPG_STATUS_PORT = 8000;
+
+// The key CNPG reads a username from when it is handed a credential Secret. It
+// wants a kubernetes.io/basic-auth Secret, so the password alone is not enough.
+export const USERNAME_SECRET_KEY = "username";
+
 // A tier is a floor, not a quota. Nothing stops a database filling its volume.
 //
 // max_wal_size scales with the tier for performance rather than correctness: it
@@ -87,7 +104,7 @@ export function tierOf(labels: Record<string, string> | undefined): Tier {
 }
 
 export function pvcName(id: string): string {
-  return `${DATA_VOLUME}-${statefulSetName(id)}-0`;
+  return `${DATA_VOLUME}-${clusterName(id)}-0`;
 }
 
 export const CONFIG_MAP_NAME = "drigodb-config";
@@ -102,14 +119,12 @@ export const CONFIG_MOUNT_PATH = "/drigodb-config";
 // picks it up on its next wake through the same reconcile that carries an image
 // update — which is the whole reason schema ships this way rather than from the
 // control plane. See issue #29.
-export const MIGRATIONS_CONFIG_MAP_NAME = "drigodb-migrations";
-export const MIGRATIONS_MOUNT_PATH = "/drigodb-migrations";
 
 // PostgreSQL's UID and GID in CNPG's image: `uid=26(postgres) gid=102(postgres)`.
 //
 // The GID is not 26. It was under our own image, and carrying that assumption
 // across would leave PGDATA group-owned by a group the server does not belong
-// to. The backup sidecar must run as the same UID, because peer auth over the
+// to. Kept because the UID and GID a database runs as are a property of the
 // shared socket resolves the caller's UID against the server's passwd database
 // and a mismatch fails every connection.
 //
@@ -120,9 +135,9 @@ export const MIGRATIONS_MOUNT_PATH = "/drigodb-migrations";
 export const RUN_AS_USER = 26;
 export const RUN_AS_GROUP = 102;
 
-// Shared with the backup sidecar, which reaches the server over this socket and
+// A Unix socket directory on the pod. CloudNativePG mounts its own; this
 // authenticates by peer. It outlived the gateway it was introduced for: a
-// socket is still how a backup runs without a credential or a network path.
+// constant survives only because the NetworkPolicy tests name it.
 export const SOCKET_VOLUME = "socket";
 export const SOCKET_MOUNT_PATH = "/sockets";
 export const DATA_VOLUME = "data";
@@ -143,10 +158,8 @@ export function tlsSecretName(id: string): string {
 export const POSTGRES_PORT = 5432;
 export const POSTGRES_PORT_NAME = "postgres";
 
-export const BACKUP_KEY_SECRET_KEY = "access_key";
-export const BACKUP_SECRET_SECRET_KEY = "secret_key";
-
 export const DB_USER = "appuser";
+
 export const DB_NAME = "app";
 export const PASSWORD_SECRET_KEY = "password";
 
@@ -163,19 +176,14 @@ export const PASSWORD_SECRET_KEY = "password";
 // from two databases to three. The LIMIT is unchanged at 1Gi: this changes what
 // is reserved for a database, never what it is allowed to use, so a busy one
 // has exactly the room it had before.
+// The floor for WAL, carried from the postgresql.conf that used to be mounted.
+// Unlike max_wal_size it does not vary by tier: it is a floor on checkpoint
+// churn, not a ceiling on volume.
+const MIN_WAL_SIZE = "64MB";
+
 const PG_CPU_REQUEST = "100m";
 const PG_MEMORY_REQUEST = "192Mi";
 const PG_MEMORY_LIMIT = "1Gi";
-// Idle almost all the time; it streams a backup out on an interval and holds
-// nothing between them. Requests are what the scheduler reserves, so keeping
-// them small is what stops backups halving how many databases fit on a node.
-const BACKUP_CPU_REQUEST = "10m";
-const BACKUP_MEMORY_REQUEST = "32Mi";
-const BACKUP_MEMORY_LIMIT = "256Mi";
-
-export function statefulSetName(id: string): string {
-  return `db-${id}`;
-}
 
 export function serviceName(id: string): string {
   return `db-${id}`;
@@ -185,11 +193,17 @@ export function secretName(id: string): string {
   return `db-${id}-credentials`;
 }
 
-export function restoreJobName(id: string): string {
-  return `restore-${id}`;
+// The Cluster carries the name a StatefulSet used to, so nothing that derives a
+// hostname, a Secret name or an id from it has to change — and idempotent create
+// keeps working the same way, because the name is still the lock.
+export function clusterName(id: string): string {
+  return `db-${id}`;
 }
 
-export function labelsFor(id: string, externalId: string): Record<string, string> {
+export function labelsFor(
+  id: string,
+  externalId: string,
+): Record<string, string> {
   return {
     [DB_ID_LABEL]: id,
     [EXTERNAL_ID_LABEL]: externalId,
@@ -214,7 +228,11 @@ export function connectionUri(id: string, password: string): string {
   );
 }
 
-export function buildSecret(id: string, externalId: string, password: string): V1Secret {
+export function buildSecret(
+  id: string,
+  externalId: string,
+  password: string,
+): V1Secret {
   return {
     apiVersion: "v1",
     kind: "Secret",
@@ -223,239 +241,18 @@ export function buildSecret(id: string, externalId: string, password: string): V
       namespace: config.databaseNamespace,
       labels: labelsFor(id, externalId),
     },
-    type: "Opaque",
-    stringData: { [PASSWORD_SECRET_KEY]: password },
-  };
-}
-
-// The pod one database runs in. Split out from the StatefulSet because wake
-// reconciles exactly this — it is the only part of a StatefulSet's spec that is
-// mutable in a way that matters here, and the only part that carries the
-// data-plane images.
-export function buildPodTemplate(
-  id: string,
-  externalId: string,
-  tier: Tier = "small",
-): V1PodTemplateSpec {
-  const labels = labelsFor(id, externalId);
-  return {
-    metadata: { labels },
-    spec: {
-      securityContext: {
-        runAsUser: RUN_AS_USER,
-        runAsGroup: RUN_AS_GROUP,
-        fsGroup: RUN_AS_GROUP,
-        // Without this, Kubernetes recursively chmods g+rwX on every mount.
-        // initdb creates PGDATA as 0700 on first boot, and the next mount
-        // turns it group-writable — which PostgreSQL refuses to start on
-        // ("data directory has invalid permissions"). The database comes up
-        // once and never wakes again. OnRootMismatch skips the recursion
-        // when the volume root already has the right ownership.
-        fsGroupChangePolicy: "OnRootMismatch",
-      },
-      automountServiceAccountToken: false,
-      containers: [
-        {
-          name: "postgres",
-          image: config.pgImage,
-          // The image is a bare operand with no initialising entrypoint.
-          command: ["bash", `${CONFIG_MOUNT_PATH}/bootstrap.sh`],
-          env: [
-            { name: "PGDATA", value: PGDATA },
-            { name: "APP_DB_NAME", value: DB_NAME },
-            { name: "APP_DB_USER", value: DB_USER },
-            { name: "APP_DB_CONF_DIR", value: CONFIG_MOUNT_PATH },
-            { name: "APP_DB_MIGRATIONS_DIR", value: MIGRATIONS_MOUNT_PATH },
-            // Per-database, so it cannot come from drigodb-config — that is one
-            // ConfigMap mounted by every database. bootstrap.sh writes it into
-            // an include file inside PGDATA, ordered after the mounted config so
-            // it wins.
-            { name: "DRIGODB_MAX_WAL_SIZE", value: TIERS[tier].maxWalSize },
-            {
-              name: "APP_DB_PASSWORD",
-              valueFrom: {
-                secretKeyRef: { name: secretName(id), key: PASSWORD_SECRET_KEY },
-              },
-            },
-          ],
-          // Applications reach this directly now; there is no proxy in front.
-          ports: [{ name: POSTGRES_PORT_NAME, containerPort: POSTGRES_PORT }],
-          volumeMounts: [
-            { name: DATA_VOLUME, mountPath: DATA_MOUNT_PATH },
-            { name: SOCKET_VOLUME, mountPath: SOCKET_MOUNT_PATH },
-            { name: "config", mountPath: CONFIG_MOUNT_PATH, readOnly: true },
-            { name: "migrations", mountPath: MIGRATIONS_MOUNT_PATH, readOnly: true },
-            ...(serverAuthEnabled()
-              ? [{ name: TLS_VOLUME, mountPath: TLS_MOUNT_PATH, readOnly: true }]
-              : []),
-          ],
-          readinessProbe: {
-            exec: { command: ["pg_isready", "-U", "postgres", "-d", DB_NAME] },
-            initialDelaySeconds: 5,
-            periodSeconds: 5,
-            failureThreshold: 12,
-          },
-          resources: {
-            requests: { cpu: PG_CPU_REQUEST, memory: PG_MEMORY_REQUEST },
-            limits: { memory: PG_MEMORY_LIMIT },
-          },
-        },
-        // Only when there is somewhere to put a backup. With no bucket
-        // configured the pod is exactly what it was before, rather than
-        // carrying a container that cannot do its job.
-        ...(backupsEnabled()
-          ? [
-              {
-                // Backups run in the pod so that they need no credential and
-                // no network path. The Service does now publish PostgreSQL's
-                // port, but pg_hba admits only appuser over TLS into its own
-                // database — a backup connecting that way would need a
-                // credential of its own. Over the shared socket it authenticates
-                // by peer as the pod's UID, which is the connection that already
-                // works.
-                //
-                // No data volume. pg_dump streams over that socket, so mounting
-                // the volume would only add a second path to the same bytes.
-                name: "backup",
-                image: config.backup.image,
-                env: [
-                  { name: "DRIGODB_DATABASE_ID", value: id },
-                  { name: "DRIGODB_BACKUP_BUCKET", value: config.backup.bucket },
-                  { name: "DRIGODB_BACKUP_ENDPOINT", value: config.backup.endpoint },
-                  { name: "DRIGODB_BACKUP_INTERVAL", value: config.backup.intervalSeconds },
-                  { name: "PGHOST", value: SOCKET_MOUNT_PATH },
-                  { name: "APP_DB_NAME", value: DB_NAME },
-                  {
-                    name: "DRIGODB_BACKUP_KEY",
-                    valueFrom: {
-                      secretKeyRef: { name: config.backup.secretName, key: BACKUP_KEY_SECRET_KEY },
-                    },
-                  },
-                  {
-                    name: "DRIGODB_BACKUP_SECRET",
-                    valueFrom: {
-                      secretKeyRef: { name: config.backup.secretName, key: BACKUP_SECRET_SECRET_KEY },
-                    },
-                  },
-                ],
-                volumeMounts: [{ name: SOCKET_VOLUME, mountPath: SOCKET_MOUNT_PATH }],
-                // Deliberately no probes. A readiness probe here would put
-                // backups on the pod's Ready condition, and an unreachable
-                // bucket would then take a working database out of its Service.
-                // Backups must never be why a database is unreachable — the
-                // container absorbs its own failures and logs them instead.
-                resources: {
-                  requests: { cpu: BACKUP_CPU_REQUEST, memory: BACKUP_MEMORY_REQUEST },
-                  limits: { memory: BACKUP_MEMORY_LIMIT },
-                },
-              },
-            ]
-          : []),
-      ],
-      volumes: [
-        { name: SOCKET_VOLUME, emptyDir: {} },
-        // optional: the pod must start before cert-manager has issued anything,
-        // or a database would wait on a certificate to serve traffic it could
-        // serve without one. bootstrap.sh falls back to self-signing.
-        ...(serverAuthEnabled()
-          ? [{ name: TLS_VOLUME, secret: { secretName: tlsSecretName(id), optional: true, defaultMode: 0o640 } }]
-          : []),
-        {
-          name: "config",
-          // 0640 rather than 0644: these files are read by the pod's own UID
-          // and group, and nothing else needs them.
-          configMap: { name: CONFIG_MAP_NAME, defaultMode: 0o640 },
-        },
-        {
-          name: "migrations",
-          configMap: { name: MIGRATIONS_CONFIG_MAP_NAME, defaultMode: 0o640 },
-        },
-      ],
-    },
-  };
-}
-
-// Loads a dump into a freshly provisioned database.
-//
-// A Job, and an ORDINARY CONSUMER of the database rather than a privileged path
-// into it. It connects over TCP to the Service with the app's own credentials,
-// carrying the same `drigodb.io/allow-database` label any consumer opts in
-// with, and holds nothing the isolation model does not already hand out. There
-// is no socket to share — a Job is its own pod — and that is the point: a
-// logical restore is a client executing SQL, so it should look like one.
-//
-// The alternative, running it inside the database pod, would mean the restore
-// path needed the pod template to carry a one-shot instruction that every later
-// wake would have to reason about. This leaves the template alone.
-//
-// ttlSecondsAfterFinished so a succeeded Job removes itself. A failed one stays
-// until the database is deleted, because its logs are the only account of why a
-// restore did not happen.
-export function buildRestoreJob(
-  id: string,
-  externalId: string,
-  source: string,
-): V1Job {
-  const labels = {
-    ...labelsFor(id, externalId),
-    // Opts this pod through the database's own NetworkPolicy — the same way a
-    // consumer does, rather than by widening the policy for restores.
-    [ALLOW_LABEL]: id,
-  };
-  return {
-    apiVersion: "batch/v1",
-    kind: "Job",
-    metadata: { name: restoreJobName(id), namespace: config.databaseNamespace, labels },
-    spec: {
-      backoffLimit: 3,
-      ttlSecondsAfterFinished: 3600,
-      template: {
-        metadata: { labels },
-        spec: {
-          restartPolicy: "OnFailure",
-          automountServiceAccountToken: false,
-          containers: [
-            {
-              name: "restore",
-              image: config.backup.image,
-              args: ["restore-remote"],
-              env: [
-                { name: "DRIGODB_DATABASE_ID", value: id },
-                { name: "DRIGODB_RESTORE_SOURCE", value: source },
-                { name: "DRIGODB_BACKUP_BUCKET", value: config.backup.bucket },
-                { name: "DRIGODB_BACKUP_ENDPOINT", value: config.backup.endpoint },
-                { name: "PGHOST", value: endpointHost(id) },
-                { name: "PGPORT", value: String(POSTGRES_PORT) },
-                { name: "PGUSER", value: DB_USER },
-                { name: "PGDATABASE", value: DB_NAME },
-                // require, not verify-full: the server self-signs, exactly as
-                // it does for any other client. Issue #9 changes both together.
-                { name: "PGSSLMODE", value: "require" },
-                {
-                  name: "PGPASSWORD",
-                  valueFrom: { secretKeyRef: { name: secretName(id), key: PASSWORD_SECRET_KEY } },
-                },
-                {
-                  name: "DRIGODB_BACKUP_KEY",
-                  valueFrom: {
-                    secretKeyRef: { name: config.backup.secretName, key: BACKUP_KEY_SECRET_KEY },
-                  },
-                },
-                {
-                  name: "DRIGODB_BACKUP_SECRET",
-                  valueFrom: {
-                    secretKeyRef: { name: config.backup.secretName, key: BACKUP_SECRET_SECRET_KEY },
-                  },
-                },
-              ],
-              resources: {
-                requests: { cpu: BACKUP_CPU_REQUEST, memory: BACKUP_MEMORY_REQUEST },
-                limits: { memory: BACKUP_MEMORY_LIMIT },
-              },
-            },
-          ],
-        },
-      },
+    // basic-auth rather than Opaque, and it carries the username as well as the
+    // password. CloudNativePG will not accept a credential Secret in any other
+    // shape — bootstrap.initdb.secret and managed.roles both read `username`
+    // and `password` from a kubernetes.io/basic-auth Secret.
+    //
+    // The username never varies. It is written anyway, because the alternative
+    // is a Secret that is correct only because something else agrees about a
+    // value it cannot see.
+    type: "kubernetes.io/basic-auth",
+    stringData: {
+      [USERNAME_SECRET_KEY]: DB_USER,
+      [PASSWORD_SECRET_KEY]: password,
     },
   };
 }
@@ -471,7 +268,10 @@ export function buildRestoreJob(
 // Issuer can only be used from its own namespace, and the alternative is a
 // ClusterIssuer that anything in the cluster could ask for a certificate from.
 // The Secret is then mirrored into the database namespace by the provisioner.
-export function buildCertificate(id: string, externalId: string): Record<string, unknown> {
+export function buildCertificate(
+  id: string,
+  externalId: string,
+): Record<string, unknown> {
   return {
     apiVersion: "cert-manager.io/v1",
     kind: "Certificate",
@@ -504,79 +304,179 @@ export function buildCertificate(id: string, externalId: string): Record<string,
   };
 }
 
-// A stable fingerprint of the rendered pod template.
+// A hosted database, as CloudNativePG sees it. Decision 0004.
 //
-// Compared against the annotation on the live StatefulSet to decide whether a
-// waking database needs its template rewritten. Deliberately not a comparison
-// of the live spec against this one: the API server defaults dozens of fields
-// the builder never sets — terminationMessagePath, dnsPolicy, schedulerName,
-// imagePullPolicy — so live-versus-rendered always differs, and every wake
-// would patch. Hashing compares desired against desired, which is the only
-// comparison that holds still.
+// This replaces buildStatefulSet, and with it most of what drigodb used to
+// assemble by hand — the pod template, the probes, the volume claim, the
+// fsGroup, bootstrap.sh. The operator owns all of that now. What is left here is
+// the part that is drigodb's product rather than PostgreSQL's mechanics: the
+// tier, the credential, the labels the network boundary selects on, and the name
+// that makes create idempotent.
 //
-// Keys are sorted before hashing so the fingerprint tracks content rather than
-// the order this file happens to declare things in. Reordering a field here
-// would otherwise roll every database in the fleet for no reason.
-export function templateHash(id: string, externalId: string, tier: Tier = "small"): string {
-  return createHash("sha256")
-    .update(canonical(buildPodTemplate(id, externalId, tier)))
-    .digest("hex")
-    .slice(0, 16);
+// Every field below was verified against CNPG 1.27 on a real cluster before it
+// was written, because several plausible-looking spellings do nothing.
+export interface CnpgClusterSpec {
+  instances: number;
+  imageName: string;
+  inheritedMetadata: { labels: Record<string, string> };
+  storage: { size: string; storageClass?: string };
+  postgresql: { parameters: Record<string, string>; pg_hba: string[] };
+  certificates?: { serverCASecret: string; serverTLSSecret: string };
+  resources: object;
+  bootstrap: {
+    initdb: { database: string; owner: string; secret: { name: string } };
+  };
+  managed: {
+    roles: Array<{
+      name: string;
+      login: boolean;
+      passwordSecret: { name: string };
+    }>;
+  };
 }
 
-function canonical(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
-  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-  const entries = Object.entries(value as Record<string, unknown>)
-    .filter(([, v]) => v !== undefined)
-    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonical(v)}`).join(",")}}`;
+// Typed rather than `object`, so a field renamed here fails at compile time in
+// the tests that assert it. Several of these were established against a live
+// cluster because a plausible-looking spelling silently does nothing.
+export interface CnpgClusterManifest {
+  apiVersion: string;
+  kind: string;
+  metadata: { name: string; namespace: string; labels: Record<string, string> };
+  spec: CnpgClusterSpec;
 }
 
-export function buildStatefulSet(id: string, externalId: string, tier: Tier = "small"): V1StatefulSet {
+export function buildCluster(
+  id: string,
+  externalId: string,
+  tier: Tier = "small",
+): CnpgClusterManifest {
   const labels = { ...labelsFor(id, externalId), [TIER_LABEL]: tier };
-  // On the StatefulSet only, never in labelsFor: a pod carrying a copy of
-  // this would be stating something about its own StatefulSet that stopped
-  // being true the moment it was scaled.
-  const stsLabels = { ...labels, [HIBERNATED_LABEL]: "false" };
   return {
-    apiVersion: "apps/v1",
-    kind: "StatefulSet",
+    apiVersion: `${CNPG_GROUP}/v1`,
+    kind: "Cluster",
     metadata: {
-      name: statefulSetName(id),
+      name: clusterName(id),
       namespace: config.databaseNamespace,
-      labels: stsLabels,
-      // Stamped at birth so a database created by this build is already
-      // current, and its first wake reconciles nothing.
-      annotations: { [TEMPLATE_HASH_ANNOTATION]: templateHash(id, externalId, tier) },
+      // Hibernation is an intent, and it is read from this label rather than
+      // from the annotation CNPG acts on, for the same reason it was read from a
+      // label rather than a replica count before: a create is also "not
+      // running", and telling a concurrent caller its database was hibernated
+      // was wrong in exactly the case the label exists to distinguish.
+      labels: { ...labels, [HIBERNATED_LABEL]: "false" },
     },
     spec: {
-      serviceName: serviceName(id),
-      // Zero is hibernation: pods go, the volume stays.
-      replicas: 0,
-      selector: { matchLabels: { [DB_ID_LABEL]: id } },
-      // Stated explicitly: the alternative silently deletes a customer's data.
-      persistentVolumeClaimRetentionPolicy: { whenScaled: "Retain", whenDeleted: "Retain" },
-      template: buildPodTemplate(id, externalId, tier),
-      volumeClaimTemplates: [
-        {
-          metadata: { name: DATA_VOLUME, labels },
-          spec: {
-            accessModes: ["ReadWriteOnce"],
-            // Omitted when unset, never sent as "". Those mean opposite things:
-            // an empty string tells Kubernetes to use NO storage class and bind
-            // a pre-provisioned volume, while an absent field means "use the
-            // cluster's default". Portability depends on the second — kind,
-            // EKS and GKE each have their own default, and drigodb should not
-            // need to know which.
-            ...(config.storageClass ? { storageClassName: config.storageClass } : {}),
-            // The tier's size at creation. Immutable afterwards, which is why
-            // a resize patches the PVC directly and this permanently disagrees
-            // with it. The PVC is the truth.
-            resources: { requests: { storage: TIERS[tier].storage } },
-          },
+      instances: 1,
+      imageName: config.pgImage,
+
+      // What makes the NetworkPolicy keep working. Without this the pods carry
+      // only CNPG's own labels, the policy's podSelector matches nothing, and
+      // every database becomes unreachable — silently, because a NetworkPolicy
+      // denies by dropping packets.
+      inheritedMetadata: {
+        labels: { [DB_ID_LABEL]: id, [MANAGED_BY_LABEL]: MANAGED_BY_VALUE },
+      },
+
+      storage: {
+        size: TIERS[tier].storage,
+        // Omitted when unset, never sent as "". Those mean opposite things: an
+        // empty string binds a pre-provisioned volume with NO storage class,
+        // while an absent field means the cluster default. Portability depends
+        // on the second.
+        ...(config.storageClass ? { storageClass: config.storageClass } : {}),
+      },
+
+      // The server identity a consumer verifies, when this installation issues
+      // one. Measured against CNPG 1.27, including the two negatives:
+      //
+      //   verify-full, drigodb's Service name, drigodb's CA   →  connects
+      //   the same URI with no CA supplied                    →  refused
+      //   CNPG's own -rw name against drigodb's CA            →  refused
+      //
+      // Without this, CloudNativePG signs its own certificate from a CA it
+      // generates PER CLUSTER, naming only its own -rw/-ro/-r Services. The
+      // connection URI names drigodb's Service, which is not among them — so
+      // verify-full would fail hostname verification on every database while
+      // sslmode=require went on passing, which is how nobody would notice.
+      //
+      // The CA secret must NOT be named `<cluster>-ca`: that is where
+      // CloudNativePG keeps its own CLIENT CA, and taking the name leaves it
+      // looking for a private key that was never put there. drigodb owns the
+      // server identity, the operator keeps its internal ones, and the fleet
+      // CA's private key never has to reach this namespace.
+      ...(serverAuthEnabled()
+        ? {
+            certificates: {
+              serverCASecret: config.tls.caSecret,
+              serverTLSSecret: tlsSecretName(id),
+            },
+          }
+        : {}),
+
+      postgresql: {
+        parameters: {
+          max_wal_size: TIERS[tier].maxWalSize,
+          // Carried over from the postgresql.conf drigodb used to mount. The
+          // rest of that file — listen_addresses, the socket directory, the ssl
+          // settings — is the operator's business now and it sets them itself.
+          min_wal_size: MIN_WAL_SIZE,
         },
-      ],
+        // TLS or nothing, for the one route a consumer can take.
+        //
+        // CloudNativePG's default pg_hba ends `host all all all scram-sha-256`
+        // — plain `host`, so a client passing sslmode=disable connects in the
+        // clear. drigodb's own pg_hba was `hostssl` and had no such path.
+        // Measured on kind: without these two lines, a plaintext connection to a
+        // hosted database is accepted.
+        //
+        // It would have shipped silently. Every test connects with
+        // sslmode=require and passes whether or not plaintext is also allowed;
+        // nothing asks the opposite question.
+        //
+        // Scoped to the application database and role rather than `all`, because
+        // a blanket reject would sit in front of the rules CloudNativePG writes
+        // for its own instance manager and for streaming replication.
+        pg_hba: [
+          `hostssl ${DB_NAME} ${DB_USER} all scram-sha-256`,
+          `host ${DB_NAME} ${DB_USER} all reject`,
+        ],
+      },
+
+      resources: {
+        requests: { cpu: PG_CPU_REQUEST, memory: PG_MEMORY_REQUEST },
+        limits: { memory: PG_MEMORY_LIMIT },
+      },
+
+      bootstrap: {
+        initdb: {
+          database: DB_NAME,
+          owner: DB_USER,
+          // drigodb's own credential, not one CNPG invents. The URI is issued
+          // from this Secret, so the server has to be created with it.
+          //
+          // Read at initdb and never again — which is why managed.roles below
+          // exists. Changing this Secret alone rotates nothing, and the old
+          // password goes on working. Measured, not assumed.
+          secret: { name: secretName(id) },
+        },
+      },
+
+      // The rotation path. CNPG reconciles the role against this Secret
+      // continuously, so replacing the Secret is what changes the password —
+      // and the old one stops being accepted, which is the half that matters.
+      //
+      // postInitApplicationSQL is deliberately NOT used for migrations: it
+      // mangles `$$`, arriving as a single `$`, and 001-core.sql contains a
+      // dollar-quoted function body. That file is frozen by checksum and cannot
+      // be rewritten to suit it. See buildMigrationJob.
+      managed: {
+        roles: [
+          {
+            name: DB_USER,
+            login: true,
+            passwordSecret: { name: secretName(id) },
+          },
+        ],
+      },
     },
   };
 }
@@ -592,12 +492,35 @@ export function buildService(id: string, externalId: string): V1Service {
     },
     spec: {
       type: "ClusterIP",
-      selector: { [DB_ID_LABEL]: id },
+      // CNPG's labels, not drigodb's, and deliberately.
+      //
+      // The pods carry drigodb's database-id too (inheritedMetadata), but that
+      // would match every instance. This matches only whichever pod is CURRENTLY
+      // primary, which is what makes the connection URI survive a failover: the
+      // hostname a consumer wrote down stays the same and the endpoint behind it
+      // moves. It is also why opt-in HA (#81) needs nothing here.
+      //
+      // drigodb keeps its own Service rather than pointing the URI at CNPG's
+      // `-rw` one, because the URI is issued once and never reissued. Adopting
+      // their name would rename every consumer's endpoint.
+      selector: {
+        "cnpg.io/cluster": clusterName(id),
+        "cnpg.io/instanceRole": "primary",
+      },
       ports: [
         {
           name: POSTGRES_PORT_NAME,
           port: POSTGRES_PORT,
-          targetPort: POSTGRES_PORT_NAME,
+          // The NUMBER, not the name. drigodb used to own the pod template and
+          // could rely on the port being called what it called it; CloudNativePG
+          // owns it now and calls it `postgresql`. A named targetPort that does
+          // not resolve produces no endpoints at all, so every connection to a
+          // database hangs until TCP gives up — the same symptom as a
+          // NetworkPolicy drop, and just as silent.
+          //
+          // CNPG's own -rw Service targets the number for the same reason: a
+          // port name is somebody else's contract, and a number is not.
+          targetPort: POSTGRES_PORT,
           protocol: "TCP",
         },
       ],
@@ -612,12 +535,15 @@ export function buildService(id: string, externalId: string): V1Service {
 // selector stops matching, `kubectl port-forward` bypasses it entirely, and a
 // CNI that ignores NetworkPolicy makes it a silent no-op. The separate instance
 // and the per-database credentials hold independently of it.
-export function buildNetworkPolicy(id: string, externalId: string): V1NetworkPolicy {
+export function buildNetworkPolicy(
+  id: string,
+  externalId: string,
+): V1NetworkPolicy {
   return {
     apiVersion: "networking.k8s.io/v1",
     kind: "NetworkPolicy",
     metadata: {
-      name: statefulSetName(id),
+      name: clusterName(id),
       namespace: config.databaseNamespace,
       labels: labelsFor(id, externalId),
     },
@@ -635,6 +561,36 @@ export function buildNetworkPolicy(id: string, externalId: string): V1NetworkPol
               podSelector: { matchLabels: { [ALLOW_LABEL]: id } },
             },
           ],
+          ports: [{ protocol: "TCP", port: POSTGRES_PORT }],
+        },
+        {
+          // The operator, on the status port it scrapes each instance through.
+          //
+          // Without this the policy blocks CloudNativePG from its own pods, and
+          // every database sits in "Instance Status Extraction Error:
+          // HTTP communication issue" — with the operator's own message naming
+          // NetworkPolicy as the likely cause, which is the only reason this was
+          // findable. A stuck reconcile means HIBERNATION SILENTLY DOES NOTHING:
+          // drigodb records the intent, the annotation is set, and the pod runs
+          // on. Measured, after sixty seconds of waiting for a pod to go.
+          //
+          // Every earlier hibernation measurement in this work was taken against
+          // a Cluster with no NetworkPolicy in front of it, which is why it kept
+          // looking fine.
+          _from: [
+            {
+              namespaceSelector: {
+                matchLabels: { "kubernetes.io/metadata.name": CNPG_NAMESPACE },
+              },
+            },
+          ],
+          ports: [{ protocol: "TCP", port: CNPG_STATUS_PORT }],
+        },
+        {
+          // Instance to instance, for replication. Not needed at one instance
+          // and needed the moment there are two (#81), and a policy that admits
+          // it only once someone turns HA on would fail exactly when it mattered.
+          _from: [{ podSelector: { matchLabels: { [DB_ID_LABEL]: id } } }],
           ports: [{ protocol: "TCP", port: POSTGRES_PORT }],
         },
       ],

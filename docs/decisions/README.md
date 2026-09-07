@@ -11,6 +11,7 @@ means arguing with the reasoning rather than guessing at it.
 | [0002 — GitOps for the control plane](0002-gitops-for-the-control-plane.md) | Pull-based reconciliation for the control plane, manual pin promotion, nothing writing to `main`; the data plane stays API-provisioned |
 | [0003 — Argo CD](0003-argo-cd.md) | Argo CD reconciles drigodb's own cluster, chosen on familiarity; the chart stays renderer-agnostic and requires nothing of anyone else |
 | [0004 — CloudNativePG for the data plane](0004-cloudnativepg-for-the-data-plane.md) | A hosted database becomes a CNPG `Cluster` rather than a StatefulSet drigodb assembles; high availability is opt-in per database |
+| [0006 — Nothing inside a hosted database](0006-nothing-inside-a-hosted-database.md) | drigodb owns the database, the role and the volume and puts no schema of its own inside; the migration runner and its ledger are removed |
 
 `leaving-documentdb.md` predates this folder and stays where it is: the README, several issues and a
 merged pull request link to it by path. Worth consolidating the next time something else moves.

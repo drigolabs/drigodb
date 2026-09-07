@@ -26,7 +26,11 @@ note() { printf "  ${YELLOW}…${RESET} %s\n" "$1"; }
 k() { kubectl --context "$CTX" "$@"; }
 
 PIDS=()
-cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" >/dev/null 2>&1 || true; done; }
+cleanup() {
+  for p in "${PIDS[@]:-}"; do kill "$p" >/dev/null 2>&1 || true; done
+  [ -n "${SMOKE_CA_CONFIGMAP:-}" ] && k delete configmap "$SMOKE_CA_CONFIGMAP" -n drigodb-databases >/dev/null 2>&1
+  return 0
+}
 trap cleanup EXIT
 
 jqf() { python3 -c "import json,sys; d=json.load(sys.stdin); print(d$1)"; }
@@ -54,10 +58,37 @@ psql_in_cluster() { # uri sql
   # enough to win, and every run afterwards has it cached and is not. It failed
   # exactly that way — passing on a fresh cluster, then returning empty strings
   # that read as failed assertions.
-  k run "$name" -n drigodb-databases --restart=Never --quiet \
-    --image="${SMOKE_PG_IMAGE:-ghcr.io/cloudnative-pg/postgresql:18}" \
-    --labels="drigodb.io/allow-database=${DB_ID}" \
-    --command -- psql "$1" -tAc "$2" >/dev/null 2>&1
+  # With server authentication on, the issued URI says verify-full and psql
+  # needs the CA to honour it. Mounting the one GET /v1/ca serves is what makes
+  # this script work against such an installation at all — and it is the only
+  # thing that exercises the verification, since every other assertion here
+  # passes on sslmode=require whether or not the chain is any good.
+  if [ -n "${SMOKE_CA_CONFIGMAP:-}" ]; then
+    # The overrides JSON is generated rather than written by hand, because the
+    # SQL argument is multi-line and pasting it into a JSON string produces
+    # invalid JSON with a literal newline in it. That failed as "pods not found",
+    # which is a long way from "your JSON is malformed".
+    OVERRIDES="$(python3 -c '
+import json, sys
+uri, sql, image, cm = sys.argv[1:5]
+print(json.dumps({"spec": {
+  "containers": [{
+    "name": "psql", "image": image,
+    "command": ["psql", uri + "&sslrootcert=/drigodb-ca/ca.crt", "-tAc", sql],
+    "volumeMounts": [{"name": "ca", "mountPath": "/drigodb-ca"}],
+  }],
+  "volumes": [{"name": "ca", "configMap": {"name": cm}}],
+}}))' "$1" "$2" "${SMOKE_PG_IMAGE:-ghcr.io/cloudnative-pg/postgresql:18}" "$SMOKE_CA_CONFIGMAP")"
+    k run "$name" -n drigodb-databases --restart=Never --quiet \
+      --image="${SMOKE_PG_IMAGE:-ghcr.io/cloudnative-pg/postgresql:18}" \
+      --labels="drigodb.io/allow-database=${DB_ID}" \
+      --overrides="$OVERRIDES" >/dev/null 2>&1
+  else
+    k run "$name" -n drigodb-databases --restart=Never --quiet \
+      --image="${SMOKE_PG_IMAGE:-ghcr.io/cloudnative-pg/postgresql:18}" \
+      --labels="drigodb.io/allow-database=${DB_ID}" \
+      --command -- psql "$1" -tAc "$2" >/dev/null 2>&1
+  fi
 
   for _ in $(seq 1 60); do
     phase="$(k get pod "$name" -n drigodb-databases -o jsonpath='{.status.phase}' 2>/dev/null)"
@@ -113,6 +144,22 @@ api() { curl -fsS -H "Authorization: Bearer ${TOKEN}" -H 'content-type: applicat
 api "localhost:${API_PORT}/healthz" >/dev/null || { fail "healthz failed"; exit 1; }
 ok "healthz ok"
 
+# Server authentication is optional, so this asks rather than assumes. A 409
+# means this installation issues no certificates and the URI will say
+# sslmode=require; a certificate means it does, the URI will say verify-full,
+# and every connection below has to carry the CA or fail.
+SMOKE_CA_CONFIGMAP=""
+if CA_PEM="$(api "localhost:${API_PORT}/v1/ca" 2>/dev/null)" && \
+   printf '%s' "$CA_PEM" | grep -q "BEGIN CERTIFICATE"; then
+  SMOKE_CA_CONFIGMAP="smoke-ca-$$"
+  printf '%s' "$CA_PEM" > "/tmp/${SMOKE_CA_CONFIGMAP}.crt"
+  k create configmap "$SMOKE_CA_CONFIGMAP" -n drigodb-databases \
+    --from-file="ca.crt=/tmp/${SMOKE_CA_CONFIGMAP}.crt" >/dev/null
+  ok "server authentication is on; connections will verify against GET /v1/ca"
+else
+  note "no CA served; this installation issues no certificates and URIs say sslmode=require"
+fi
+
 step "Provisioning '${EXTERNAL_ID}'"
 RESP="$(api -XPOST "localhost:${API_PORT}/v1/databases" -d "{\"external_id\":\"${EXTERNAL_ID}\"}")"
 DB_ID="$(echo "$RESP" | jqf '["id"]')"
@@ -150,14 +197,18 @@ done
 for p in "${race_pids[@]}"; do wait "$p" || true; done
 for i in 1 2 3 4; do race_codes="${race_codes}$(cat "/tmp/drigodb-race-$$-$i.code" 2>/dev/null) "; done
 
-RACE_COUNT="$(k get sts -n drigodb-databases -l "drigodb.io/external-id=${RACE_ID}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+RACE_COUNT="$(k get clusters.postgresql.cnpg.io -n drigodb-databases -l "drigodb.io/external-id=${RACE_ID}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
 CREATED="$(printf '%s' "$race_codes" | tr ' ' '\n' | grep -c '^202$' || true)"
 
 if [ "$RACE_COUNT" = "1" ]; then
   ok "4 simultaneous creates, 1 database (codes: ${race_codes})"
 else
-  fail "4 simultaneous creates made ${RACE_COUNT} databases — one caller's data is split"
-  k get sts -n drigodb-databases -l "drigodb.io/external-id=${RACE_ID}"
+  if [ "$RACE_COUNT" = "0" ]; then
+    fail "4 simultaneous creates made no database at all — every one of them failed"
+  else
+    fail "4 simultaneous creates made ${RACE_COUNT} databases — one caller's data is split"
+  fi
+  k get clusters.postgresql.cnpg.io -n drigodb-databases -l "drigodb.io/external-id=${RACE_ID}"
   exit 1
 fi
 # Exactly one caller owns the password. The others must not be handed a URI they
@@ -168,7 +219,7 @@ else
   fail "expected one 202, got ${CREATED} (codes: ${race_codes})"
   exit 1
 fi
-RACE_DB="$(k get sts -n drigodb-databases -l "drigodb.io/external-id=${RACE_ID}" \
+RACE_DB="$(k get clusters.postgresql.cnpg.io -n drigodb-databases -l "drigodb.io/external-id=${RACE_ID}" \
   -o jsonpath='{.items[0].metadata.labels.drigodb\.io/database-id}' 2>/dev/null)"
 [ -n "$RACE_DB" ] && api -XDELETE "localhost:${API_PORT}/v1/databases/${RACE_DB}" >/dev/null 2>&1
 rm -f "/tmp/drigodb-race-$$-"*
@@ -185,10 +236,31 @@ esac
 
 # The schema drigodb installs into every database, which nothing else asserts
 # outside its own integration test.
-VER="$(psql_in_cluster "$URI" "SELECT _drigodb.version()")" || true
-case "$VER" in
-  *.sql*) ok "migrations applied, at $(echo "$VER" | tr -d '\r' | head -1)" ;;
-  *) fail "_drigodb.version() did not answer (${VER})"; exit 1 ;;
+# TLS or nothing. CloudNativePG's default pg_hba ends `host all all all
+# scram-sha-256` — plain `host` — so a client passing sslmode=disable connects in
+# the clear unless drigodb says otherwise. It does, in the Cluster's pg_hba.
+#
+# This assertion exists because every other connection in this script uses the
+# URI as issued, which carries sslmode=require and passes whether or not
+# plaintext is ALSO accepted. Nothing else asks the opposite question, and the
+# regression was real: measured on kind before the rule was added.
+#
+# Asserted on the OUTPUT, not on an exit code: psql_in_cluster returns the pod's
+# logs and its own status is `printf`, which always succeeds. Written the other
+# way round first, and the assertion then fired on every run whatever the server
+# did — a check that cannot pass is no better than one that cannot fail.
+# Whatever sslmode the URI carries, not the one it carries today. With server
+# authentication on it says verify-full, and a substitution written for
+# `require` silently changed nothing — so this connected with verification
+# intact, succeeded, and reported that plaintext had been accepted.
+PLAIN_URI="$(printf '%s' "$URI" | sed -E 's/sslmode=[a-z-]+/sslmode=disable/')"
+PLAIN_OUT="$(psql_in_cluster "$PLAIN_URI" "SELECT 'PLAINTEXT-ACCEPTED'")"
+case "$PLAIN_OUT" in
+  *PLAINTEXT-ACCEPTED*)
+    fail "a plaintext connection was accepted — pg_hba is not requiring TLS"
+    exit 1 ;;
+  *)
+    ok "a plaintext connection is refused" ;;
 esac
 
 step "Hibernate and wake"
@@ -202,28 +274,26 @@ for _ in $(seq 1 60); do
 done
 ok "hibernated — zero compute, volume retained"
 
-# Waking is also when a database picks up the pod template the control plane
-# currently renders — a rebuilt postgres image, a fixed probe. Staling the
-# recorded template hash makes the next wake think this database was built by
-# an older drigodb, which is exactly the state a real fleet is in after an
-# image rebuild. If the reconcile does not run, the hash stays "stale".
-k annotate statefulset "db-${DB_ID}" -n drigodb-databases \
-  drigodb.io/template-hash=stale --overwrite >/dev/null
-ok "marked as built by an older template"
-
+# The template reconcile this used to stale-and-check is gone: CloudNativePG
+# owns the pod template and rolls it itself, so there is no drigodb-rendered
+# hash for a wake to bring forward. What is still drigodb's, and still worth
+# timing, is that a hibernated database comes back.
 t0=$(date +%s)
 api -XPOST "localhost:${API_PORT}/v1/databases/${DB_ID}/wake" >/dev/null
 for _ in $(seq 1 60); do
   [ "$(api "localhost:${API_PORT}/v1/databases/${DB_ID}" | jqf '["status"]')" = "ready" ] && break
   sleep 2
 done
+[ "$(api "localhost:${API_PORT}/v1/databases/${DB_ID}" | jqf '["status"]')" = "ready" ] \
+  || { fail "never came back from hibernation"; exit 1; }
 ok "woke in $(( $(date +%s) - t0 ))s"
 
-HASH="$(k get statefulset "db-${DB_ID}" -n drigodb-databases \
-  -o jsonpath='{.metadata.annotations.drigodb\.io/template-hash}')"
-case "$HASH" in
-  stale|"") fail "wake did not reconcile the template (hash: ${HASH:-unset})"; exit 1 ;;
-  *) ok "reconciled to template ${HASH} on the way up" ;;
+# The data survived the cycle. Cheap, and it is the assertion that makes
+# hibernation a feature rather than a way to lose a volume.
+WOKE="$(psql_in_cluster "$URI" "SELECT proof FROM smoke")"
+case "$WOKE" in
+  *provisioned-by-api*) ok "the row written before hibernation is still there" ;;
+  *) fail "data did not survive the hibernate/wake cycle (${WOKE})"; exit 1 ;;
 esac
 
 PG_RUNNING="$(k get pod -n drigodb-databases -l "drigodb.io/database-id=${DB_ID}" \
@@ -244,8 +314,14 @@ step "Is the network policy actually enforced?"
 # One pod, relabelled between attempts, so the label is the only variable.
 NP_NS=default
 NP_POD="smoke-np-$$"
+# sslmode=require, deliberately, whatever the issued URI says. This probe is
+# about whether packets arrive, and with server authentication on the URI says
+# verify-full — so a probe pod without the CA fails verification and looks
+# exactly like the policy dropping it. It reported the policy as broken when the
+# policy was fine.
+NP_URI="$(printf '%s' "$URI" | sed -E 's/sslmode=[a-z-]+/sslmode=require/')"
 np_try() { # returns 0 if it connected
-  k exec -n "$NP_NS" "$NP_POD" -- psql "${URI}&connect_timeout=10" -tAc "select 1" >/dev/null 2>&1
+  k exec -n "$NP_NS" "$NP_POD" -- psql "${NP_URI}&connect_timeout=10" -tAc "select 1" >/dev/null 2>&1
 }
 k run "$NP_POD" -n "$NP_NS" --restart=Never --quiet \
   --image="${SMOKE_PG_IMAGE:-ghcr.io/cloudnative-pg/postgresql:18}" \

@@ -145,7 +145,6 @@ for the chart's values.
 On DigitalOcean:
 
 ```bash
-bash scripts/publish-images.sh   # multi-arch to GHCR (needs gh auth refresh -s write:packages)
 bash scripts/doks-up.sh          # DigitalOcean cluster — starts billing
 bash scripts/deploy.sh           # helm upgrade --install, against the current context
 bash scripts/doks-down.sh        # stop billing
@@ -221,21 +220,16 @@ could do — so the check passed while the very next call failed `403`, and seve
 successful deploy without ever deploying. A check that does not exercise the credential it is checking
 is not a check. See [#15](https://github.com/drigolabs/drigodb/issues/15).
 
-### The data-plane image
+### There is no data-plane image
 
-`drigodb-backup` carries the PostgreSQL major it is built against, not this repo's version, so it is
-not part of a semver release. `.github/workflows/images.yml` builds it when `images/postgres-backup/`,
-`config/` or `images/versions.env` changes, and on demand.
+drigodb built and published one — `drigodb-backup`, a sidecar — and it went with
+the pod template it lived in ([decision 0004](docs/decisions/0004-cloudnativepg-for-the-data-plane.md)).
+Databases run `ghcr.io/cloudnative-pg/postgresql:18` directly, which CloudNativePG
+rebuilds and drigodb inherits, so there is nothing here to publish and no weekly
+rebuild to run. The API image is the only image this repository makes.
 
-**There is no weekly rebuild any more.** It existed because the postgres image was built on Ubuntu
-rather than CNPG's own, and that trade bought drigodb the job of patching its own base. Databases now
-run `ghcr.io/cloudnative-pg/postgresql:18` directly; CNPG rebuild it and drigodb inherits that.
-
-Nothing is published until it has been proved to run. For the backup image that means
-`images/postgres-backup/integration-test.sh`: write rows to a real PostgreSQL, back them up to MinIO
-standing in for Spaces, restore into a *second, running* instance, and read the rows and the expression
-index back. A rebuild that merely *builds* would sail past the failure that matters, which is a runtime
-one — and the DocumentDB era proved that exactly: a dump that exits zero and restores nothing.
+Backups return with [#95](https://github.com/drigolabs/drigodb/issues/95), on the
+operator's own machinery rather than an image of drigodb's.
 
 ### Setting it up
 
@@ -271,103 +265,33 @@ The repository's default token is read-only, which is correct and needs no chang
 exactly the access it needs. Nothing asks for `pull-requests: write`, so *Allow GitHub Actions to
 create and approve pull requests* stays off.
 
-`scripts/publish-images.sh` and `scripts/deploy.sh` still work by hand — for publishing off a branch,
-bisecting a build, or bootstrapping a registry. They are the escape hatch, not the route.
+`scripts/deploy.sh` still works by hand — for standing a cluster up outside the
+reconciler, or bootstrapping one. It is the escape hatch, not the route.
 
 ## Backups
 
-Off by default. Set a bucket and an endpoint and every database gains a sidecar that streams a
-logical backup to S3-compatible storage on an interval.
+Backups are **not available in this release**. The sidecar that took them shared
+a Unix socket with PostgreSQL and authenticated by peer over it — no credential,
+no network path — and CloudNativePG owns the pod template now, so there is
+nowhere to put it. `GET /v1/databases/{id}` reports `"backups": "unavailable"`
+rather than leaving anyone to infer it.
 
-```bash
-kubectl create secret generic drigodb-backup-credentials -n drigodb-databases \
-  --from-literal=access_key=... --from-literal=secret_key=...
+[#95](https://github.com/drigolabs/drigodb/issues/95) rebuilds them on the
+operator's own backup machinery, which also brings
+[#19](https://github.com/drigolabs/drigodb/issues/19) (point-in-time recovery)
+and [#23](https://github.com/drigolabs/drigodb/issues/23) (retention) with it.
 
-# then, on the control plane
-DRIGODB_BACKUP_BUCKET=my-bucket
-DRIGODB_BACKUP_ENDPOINT=https://fra1.digitaloceanspaces.com
-```
+## Nothing inside a database
 
-Existing databases pick the sidecar up on their next wake, through the same template reconcile that
-carries image updates. With no bucket configured no sidecar is added at all — a database is exactly
-what it was before, rather than one carrying a container that cannot do its job.
+drigodb creates the database, the role and the volume, and then it stops. There
+is no drigodb schema in a hosted database, no table it owns, nothing it reads
+back out. `public` is yours and so is everything else.
 
-**Logical, now that it can be.** A backup is `pg_dump` of the app database, gzipped and streamed
-straight to object storage. It was `pg_basebackup` under DocumentDB and not by preference — `pg_dump`
-never dumps the data of tables belonging to an extension, `documentdb` marked none of its catalog, and
-a restore completed with no error leaving every collection invisible. With the extension gone an empty
-database dumps to under a kilobyte instead of ~73 MB, and it restores across PostgreSQL major versions.
-[Full write-up](images/postgres-backup/README.md).
-
-**A broken bucket cannot take a database offline.** The sidecar carries no probes and absorbs its own
-failures. A readiness probe would put backups on the pod's Ready condition, and a NotReady pod leaves
-its Service — so an unreachable bucket would sever a database that is working perfectly well.
-
-**A hibernated database is not backed up, and does not need to be.** No pod means no writes, so
-nothing can have changed since the last backup. The sidecar only exists while the database is awake,
-which is the only time it can have anything new to say.
-
-**`GET /v1/databases/{id}/backups` lists what can be restored** — keys, sizes and timestamps, newest
-first, never a credential. It answers for a **hibernated** database, which is the point: that is when
-the question gets asked, and it is exactly when there is no pod to ask. The control plane lists the
-bucket itself for that reason; the alternative, `kubectl exec` into the database pod, needs `pods/exec`
-RBAC, and a control plane that can exec into any pod can read every tenant's data.
-
-An empty list means a database that has never been backed up. A `409` means backups are off for the
-installation, which is a different fact and one a caller must not confuse with the first.
-
-**Restoring is provisioning with a source.**
-
-```bash
-curl -XPOST localhost:8080/v1/databases -H "Authorization: Bearer $TOKEN" \
-  -d '{"external_id":"my-app-recovered",
-       "restore_from":{"database_id":"a1b2c3d4e5f6","key":"20260905T040000Z.sql.gz"}}'
-```
-
-A new database, with its own id, volume and credentials. **The one it was restored from is untouched**,
-which is what makes this the safe shape — an undo that cannot destroy the thing being undone. To
-replace a database with an older version of itself, restore into a new one, repoint, and delete the old.
-
-The load runs as a Kubernetes Job that is an *ordinary consumer* of the new database: it connects over
-TCP with the app's own credentials and carries the same `drigodb.io/allow-database` label any consumer
-opts in with. It holds nothing the isolation model does not already hand out, and no service account
-token at all.
-
-**The database reports `restoring` until the data has landed**, and that status is doing real work: a
-restored database answers on its port before its dump has been loaded, and a caller that connected then
-would find it empty — and any write it made would leave the restore to find a non-empty target and skip
-it. Poll until `ready`.
-
-Restoring in place, over an existing database, is not built. It is the one someone recovering from
-corruption wants and it is genuinely destructive, so it waits for someone to have needed it —
-[#22](https://github.com/drigolabs/drigodb/issues/22).
-
-## Schema inside a database
-
-A provisioned database carries a `_drigodb` schema, applied from
-[`config/migrations/`](charts/drigodb/files/migrations/) in filename order, exactly once each and recorded in
-`_drigodb.schema_migrations`. `SELECT _drigodb.version()` says where a database is up to.
-
-`config/bootstrap.sh` runs them, over the local socket, as `postgres`. **The control plane never
-connects to a database** — it holds every credential but has no route to use one, and giving it a way in
-would mean a `pg_hba` rule, a NetworkPolicy hole and a DDL-capable credential per database. Shipping
-schema through the pod instead means a new migration reaches an existing database on its next wake,
-through the same template reconcile that carries an image update.
-
-An ordinary wake still costs nothing: a marker in `PGDATA` records which set of files the cluster has
-seen, so the server is only started early when there is actually work — the same trick the credential
-fingerprint uses, and they share one start/stop cycle when both are due.
-
-**Migrations are forward-only.** The runner records a checksum per file, and an edited migration that
-has already been applied stops the server from starting rather than letting a schema drift from the file
-claiming to describe it. That failure is fleet-wide by design, so it has to be caught before it ships —
-`config/migrations-test.sh` runs the real `bootstrap.sh` against the real image on every CI run and
-asserts exactly that.
-
-What is deliberately *not* in there: no patch log, no manifest tables, no `apply_patch`. Those belong to
-the document-framework proposal in [docs/plans/](docs/plans/), which is a separate bet. This is the
-mechanism that would deliver them, and is worth having either way — without it nothing can change a
-provisioned database after it is created.
+That was not always true. A `_drigodb` schema used to be applied from a set of
+migration files, tracked in a ledger, with a runner enforcing checksums — and
+the only migration that ever existed created the ledger and a function reporting
+what was in the ledger. Nothing in the control plane read either. See
+[decision 0006](docs/decisions/0006-nothing-inside-a-hosted-database.md).
 
 ## Measured
 

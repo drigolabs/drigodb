@@ -29,7 +29,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CTX="${KUBE_CONTEXT:-$(kubectl config current-context)}"
 # shellcheck disable=SC1091
-source "${ROOT}/images/versions.env"
+source "${ROOT}/scripts/versions.env"
 
 if [ -t 1 ]; then GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; BOLD='\033[1m'; RESET='\033[0m'; else GREEN=''; YELLOW=''; BLUE=''; BOLD=''; RESET=''; fi
 step() { printf "${BOLD}${BLUE}▸${RESET} ${BOLD}%s${RESET}\n" "$1"; }

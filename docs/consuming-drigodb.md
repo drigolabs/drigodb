@@ -189,7 +189,7 @@ database that is already awake: a speculative wake must not restart something
 serving traffic, so it does nothing.
 
 **Waking is also when a database picks up changes** — a rebuilt image, a new
-migration, a resize. A database that stays hibernated indefinitely never
+a resize. A database that stays hibernated indefinitely never
 reconciles; one that cycles gets everything owed to it.
 
 ## A complete example
@@ -219,7 +219,7 @@ spec:
 ## What drigodb does not do for you
 
 - **No connection pooling.** One PostgreSQL instance per database, `max_connections` at the server default. Pool in your application.
-- **No schema management.** `_drigodb` is drigodb's; `public` is yours.
+- **No schema management.** drigodb puts nothing inside your database — no schema, no table, no extension. It is yours entirely.
 - **No automatic hibernation.** Nothing decides your database is idle.
 - **No accounts or quotas.** One token per installation, and every holder can do everything —
   including to databases they did not create. If you are not also the operator, you are trusting

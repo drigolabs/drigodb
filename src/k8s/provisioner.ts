@@ -19,48 +19,42 @@ import {
 import type { V1Job, V1StatefulSet } from "@kubernetes/client-node";
 import type { Tier } from "./manifests.js";
 
-import { backupsEnabled, config, serverAuthEnabled } from "../config.js";
-import type { BackupObject } from "../backups/s3.js";
-import { BackupStorageError, listObjects, regionFromEndpoint } from "../backups/s3.js";
+import { config, serverAuthEnabled } from "../config.js";
 import {
-  BACKUP_KEY_SECRET_KEY,
-  BACKUP_SECRET_SECRET_KEY,
   TIERS,
   TIER_LABEL,
   TIER_ORDER,
   DB_ID_LABEL,
+  CLUSTERS_PLURAL,
+  DB_USER,
+  CNPG_GROUP,
+  CNPG_HIBERNATION_ANNOTATION,
+  CREDENTIAL_VERSION_ANNOTATION,
   EXTERNAL_ID_LABEL,
   HIBERNATED_LABEL,
   MANAGED_BY_LABEL,
   MANAGED_BY_VALUE,
   POSTGRES_PORT,
-  TEMPLATE_HASH_ANNOTATION,
   buildNetworkPolicy,
-  buildPodTemplate,
   buildCertificate,
-  buildRestoreJob,
+  buildCluster,
   buildSecret,
   buildService,
-  buildStatefulSet,
   connectionUri,
   endpointHost,
-  pvcName,
-  restoreJobName,
   tierOf,
   tlsSecretName,
   secretName,
   serviceName,
-  statefulSetName,
-  templateHash,
+  clusterName,
 } from "./manifests.js";
 
-// "restoring" is deliberately NOT "ready". A restored database answers on its
-// port before its data has landed, and a caller that connected then would see
-// an empty database — and any write it made would leave the restore to find a
-// non-empty target and skip. The status is what stops that race.
 export type DatabaseStatus =
   | "provisioning"
-  | "restoring"
+  // Running, and not usable yet: the server accepts connections but drigodb's
+  // migrations have not finished. Distinct from `restoring`, which is data
+  // arriving, and from `failed`, which is a migration that will not finish.
+  | "migrating"
   | "ready"
   | "hibernated"
   | "failed";
@@ -69,6 +63,15 @@ export type Database = {
   id: string;
   external_id: string;
   status: DatabaseStatus;
+  // Not a lifecycle state, and deliberately on every database rather than only
+  // the unprotected ones: right now that is all of them.
+  //
+  // The backup sidecar lived in a pod template drigodb no longer owns
+  // (decision 0004), so it went with it, and CloudNativePG's own backups are
+  // #95. Until that lands a hosted database has no backup at all, and a
+  // consumer polling this endpoint should be told rather than left to infer it
+  // from an endpoint that no longer exists.
+  backups: "unavailable";
   tier: Tier;
   endpoint: string;
   port: number;
@@ -79,15 +82,44 @@ export type Database = {
 // permitted inside. Callers get a 400 rather than a confusing API-server error.
 const EXTERNAL_ID_RE = /^[A-Za-z0-9]([-A-Za-z0-9_.]{0,61}[A-Za-z0-9])?$/;
 
+// The slice of a CloudNativePG Cluster drigodb reads.
+//
+// Deliberately not the operator's full type. drigodb depends on four fields, and
+// writing them down is what keeps a CNPG upgrade from being able to change
+// something this code silently relied on.
+interface CnpgCluster {
+  metadata?: {
+    name?: string;
+    labels?: Record<string, string>;
+    annotations?: Record<string, string>;
+    creationTimestamp?: string;
+  };
+  spec?: { instances?: number; storage?: { size?: string } };
+  status?: {
+    readyInstances?: number;
+    phase?: string;
+    managedRolesStatus?: {
+      passwordStatus?: Record<string, { resourceVersion?: string }>;
+    };
+  };
+}
+
 export class ValidationError extends Error {}
 export class NotFoundError extends Error {}
 // "Backups are off" is a different answer from "there are none", and a caller
 // acting on the second when the first is true would be wrong.
-export class BackupsDisabledError extends Error {}
 // The storage layer refused to grow the volume. Almost always a StorageClass
 // with allowVolumeExpansion: false, which is the operator's to change and not
 // something drigodb can work around.
 export class ResizeRefusedError extends Error {}
+
+// A feature this installation has not turned on was asked for.
+//
+// caCertificate used to throw BackupsDisabledError for "server authentication is
+// off", which was true of the HTTP status and a lie about everything else. An
+// error class is read by whoever is debugging at 3am; naming it after a
+// different feature costs them the first ten minutes.
+export class NotConfiguredError extends Error {}
 
 // A create landed on an id whose previous database is still being deleted.
 //
@@ -101,25 +133,6 @@ export class DeletionInFlightError extends Error {}
 // is a caller mistake or an attempt to read another prefix. Both are 400s.
 const RESTORE_KEY_RE = /^\d{8}T\d{6}Z\.sql\.gz$/;
 const DB_ID_RE = /^[0-9a-f]{12}$/;
-
-export function validateRestoreFrom(
-  value: unknown,
-): { databaseId: string; key: string } | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (typeof value !== "object") throw new ValidationError("restore_from must be an object");
-  const { database_id: dbId, key } = value as { database_id?: unknown; key?: unknown };
-
-  if (typeof dbId !== "string" || !DB_ID_RE.test(dbId)) {
-    throw new ValidationError("restore_from.database_id must be a database id");
-  }
-  // A key is joined onto a bucket prefix, so a traversal here would read
-  // another database's backups. Matching the exact shape this service writes is
-  // a tighter check than rejecting "..", and needs no reasoning about encoding.
-  if (typeof key !== "string" || !RESTORE_KEY_RE.test(key)) {
-    throw new ValidationError("restore_from.key must be a backup key, e.g. 20260905T040000Z.sql.gz");
-  }
-  return { databaseId: dbId, key };
-}
 
 // Falls back rather than throwing on a bad value: a typo in an operator's env
 // must not stop every provision, and small is the safe direction to be wrong in.
@@ -172,14 +185,16 @@ function newPassword(): string {
 }
 
 function isAlreadyExists(err: unknown): boolean {
-  const code = (err as { code?: number; statusCode?: number })?.code
-    ?? (err as { statusCode?: number })?.statusCode;
+  const code =
+    (err as { code?: number; statusCode?: number })?.code ??
+    (err as { statusCode?: number })?.statusCode;
   return code === 409;
 }
 
 function isNotFound(err: unknown): boolean {
-  const code = (err as { code?: number; statusCode?: number })?.code
-    ?? (err as { statusCode?: number })?.statusCode;
+  const code =
+    (err as { code?: number; statusCode?: number })?.code ??
+    (err as { statusCode?: number })?.statusCode;
   return code === 404;
 }
 
@@ -219,12 +234,18 @@ export class Provisioner {
     );
   }
 
-  private async statefulSetFor(id: string) {
+  // The shape drigodb reads out of a CNPG Cluster. Narrow on purpose: the
+  // operator's status has a great deal in it and depending on more of it than
+  // this would make every CNPG upgrade a risk.
+  private async clusterFor(id: string): Promise<CnpgCluster | undefined> {
     try {
-      return await this.apps.readNamespacedStatefulSet({
-        name: statefulSetName(id),
+      return (await this.objects.getNamespacedCustomObject({
+        group: CNPG_GROUP,
+        version: "v1",
         namespace: config.databaseNamespace,
-      });
+        plural: CLUSTERS_PLURAL,
+        name: clusterName(id),
+      })) as CnpgCluster;
     } catch (err) {
       if (isNotFound(err)) return undefined;
       throw err;
@@ -234,76 +255,132 @@ export class Provisioner {
   private async statusOf(
     id: string,
     labels: Record<string, string>,
-    desiredReplicas: number,
-    ready: number,
+    cluster: CnpgCluster,
   ): Promise<DatabaseStatus> {
     // Hibernation is an intent, so it is read from the label that records the
-    // intent rather than inferred from the replica count it produced. A create
-    // is also at zero replicas while it runs, and telling the concurrent caller
-    // its database was hibernated was wrong in the one case the second API
-    // replica exists to serve.
-    const hibernated = labels[HIBERNATED_LABEL];
-    if (hibernated === "true") return "hibernated";
-    // Databases created before the label carry no intent to read, and the
-    // replica count is what they were always judged by. They gain the label the
-    // first time they are scaled.
-    if (hibernated === undefined && desiredReplicas === 0) return "hibernated";
+    // intent rather than from what the operator has done about it yet. A create
+    // is also "no instances running", and telling a concurrent caller its
+    // database was hibernated was wrong in exactly the case this distinguishes.
+    if (labels[HIBERNATED_LABEL] === "true") return "hibernated";
 
-    // Before the ready check, not after: a restoring database has a ready pod
-    // and is not usable, which is the whole reason this status exists.
-    const restore = await this.restoreJobFor(id);
-    if (restore) {
-      if ((restore.status?.succeeded ?? 0) > 0) return ready > 0 ? "ready" : "provisioning";
-      if ((restore.status?.failed ?? 0) > 0) return "failed";
-      return "restoring";
-    }
-
-    if (ready > 0) return "ready";
-
-    // Distinguish "still starting" from "stuck". A pod that cannot pull its
-    // image or is crash-looping will never become ready on its own, and a
-    // caller polling forever is worse than an error.
+    // Counted from the pods, not read from status.readyInstances.
+    //
+    // A hibernated Cluster reports readyInstances: 1 with zero pods running —
+    // CloudNativePG does not zero it on the way down. The hibernation label
+    // covers a database that is deliberately down, but a database on its way
+    // BACK up would have reported `ready` the instant the annotation flipped,
+    // before anything was listening. Measured: "woke in 0s", with no pod.
+    // `cnpg.io/podRole=instance` as well as drigodb's own id, because
+    // inheritedMetadata puts drigodb's labels on EVERY pod the operator makes
+    // for this database — including the initdb Job's. Selecting on the id alone
+    // counted that job pod as a ready instance and reported the database ready
+    // seven seconds in, while nothing was listening yet. Measured: "ready in
+    // 7s", then connection refused.
     const pods = await this.core.listNamespacedPod({
       namespace: config.databaseNamespace,
-      labelSelector: `${DB_ID_LABEL}=${id}`,
+      labelSelector: `${DB_ID_LABEL}=${id},cnpg.io/podRole=instance`,
     });
-    for (const pod of pods.items ?? []) {
-      for (const cs of pod.status?.containerStatuses ?? []) {
-        const reason = cs.state?.waiting?.reason ?? "";
-        if (reason === "CrashLoopBackOff" || reason.endsWith("ImagePullBackOff")) {
-          return "failed";
-        }
-      }
-    }
+    const ready = (pods.items ?? []).filter((p) =>
+      (p.status?.conditions ?? []).some(
+        (c) => c.type === "Ready" && c.status === "True",
+      ),
+    ).length;
+
+    // Before the ready check, not after: a database whose migrations failed has
+    // a running server and an unusable schema, which is the whole reason this
+    // status exists. It is also why no URI is issued for one — see create().
+    if (ready > 0) return "ready";
+
+    // The operator's own verdict, for the cases it can see and drigodb cannot:
+    // an image that will not pull, a volume that will not bind, a cluster that
+    // has given up. A caller polling forever is worse than an error.
+    const phase = cluster.status?.phase ?? "";
+    if (/failure|failed|unrecoverable/i.test(phase)) return "failed";
+
     return "provisioning";
   }
 
-  private async toDatabase(sts: { metadata?: { labels?: Record<string, string>; creationTimestamp?: Date }; spec?: { replicas?: number }; status?: { readyReplicas?: number } }): Promise<Database> {
-    const labels = sts.metadata?.labels ?? {};
+  private async toDatabase(cluster: CnpgCluster): Promise<Database> {
+    const labels = cluster.metadata?.labels ?? {};
     const id = labels[DB_ID_LABEL] ?? "";
-    const status = await this.statusOf(
-      id,
-      labels,
-      sts.spec?.replicas ?? 0,
-      sts.status?.readyReplicas ?? 0,
-    );
     return {
       id,
       external_id: labels[EXTERNAL_ID_LABEL] ?? "",
-      status,
+      status: await this.statusOf(id, labels, cluster),
+      backups: "unavailable",
       tier: tierOf(labels),
       endpoint: endpointHost(id),
       port: POSTGRES_PORT,
-      created_at: sts.metadata?.creationTimestamp?.toISOString(),
+      created_at: cluster.metadata?.creationTimestamp
+        ? new Date(cluster.metadata.creationTimestamp).toISOString()
+        : undefined,
     };
   }
 
-  // Missing is the ordinary case: most databases were never restored into, and
-  // a succeeded Job removes itself after an hour.
-  private async restoreJobFor(id: string): Promise<V1Job | undefined> {
+  // Make the rotation happen, then wait for the operator to say it has.
+  //
+  // Replacing the Secret is not enough on its own, and this is the trap:
+  // CloudNativePG goes on reporting the role `reconciled` against the version it
+  // last applied and does not re-read the Secret until something touches the
+  // Cluster. Measured — the Secret at resourceVersion 6634, the operator
+  // reporting 6176, `reconciled`, indefinitely.
+  //
+  // Which is the worst shape a failed rotation can take. The API returns a new
+  // URI that does not work, and the OLD password goes on working — so a caller
+  // rotating because a credential leaked would believe they had revoked it.
+  //
+  // The annotation is the nudge and the record: it names the Secret version
+  // drigodb expects applied, so the two can be compared by anyone debugging.
+  // Reconciles in about four seconds once written.
+  private async applyCredentialVersion(
+    id: string,
+    version?: string,
+    attempts = 60,
+  ): Promise<void> {
+    if (!version) return;
+    await this.objects.patchNamespacedCustomObject(
+      {
+        group: CNPG_GROUP,
+        version: "v1",
+        namespace: config.databaseNamespace,
+        plural: CLUSTERS_PLURAL,
+        name: clusterName(id),
+        body: {
+          metadata: {
+            annotations: { [CREDENTIAL_VERSION_ANNOTATION]: version },
+          },
+        },
+      },
+      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+    );
+    for (let i = 0; i < attempts; i++) {
+      const cluster = await this.clusterFor(id);
+      const applied =
+        cluster?.status?.managedRolesStatus?.passwordStatus?.[DB_USER]
+          ?.resourceVersion;
+      if (applied === version) return;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    // Not fatal. The rotation HAS happened — the Secret is written and the
+    // operator will converge — so refusing to return the URI would leave the
+    // caller without a credential that is about to start working.
+    console.warn(
+      `[drigodb] ${id}: role password not confirmed applied after ${attempts}s`,
+    );
+  }
+
+  private async ignoreMissing(fn: () => Promise<unknown>): Promise<void> {
+    try {
+      await fn();
+    } catch (err) {
+      if (!isNotFound(err)) throw err;
+    }
+  }
+
+  private async jobFor(name: string): Promise<V1Job | undefined> {
     try {
       return await this.batch.readNamespacedJob({
-        name: restoreJobName(id),
+        name,
         namespace: config.databaseNamespace,
       });
     } catch (err) {
@@ -312,27 +389,37 @@ export class Provisioner {
     }
   }
 
-  async findByExternalId(externalId: string): Promise<Database | undefined> {
-    const list = await this.apps.listNamespacedStatefulSet({
+  private async listClusters(selector: string): Promise<CnpgCluster[]> {
+    const list = (await this.objects.listNamespacedCustomObject({
+      group: CNPG_GROUP,
+      version: "v1",
       namespace: config.databaseNamespace,
-      labelSelector: `${EXTERNAL_ID_LABEL}=${externalId},${MANAGED_BY_LABEL}=${MANAGED_BY_VALUE}`,
-    });
-    const found = list.items?.[0];
+      plural: CLUSTERS_PLURAL,
+      labelSelector: selector,
+    })) as { items?: CnpgCluster[] };
+    return list.items ?? [];
+  }
+
+  async findByExternalId(externalId: string): Promise<Database | undefined> {
+    const found = (
+      await this.listClusters(
+        `${EXTERNAL_ID_LABEL}=${externalId},${MANAGED_BY_LABEL}=${MANAGED_BY_VALUE}`,
+      )
+    )[0];
     return found ? await this.toDatabase(found) : undefined;
   }
 
   async get(id: string): Promise<Database> {
-    const sts = await this.statefulSetFor(id);
-    if (!sts) throw new NotFoundError(`no database with id ${id}`);
-    return this.toDatabase(sts);
+    const cluster = await this.clusterFor(id);
+    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
+    return this.toDatabase(cluster);
   }
 
   async list(): Promise<Database[]> {
-    const list = await this.apps.listNamespacedStatefulSet({
-      namespace: config.databaseNamespace,
-      labelSelector: `${MANAGED_BY_LABEL}=${MANAGED_BY_VALUE}`,
-    });
-    return Promise.all((list.items ?? []).map((s) => this.toDatabase(s)));
+    const clusters = await this.listClusters(
+      `${MANAGED_BY_LABEL}=${MANAGED_BY_VALUE}`,
+    );
+    return Promise.all(clusters.map((c) => this.toDatabase(c)));
   }
 
   // Returns the database and its connection URI. The URI is returned here and
@@ -340,7 +427,6 @@ export class Provisioner {
   // leak database credentials.
   async create(
     externalId: string,
-    restoreFrom?: { databaseId: string; key: string },
   ): Promise<{ database: Database; uri: string; created: boolean }> {
     const id = idFor(externalId);
     const password = newPassword();
@@ -360,26 +446,58 @@ export class Provisioner {
       namespace: ns,
       labelSelector: `${DB_ID_LABEL}=${id}`,
     });
-    if ((leftover.items ?? []).length > 0 && !(await this.statefulSetFor(id))) {
+    if ((leftover.items ?? []).length > 0 && !(await this.clusterFor(id))) {
       throw new DeletionInFlightError(
         `a database for external_id ${externalId} is still being deleted; retry in a moment`,
       );
     }
 
-    // The StatefulSet FIRST, and it is the lock rather than merely the first
-    // step. Whichever replica creates it wins; the other is told AlreadyExists
-    // and returns the database that now exists, which is the same answer a plain
-    // retry gets. Its pod template references a Secret that does not exist yet,
-    // which is fine because it starts at zero replicas — nothing resolves a
-    // secretKeyRef until the wake below.
-    try {
-      await this.apps.createNamespacedStatefulSet({
+    // The Secret BEFORE the Cluster, which is the one ordering CloudNativePG
+    // forces and the old data plane did not. bootstrap.initdb.secret is read
+    // during initdb, so a Cluster created first would bootstrap against a Secret
+    // that does not exist yet.
+    //
+    // Safe to write before the lock is taken, unlike the Cluster: a Secret for a
+    // database that never gets created is an orphan, not a second database. The
+    // loser of a race overwrites it with an identical-shaped Secret carrying a
+    // password nobody will ever be told, and then returns without using it.
+    await this.ensure(() =>
+      this.core.createNamespacedSecret({
         namespace: ns,
-        body: buildStatefulSet(id, externalId, defaultTier()),
+        body: buildSecret(id, externalId, password),
+      }),
+    );
+
+    // BEFORE the Cluster, not after, and that ordering is now load-bearing.
+    //
+    // The Cluster's spec names this Secret, so CloudNativePG waits for it —
+    // a database whose certificate has not issued stays provisioning, visibly,
+    // instead of coming up on a certificate that names the wrong host.
+    //
+    // That is a deliberate change. The old data plane self-signed as a fallback
+    // so a slow cert-manager cost a database its certificate and not its
+    // availability. There is no fallback to reach for now: the operator would
+    // sign its own, naming its own Services, and every consumer's verify-full
+    // would fail against a URI drigodb had already issued. Failing to start is
+    // louder than failing to verify.
+    if (serverAuthEnabled()) await this.ensureCertificate(id, externalId);
+
+    // The Cluster is the lock, exactly as the StatefulSet was: whichever caller
+    // creates it wins, and the other is told AlreadyExists and handed the
+    // database that now exists — the same answer a plain retry gets.
+    try {
+      await this.objects.createNamespacedCustomObject({
+        group: CNPG_GROUP,
+        version: "v1",
+        namespace: ns,
+        plural: CLUSTERS_PLURAL,
+        body: buildCluster(id, externalId, defaultTier()),
       });
     } catch (err) {
       if (!isAlreadyExists(err)) throw err;
-      const owner = (await this.statefulSetFor(id))?.metadata?.labels?.[EXTERNAL_ID_LABEL];
+      const owner = (await this.clusterFor(id))?.metadata?.labels?.[
+        EXTERNAL_ID_LABEL
+      ];
       // Twelve hex characters is 48 bits, so a collision needs millions of
       // external_ids — but handing one caller another's database, credentials
       // and all, is not a failure to discover in production.
@@ -394,39 +512,28 @@ export class Provisioner {
     // Tolerating AlreadyExists on each: a create that failed partway leaves some
     // of these behind, and a retry has to be able to finish the job rather than
     // stall on the first object it already made.
+    //
+    // drigodb's own Service, not CloudNativePG's `-rw` one. Same reason the
+    // Cluster carries the same name a StatefulSet did: the connection URI is
+    // issued once and never reissued, so the hostname in it cannot move.
     await this.ensure(() =>
-      this.core.createNamespacedSecret({ namespace: ns, body: buildSecret(id, externalId, password) }),
-    );
-    await this.ensure(() =>
-      this.core.createNamespacedService({ namespace: ns, body: buildService(id, externalId) }),
-    );
-    await this.ensure(() =>
-      this.net.createNamespacedNetworkPolicy({ namespace: ns, body: buildNetworkPolicy(id, externalId) }),
-    );
-
-    // Created hibernated, then woken: provisioning and waking are the same code
-    // path, so the wake path is exercised on every single create — including
-    // its reconcile, which lands on the no-op branch because the StatefulSet
-    // was just built from the template it is about to be compared against.
-    // Before the wake, so cert-manager has the whole provisioning window to
-    // issue. The mount is optional and bootstrap.sh self-signs, so a slow
-    // issuance costs the database a certificate on its first start and not its
-    // availability — it picks the real one up on its next cycle.
-    if (serverAuthEnabled()) await this.ensureCertificate(id, externalId);
-
-    await this.wake(id);
-
-    // After the wake, because the Job connects over TCP to a server that has to
-    // be listening — and creating it earlier would only mean it crash-looped
-    // through its backoff while the database initialised.
-    if (restoreFrom) {
-      await this.batch.createNamespacedJob({
+      this.core.createNamespacedService({
         namespace: ns,
-        body: buildRestoreJob(id, externalId, `${restoreFrom.databaseId}/${restoreFrom.key}`),
-      });
-    }
+        body: buildService(id, externalId),
+      }),
+    );
+    await this.ensure(() =>
+      this.net.createNamespacedNetworkPolicy({
+        namespace: ns,
+        body: buildNetworkPolicy(id, externalId),
+      }),
+    );
 
-    return { database: await this.get(id), uri: connectionUri(id, password), created: true };
+    return {
+      database: await this.get(id),
+      uri: connectionUri(id, password),
+      created: true,
+    };
   }
 
   // Bring a database up, on the template this build renders rather than the one
@@ -440,75 +547,13 @@ export class Provisioner {
   // databases and never for existing ones. It is also how the plain-PostgreSQL
   // data plane reaches a database created before the migration.
   async wake(id: string): Promise<Database> {
-    const sts = await this.statefulSetFor(id);
+    const cluster = await this.clusterFor(id);
     // Read first, so waking something that does not exist is a 404 rather than
-    // a 500 from the scale subresource.
-    if (!sts) throw new NotFoundError(`no database with id ${id}`);
+    // whatever the patch below would have said.
+    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
 
-    await this.reconcile(sts);
-    return this.scale(id, 1);
-  }
-
-  // Rewrite the pod template if this build renders a different one.
-  //
-  // Ordering is the point: this runs BEFORE the scale, while the StatefulSet is
-  // still at zero replicas. With no pods there is nothing to roll, so the
-  // rewrite costs nothing and the pod that follows starts once, on the new
-  // template. Reconciling after the scale would start it on the old template
-  // and then roll it — two starts, and roughly twice the eight seconds a wake
-  // is supposed to take.
-  private async reconcile(sts: V1StatefulSet): Promise<void> {
-    const labels = sts.metadata?.labels ?? {};
-    const id = labels[DB_ID_LABEL];
-    const externalId = labels[EXTERNAL_ID_LABEL];
-    if (!id || !externalId) return;
-
-    // Waking is how everything else reaches an existing database — a rebuilt
-    // image, a new migration, a resized volume — and a certificate is no
-    // different. Without this, turning server authentication on would give it
-    // only to databases created afterwards, and the fleet would divide silently
-    // into verifiable and not.
-    if (serverAuthEnabled()) await this.ensureCertificate(id, externalId);
-
-    // Only on the way up from hibernation. Callers wake speculatively — that is
-    // what the endpoint is for — and a wake on a database that is already
-    // serving must not touch it: rewriting the template of a running
-    // StatefulSet rolls the pod and drops every live connection. A database
-    // that is already awake reconciles on its next hibernate/wake cycle.
-    if ((sts.spec?.replicas ?? 0) > 0) return;
-
-    // From the StatefulSet's own label, not from configuration. A resized
-    // database is on a tier this installation may not create by default, and
-    // rebuilding its template from config.defaultTier would silently move it
-    // back — undoing a resize on the next wake, with the PVC left large and
-    // max_wal_size dropped underneath it.
-    const tier = tierOf(labels);
-
-    const want = templateHash(id, externalId, tier);
-    if (sts.metadata?.annotations?.[TEMPLATE_HASH_ANNOTATION] === want) return;
-
-    await this.apps.patchNamespacedStatefulSet(
-      {
-        name: statefulSetName(id),
-        namespace: config.databaseNamespace,
-        body: {
-          metadata: { annotations: { [TEMPLATE_HASH_ANNOTATION]: want } },
-          // Only the template. A StatefulSet's selector, serviceName and
-          // volumeClaimTemplates are immutable, so anything wider than this is
-          // rejected outright; replicas is left out so the patch cannot fight
-          // the scale that follows it.
-          spec: { template: buildPodTemplate(id, externalId, tier) },
-        },
-      },
-      // A merge patch, not the strategic merge the client would otherwise send.
-      // Strategic merge unions lists by key — containers by name, env by name —
-      // so a field this build no longer renders would survive in the live
-      // object indefinitely. Merge patch replaces lists wholesale, which is
-      // what "make it match what we render" actually means.
-      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
-    );
-
-    console.log(`[drigodb] reconciled ${id} to template ${want}`);
+    await this.scale(id, 1);
+    return this.get(id);
   }
 
   // Issue a new password and return the URI that carries it.
@@ -525,18 +570,20 @@ export class Provisioner {
   // pg_hba rule and a DDL-capable credential per database that the control
   // plane holds and can use — it already holds every credential; the point is
   // that it cannot use one from where it runs. See issue #29.
-  async rotateCredentials(id: string): Promise<{ database: Database; uri: string }> {
-    const sts = await this.statefulSetFor(id);
-    if (!sts) throw new NotFoundError(`no database with id ${id}`);
+  async rotateCredentials(
+    id: string,
+  ): Promise<{ database: Database; uri: string }> {
+    const cluster = await this.clusterFor(id);
+    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
 
-    const externalId = sts.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "";
+    const externalId = cluster.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "";
     const password = newPassword();
 
     // The Secret first, always. The pod reads it at start, so a restart that
     // happened before this landed would come back on the old password. This
     // order also fails safe: if the restart below never happens, the database
     // still converges on the new password at its next wake.
-    await this.core.replaceNamespacedSecret({
+    const written = await this.core.replaceNamespacedSecret({
       name: secretName(id),
       namespace: config.databaseNamespace,
       body: buildSecret(id, externalId, password),
@@ -545,12 +592,20 @@ export class Provisioner {
     // A hibernated database has nothing to restart and nothing connected to it.
     // It picks the new password up when it next wakes, which is the first
     // moment the URI could be used anyway.
-    if ((sts.spec?.replicas ?? 0) > 0) {
-      await this.scale(id, 0);
-      await this.waitForPodsGone(id);
-      await this.wake(id);
-      await this.waitForReady(id);
-    }
+    // No restart. Under CloudNativePG the password is a managed role reconciled
+    // against this Secret continuously, so replacing the Secret IS the rotation
+    // — measured, including that the old password stops being accepted.
+    //
+    // But it is not instant, and this endpoint returns a URI a caller will use
+    // immediately. Waiting for the operator to say it has adopted THIS version
+    // of the Secret is what makes the returned credential true when it is
+    // returned. Without it the caller gets "password authentication failed" on
+    // a password drigodb has just told them is theirs — measured, not guessed.
+    await this.applyCredentialVersion(id, written?.metadata?.resourceVersion);
+    //
+    // The hibernate/wake cycle this used to perform was there because the old
+    // data plane read the Secret only at start. Dropping it removes the one
+    // operation that took a database offline to change a credential.
 
     return { database: await this.get(id), uri: connectionUri(id, password) };
   }
@@ -586,43 +641,41 @@ export class Provisioner {
   // especially right after create, where the object is being actively
   // reconciled. A 409 here is normal, not exceptional.
   async scale(id: string, replicas: number): Promise<Database> {
-    const name = statefulSetName(id);
-    const namespace = config.databaseNamespace;
-    let lastErr: unknown;
-
-    // Before the scale, in both directions, because a label that lags the
-    // replica count is a status that lies. Going down it briefly reports
-    // hibernated for a pod still running, which is where it is heading; going
-    // up it reports provisioning for a pod not yet started, which is what it
-    // is. The reverse order would report a live database as hibernated after a
-    // failure, and leave it that way.
-    //
-    // Only when it disagrees. Waking is called speculatively against databases
-    // that are already awake, and writing a label its value already has would
-    // make every one of those a write.
     const want = replicas === 0 ? "true" : "false";
-    const live = await this.statefulSetFor(id);
-    if (live && live.metadata?.labels?.[HIBERNATED_LABEL] !== want) {
-      await this.apps.patchNamespacedStatefulSet(
-        { name, namespace, body: { metadata: { labels: { [HIBERNATED_LABEL]: want } } } },
-        setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
-      );
-    }
 
-    for (let attempt = 0; attempt < 5; attempt++) {
-      try {
-        const scale = await this.apps.readNamespacedStatefulSetScale({ name, namespace });
-        scale.spec = { ...(scale.spec ?? {}), replicas };
-        await this.apps.replaceNamespacedStatefulSetScale({ name, namespace, body: scale });
-        return await this.get(id);
-      } catch (err) {
-        const code = (err as { code?: number })?.code;
-        if (code !== 409) throw err;
-        lastErr = err;
-        await new Promise((r) => setTimeout(r, 100 * (attempt + 1)));
-      }
-    }
-    throw lastErr;
+    // One patch, both fields, so the label recording the intent and the
+    // annotation acting on it can never disagree. The previous data plane needed
+    // two writes — a label patch and a scale subresource — and an ordering
+    // argument about which lies less when the second one fails.
+    await this.objects.patchNamespacedCustomObject(
+      {
+        group: CNPG_GROUP,
+        version: "v1",
+        namespace: config.databaseNamespace,
+        plural: CLUSTERS_PLURAL,
+        name: clusterName(id),
+        body: {
+          metadata: {
+            labels: { [HIBERNATED_LABEL]: want },
+            annotations: {
+              [CNPG_HIBERNATION_ANNOTATION]: replicas === 0 ? "on" : "off",
+            },
+          },
+        },
+      },
+      // The merge-patch content type, which every patch this service sends
+      // needs. Without it the client sends a JSON Patch — an array of
+      // operations — and the API server rejects an object outright with
+      // "cannot unmarshal object into Go value of type []handlers.jsonPatchOp".
+      //
+      // Written without it here, and hibernate returned 500 on a real cluster
+      // while every unit test passed: a mocked client cannot notice a content
+      // type. The same mistake, in the same shape, as the one the StatefulSet
+      // patches carry a comment about.
+      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+    );
+
+    return await this.get(id);
   }
 
   // Grow a database onto a bigger tier.
@@ -636,11 +689,11 @@ export class Provisioner {
   // not grown is how PostgreSQL PANICs on a full disk — and a full PVC is not a
   // quick recovery.
   async resize(id: string, target: Tier): Promise<Database> {
-    const sts = await this.statefulSetFor(id);
-    if (!sts) throw new NotFoundError(`no database with id ${id}`);
+    const cluster = await this.clusterFor(id);
+    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
 
-    const current = tierOf(sts.metadata?.labels);
-    const externalId = sts.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "";
+    const current = tierOf(cluster.metadata?.labels);
+    const externalId = cluster.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "";
     const at = TIER_ORDER.indexOf(current);
     const to = TIER_ORDER.indexOf(target);
     const ceiling = TIER_ORDER.indexOf(config.maxTier as Tier);
@@ -661,22 +714,38 @@ export class Provisioner {
 
     const ns = config.databaseNamespace;
 
-    // 1. The volume. Expansion is online — measured on DigitalOcean 2026-09-05,
-    //    974M to 2.0G with the database serving and no restart — so this alone
-    //    costs a tenant nothing.
+    // One patch, and the operator does both halves.
+    //
+    // The old data plane needed two: a PVC patch to grow the volume, then a pod
+    // template rewrite for max_wal_size, ordered so that a failure between them
+    // left a LARGER volume running the old ceiling rather than a raised ceiling
+    // on a volume that never grew — PostgreSQL on a full disk PANICs.
+    //
+    // That ordering argument is gone. The Cluster carries the size and the
+    // parameter, and the operator expands the volume and decides whether the
+    // parameter needs a restart. It also means the PVC name is no longer
+    // drigodb's business, which is just as well: CloudNativePG names it
+    // `db-<id>-1`, not the `data-db-<id>-0` a StatefulSet would have.
+    //
+    // Expansion is online — measured on DigitalOcean 2026-09-05, 974M to 2.0G
+    // with the database serving and no restart.
     try {
-      await this.core.patchNamespacedPersistentVolumeClaim(
-        {
-          name: pvcName(id),
-          namespace: ns,
-          body: { spec: { resources: { requests: { storage: TIERS[target].storage } } } },
+      await this.objects.patchNamespacedCustomObject({
+        group: CNPG_GROUP,
+        version: "v1",
+        namespace: ns,
+        plural: CLUSTERS_PLURAL,
+        name: clusterName(id),
+        body: {
+          metadata: { labels: { [TIER_LABEL]: target } },
+          spec: {
+            storage: { size: TIERS[target].storage },
+            postgresql: {
+              parameters: { max_wal_size: TIERS[target].maxWalSize },
+            },
+          },
         },
-        // Same reason the StatefulSet patch sets this: without it the client
-        // sends a JSON Patch, which expects an array of operations and rejects
-        // this object outright with "cannot unmarshal object into Go value of
-        // type []handlers.jsonPatchOp". A mocked client cannot notice that.
-        setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
-      );
+      });
     } catch (err) {
       // The common cause is a StorageClass with allowVolumeExpansion: false —
       // kind's local-path, and plenty of others. Kubernetes says so clearly and
@@ -689,50 +758,25 @@ export class Provisioner {
       const raw = (err as { body?: unknown })?.body;
       let detail: string | undefined;
       if (typeof raw === "string") {
-        try { detail = (JSON.parse(raw) as { message?: string }).message; } catch { detail = raw; }
+        try {
+          detail = (JSON.parse(raw) as { message?: string }).message;
+        } catch {
+          detail = raw;
+        }
       } else if (raw && typeof raw === "object") {
         detail = (raw as { message?: string }).message;
       }
-      if (detail) throw new ResizeRefusedError(`could not grow the volume: ${detail}`);
+      if (detail)
+        throw new ResizeRefusedError(`could not grow the volume: ${detail}`);
       throw err;
     }
-
-    // 2. The template and the label, together. The pod template carries
-    //    DRIGODB_MAX_WAL_SIZE, which bootstrap.sh writes into PGDATA at start —
-    //    so this takes effect on the cycle below, after the volume has grown.
-    await this.apps.patchNamespacedStatefulSet(
-      {
-        name: statefulSetName(id),
-        namespace: ns,
-        body: {
-          metadata: {
-            labels: { [TIER_LABEL]: target },
-            annotations: { [TEMPLATE_HASH_ANNOTATION]: templateHash(id, externalId, target) },
-          },
-          spec: { template: buildPodTemplate(id, externalId, target) },
-        },
-      },
-      // Every patch this service sends needs this. Without it the client sends a
-      // JSON Patch, which wants an array of operations and rejects an object —
-      // and a mocked client in a unit test cannot tell the difference, which is
-      // why both of these got it wrong until a real cluster said so.
-      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
-    );
-
-    // There is no transaction across these two, and the order is what makes that
-    // survivable: a failure between them leaves a LARGER volume still running
-    // the old max_wal_size, which is merely wasteful. Reversed, it would leave a
-    // raised WAL ceiling on a volume that never grew — and PostgreSQL on a full
-    // disk does not degrade, it PANICs and will not restart until space is
-    // freed. Observed exactly once during development, in the safe direction.
 
     // 3. The cycle, which is what the WAL change needs and the volume does not.
     //    Skipped for a hibernated database: it will pick both up when it wakes,
     //    and waking one to change a setting it is not using would be rude.
-    if ((sts.spec?.replicas ?? 0) > 0) {
-      await this.scale(id, 0);
-      await this.wake(id);
-    }
+    // No cycle. The operator owns both halves: it expands the volume and it
+    // decides whether max_wal_size needs a restart to take effect. Doing it by
+    // hand would be racing the thing that is already doing it.
 
     return await this.get(id);
   }
@@ -757,7 +801,10 @@ export class Provisioner {
   // bootstrap.sh self-signs, the URI still works with the sslmode it was issued
   // for, and the alternative is an installation where a broken cert-manager
   // stops anyone creating a database at all.
-  private async ensureCertificate(id: string, externalId: string): Promise<void> {
+  private async ensureCertificate(
+    id: string,
+    externalId: string,
+  ): Promise<void> {
     try {
       await this.objects.createNamespacedCustomObject({
         group: "cert-manager.io",
@@ -768,14 +815,17 @@ export class Provisioner {
       });
     } catch (err) {
       if (isAlreadyExists(err)) return;
-      console.error(`[drigodb] could not request a certificate for ${id}:`, err);
+      console.error(
+        `[drigodb] could not request a certificate for ${id}:`,
+        err,
+      );
     }
   }
 
   async delete(id: string): Promise<void> {
     const ns = config.databaseNamespace;
-    const sts = await this.statefulSetFor(id);
-    if (!sts) throw new NotFoundError(`no database with id ${id}`);
+    const cluster = await this.clusterFor(id);
+    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
 
     const ignoreMissing = async (fn: () => Promise<unknown>) => {
       try {
@@ -786,49 +836,57 @@ export class Provisioner {
     };
 
     await ignoreMissing(() =>
-      this.apps.deleteNamespacedStatefulSet({ name: statefulSetName(id), namespace: ns }),
-    );
-    await ignoreMissing(() => this.core.deleteNamespacedService({ name: serviceName(id), namespace: ns }));
-    await ignoreMissing(() =>
-      this.net.deleteNamespacedNetworkPolicy({ name: statefulSetName(id), namespace: ns }),
-    );
-    await ignoreMissing(() => this.core.deleteNamespacedSecret({ name: secretName(id), namespace: ns }));
-    // A failed restore Job outlives its TTL on purpose, so DELETE is what
-    // finally removes it — along with the pod holding its logs.
-    if (serverAuthEnabled()) {
-      // The Certificate, not just its Secret: cert-manager would reissue the
-      // Secret it owns, leaving a certificate for a database that no longer
-      // exists renewing itself indefinitely.
-      await ignoreMissing(() =>
-        this.objects.deleteNamespacedCustomObject({
-          group: "cert-manager.io",
-          version: "v1",
-          namespace: config.tls.issuerNamespace,
-          plural: "certificates",
-          name: tlsSecretName(id),
-        }),
-      );
-    }
-    await ignoreMissing(() =>
-      this.batch.deleteNamespacedJob({
-        name: restoreJobName(id),
+      this.objects.deleteNamespacedCustomObject({
+        group: CNPG_GROUP,
+        version: "v1",
         namespace: ns,
-        propagationPolicy: "Background",
+        plural: CLUSTERS_PLURAL,
+        name: clusterName(id),
       }),
+    );
+    await ignoreMissing(() =>
+      this.core.deleteNamespacedService({
+        name: serviceName(id),
+        namespace: ns,
+      }),
+    );
+    await ignoreMissing(() =>
+      this.net.deleteNamespacedNetworkPolicy({
+        name: clusterName(id),
+        namespace: ns,
+      }),
+    );
+    await ignoreMissing(() =>
+      this.core.deleteNamespacedSecret({ name: secretName(id), namespace: ns }),
     );
 
     // The retention policy deliberately keeps volumes when a StatefulSet is
     // removed, so DELETE has to remove them explicitly. This is the point at
     // which the customer's data actually goes.
-    const pvcs = await this.core.listNamespacedPersistentVolumeClaim({
-      namespace: ns,
-      labelSelector: `${DB_ID_LABEL}=${id}`,
-    });
+    const pvcs = await this.core.listNamespacedPersistentVolumeClaim(
+      {
+        namespace: ns,
+        labelSelector: `${DB_ID_LABEL}=${id}`,
+      },
+      // The merge-patch content type, which every patch this service sends
+      // needs. Without it the client sends a JSON Patch — an array of
+      // operations — and the API server rejects an object outright with
+      // "cannot unmarshal object into Go value of type []handlers.jsonPatchOp".
+      //
+      // Written without it here, and hibernate returned 500 on a real cluster
+      // while every unit test passed: a mocked client cannot notice a content
+      // type. The same mistake, in the same shape, as the one the StatefulSet
+      // patches carry a comment about.
+      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+    );
     for (const pvc of pvcs.items ?? []) {
       const name = pvc.metadata?.name;
       if (name) {
         await ignoreMissing(() =>
-          this.core.deleteNamespacedPersistentVolumeClaim({ name, namespace: ns }),
+          this.core.deleteNamespacedPersistentVolumeClaim({
+            name,
+            namespace: ns,
+          }),
         );
       }
     }
@@ -842,7 +900,7 @@ export class Provisioner {
   // consumer to read a Secret in a namespace it has no business in.
   async caCertificate(): Promise<string> {
     if (!serverAuthEnabled()) {
-      throw new BackupsDisabledError(
+      throw new NotConfiguredError(
         "server authentication is not configured; connection URIs use sslmode=require",
       );
     }
@@ -856,50 +914,5 @@ export class Provisioner {
     const raw = secret.data?.["ca.crt"] ?? secret.data?.["tls.crt"];
     if (!raw) throw new NotFoundError("the CA secret holds no certificate yet");
     return Buffer.from(raw, "base64").toString("utf8");
-  }
-
-  // Every backup this database has, newest first.
-  //
-  // Answered from the control plane rather than from the pod, because the pod
-  // is exactly what is missing when the question matters: a hibernated database
-  // has no container to exec into, and "what can I restore?" is a question
-  // people ask about idle databases. Reaching `drigodb-backup latest` instead
-  // would need pods/exec RBAC, and a control plane that can exec into any
-  // database pod can read every tenant's data — strictly worse than listing a
-  // bucket, and still unable to answer while hibernated. See issue #39.
-  async listBackups(id: string): Promise<BackupObject[]> {
-    // 404 before 409: a database that does not exist is not a database whose
-    // backups are disabled.
-    const sts = await this.statefulSetFor(id);
-    if (!sts) throw new NotFoundError(`no database with id ${id}`);
-    if (!backupsEnabled()) {
-      throw new BackupsDisabledError("backups are not configured for this installation");
-    }
-
-    const secret = await this.core.readNamespacedSecret({
-      name: config.backup.secretName,
-      namespace: config.databaseNamespace,
-    });
-    const read = (k: string): string => {
-      const v = secret.data?.[k];
-      if (!v) throw new BackupStorageError(`${config.backup.secretName} has no ${k}`);
-      return Buffer.from(v, "base64").toString("utf8");
-    };
-
-    const objects = await listObjects({
-      endpoint: config.backup.endpoint,
-      bucket: config.backup.bucket,
-      // The trailing slash matters: without it the prefix for "a1" would also
-      // match "a1b2", which is another tenant's backups.
-      prefix: `${id}/`,
-      accessKeyId: read(BACKUP_KEY_SECRET_KEY),
-      secretAccessKey: read(BACKUP_SECRET_SECRET_KEY),
-      region: config.backup.region || regionFromEndpoint(config.backup.endpoint),
-    });
-
-    // Keys are ISO-8601 UTC timestamps, so this is chronological — but sorted
-    // on lastModified rather than the name, because the name is what the writer
-    // chose and the timestamp is what the store observed.
-    return objects.sort((a, b) => (a.lastModified < b.lastModified ? 1 : -1));
   }
 }
