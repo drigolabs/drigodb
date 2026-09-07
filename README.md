@@ -270,16 +270,41 @@ reconciler, or bootstrapping one. It is the escape hatch, not the route.
 
 ## Backups
 
-Backups are **not available in this release**. The sidecar that took them shared
-a Unix socket with PostgreSQL and authenticated by peer over it — no credential,
-no network path — and CloudNativePG owns the pod template now, so there is
-nowhere to put it. `GET /v1/databases/{id}` reports `"backups": "unavailable"`
-rather than leaving anyone to infer it.
+Off by default. Set a bucket and an endpoint and every database archives WAL
+continuously and can be backed up on demand.
 
-[#95](https://github.com/drigolabs/drigodb/issues/95) rebuilds them on the
-operator's own backup machinery, which also brings
-[#19](https://github.com/drigolabs/drigodb/issues/19) (point-in-time recovery)
-and [#23](https://github.com/drigolabs/drigodb/issues/23) (retention) with it.
+```bash
+kubectl create secret generic drigodb-backup-credentials -n drigodb-databases \
+  --from-literal=access_key=... --from-literal=secret_key=...
+
+# then, on the control plane
+DRIGODB_BACKUP_BUCKET=my-bucket
+DRIGODB_BACKUP_ENDPOINT=https://fra1.digitaloceanspaces.com
+```
+
+```
+POST /v1/databases/{id}/backups   → 202, take one now
+GET  /v1/databases/{id}/backups   → what can be restored
+```
+
+**drigodb never touches object storage.** It names a Secret, and CloudNativePG's
+barman-cloud plugin does the reading, the archiving and the writing. The control
+plane holds no bucket credential and has no S3 client — which is a smaller blast
+radius than the sidecar era managed with 250 lines of its own request signing.
+
+A backup is a Kubernetes object, so `GET` answers for a **hibernated** database
+too. That is exactly when someone asks what they can restore, and exactly when
+there is no pod to ask; the previous implementation listed the bucket and could
+not answer it at all.
+
+**Requires the barman-cloud plugin, which requires cert-manager.**
+`scripts/cnpg-install.sh` installs both, pinned. Turning backups on therefore
+costs an installation two cluster-scoped components it may not have wanted —
+stated here rather than discovered.
+
+The plugin, not `spec.backup.barmanObjectStore`. That works on the pinned
+CloudNativePG 1.27 and is **removed in 1.28**, a deprecation nothing in the CRD
+schema mentions and only the admission webhook prints, on apply.
 
 ## Nothing inside a database
 

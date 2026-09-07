@@ -59,3 +59,11 @@ the chart made from an explicit value. Never one the chart invented.
 Issuer
 {{- end -}}
 {{- end -}}
+
+{{/*
+The ObjectStore every Cluster points at. Named after the release rather than
+after a database, because there is one of them.
+*/}}
+{{- define "drigodb.objectStoreName" -}}
+{{- printf "%s-backups" (include "drigodb.fullname" .) -}}
+{{- end -}}

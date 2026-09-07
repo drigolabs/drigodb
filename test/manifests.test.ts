@@ -256,3 +256,60 @@ describe("server certificates", () => {
     expect(spec.dnsNames).toContain(m.endpointHost(ID));
   });
 });
+
+describe("backups", () => {
+  afterEach(() => { vi.unstubAllEnvs(); vi.resetModules(); });
+
+  async function withBackups() {
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_BACKUP_OBJECT_STORE", "drigodb-api-backups");
+    return await import("../src/k8s/manifests.js");
+  }
+
+  it("adds no plugin when the installation has nowhere to put a backup", async () => {
+    vi.resetModules();
+    const m = await import("../src/k8s/manifests.js");
+    expect(m.buildCluster(ID, EXT).spec).not.toHaveProperty("plugins");
+  });
+
+  it("points the database at the installation's one ObjectStore", async () => {
+    // One store for every database. CloudNativePG separates them inside the
+    // bucket by serverName, which defaults to the Cluster name — and those are
+    // derived from external_id, so they are distinct without drigodb passing
+    // anything to make them so.
+    const m = await withBackups();
+    const p = m.buildCluster(ID, EXT).spec.plugins?.[0];
+    expect(p?.name).toBe("barman-cloud.cloudnative-pg.io");
+    expect(p?.parameters.barmanObjectName).toBe("drigodb-api-backups");
+  });
+
+  it("archives WAL, which is what makes a backup more than a snapshot", async () => {
+    // Without isWALArchiver the plugin takes base backups and archives nothing,
+    // so a restore can only reach the moment the backup was taken. Point-in-time
+    // recovery is the archive, not the backup.
+    const m = await withBackups();
+    expect(m.buildCluster(ID, EXT).spec.plugins?.[0]?.isWALArchiver).toBe(true);
+  });
+
+  it("asks the operator for a backup rather than reaching for the bucket", async () => {
+    const m = await withBackups();
+    const b = m.buildBackup(ID, EXT, new Date("2026-09-07T07:18:16Z")) as {
+      metadata: { name: string; labels: Record<string, string> };
+      spec: { cluster: { name: string }; method: string; pluginConfiguration: { name: string } };
+    };
+    expect(b.spec.cluster.name).toBe(`db-${ID}`);
+    expect(b.spec.method).toBe("plugin");
+    expect(b.spec.pluginConfiguration.name).toBe("barman-cloud.cloudnative-pg.io");
+    // Labelled with the database id, because listing is a label selector and a
+    // backup that carries no id belongs to no database anyone can find.
+    expect(b.metadata.labels["drigodb.io/database-id"]).toBe(ID);
+  });
+
+  it("names a backup so that a plain listing sorts into the order it happened", async () => {
+    const m = await withBackups();
+    const early = (m.buildBackup(ID, EXT, new Date("2026-01-02T03:04:05Z")) as { metadata: { name: string } }).metadata.name;
+    const late = (m.buildBackup(ID, EXT, new Date("2026-11-12T13:14:15Z")) as { metadata: { name: string } }).metadata.name;
+    expect([late, early].sort()).toEqual([early, late]);
+    expect(early).toMatch(/^bk-[0-9a-f]{12}-\d{14}$/);
+  });
+});

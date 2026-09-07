@@ -19,12 +19,13 @@ import {
 import type { V1Job, V1StatefulSet } from "@kubernetes/client-node";
 import type { Tier } from "./manifests.js";
 
-import { config, serverAuthEnabled } from "../config.js";
+import { backupsEnabled, config, serverAuthEnabled } from "../config.js";
 import {
   TIERS,
   TIER_LABEL,
   TIER_ORDER,
   DB_ID_LABEL,
+  BACKUPS_PLURAL,
   CLUSTERS_PLURAL,
   DB_USER,
   CNPG_GROUP,
@@ -37,6 +38,7 @@ import {
   POSTGRES_PORT,
   buildNetworkPolicy,
   buildCertificate,
+  buildBackup,
   buildCluster,
   buildSecret,
   buildService,
@@ -71,7 +73,10 @@ export type Database = {
   // #95. Until that lands a hosted database has no backup at all, and a
   // consumer polling this endpoint should be told rather than left to infer it
   // from an endpoint that no longer exists.
-  backups: "unavailable";
+  // "unavailable" when this installation has nowhere to put a backup, which is
+  // an honest answer rather than an empty list — a consumer that sees no
+  // backups should be able to tell "none taken yet" from "none possible".
+  backups: "unavailable" | "enabled";
   tier: Tier;
   endpoint: string;
   port: number;
@@ -198,6 +203,36 @@ function isNotFound(err: unknown): boolean {
   return code === 404;
 }
 
+// What a caller can restore from. Read from Backup objects rather than from the
+// bucket, so drigodb answers this without a credential for object storage and
+// without the bucket having to be reachable from the control plane at all.
+//
+// Answers for a hibernated database too, which is the point: that is exactly
+// when someone asks what they can restore, and exactly when there is no pod to
+// ask. The old implementation listed the bucket and could not answer it.
+export interface DatabaseBackup {
+  id: string;
+  status: string;
+  started_at?: string;
+  // Barman's own identifier, once the backup has completed. Reported because it
+  // is what appears in the bucket and in barman's own tooling, and someone
+  // debugging will be looking at both.
+  backup_id?: string;
+  completed_at?: string;
+  error?: string;
+}
+
+interface CnpgBackup {
+  metadata?: { name?: string; creationTimestamp?: string };
+  status?: {
+    phase?: string;
+    backupId?: string;
+    startedAt?: string;
+    stoppedAt?: string;
+    error?: string;
+  };
+}
+
 export class Provisioner {
   constructor(
     private readonly apps: AppsV1Api,
@@ -307,7 +342,7 @@ export class Provisioner {
       id,
       external_id: labels[EXTERNAL_ID_LABEL] ?? "",
       status: await this.statusOf(id, labels, cluster),
-      backups: "unavailable",
+      backups: backupsEnabled() ? "enabled" : "unavailable",
       tier: tierOf(labels),
       endpoint: endpointHost(id),
       port: POSTGRES_PORT,
@@ -822,6 +857,50 @@ export class Provisioner {
     }
   }
 
+  // Take one now.
+  //
+  // 202, not 200: the operator does the work and reports it in the object's
+  // status. This returns as soon as the request exists, which is the only thing
+  // drigodb can honestly say has happened.
+  async createBackup(id: string): Promise<DatabaseBackup> {
+    const cluster = await this.clusterFor(id);
+    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
+    if (!backupsEnabled()) {
+      throw new NotConfiguredError(
+        "backups are not configured for this installation; set backup.bucket and backup.endpoint",
+      );
+    }
+    const externalId = cluster.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "";
+    const created = (await this.objects.createNamespacedCustomObject({
+      group: CNPG_GROUP,
+      version: "v1",
+      namespace: config.databaseNamespace,
+      plural: BACKUPS_PLURAL,
+      body: buildBackup(id, externalId),
+    })) as CnpgBackup;
+    return toBackup(created);
+  }
+
+  async listBackups(id: string): Promise<DatabaseBackup[]> {
+    // 404 before the disabled check: a database that does not exist is not a
+    // database whose backups are turned off.
+    const cluster = await this.clusterFor(id);
+    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
+    if (!backupsEnabled()) {
+      throw new NotConfiguredError("backups are not configured for this installation");
+    }
+    const list = (await this.objects.listNamespacedCustomObject({
+      group: CNPG_GROUP,
+      version: "v1",
+      namespace: config.databaseNamespace,
+      plural: BACKUPS_PLURAL,
+      labelSelector: `${DB_ID_LABEL}=${id}`,
+    })) as { items?: CnpgBackup[] };
+    return (list.items ?? [])
+      .map(toBackup)
+      .sort((a, b) => (a.started_at ?? "").localeCompare(b.started_at ?? ""));
+  }
+
   async delete(id: string): Promise<void> {
     const ns = config.databaseNamespace;
     const cluster = await this.clusterFor(id);
@@ -844,6 +923,37 @@ export class Provisioner {
         name: clusterName(id),
       }),
     );
+
+    // The Backup objects too. They name a Cluster, so leaving them behind
+    // leaves a listing of backups belonging to a database that no longer
+    // exists — and ids are derived from external_id, so the next database to
+    // take this id would inherit them.
+    //
+    // This removes the RECORDS, not the data in the bucket. Barman's retention
+    // policy owns that, which is the right split: drigodb should not be able to
+    // delete a customer's backups by deleting a Kubernetes object.
+    if (backupsEnabled()) {
+      const backups = (await this.objects.listNamespacedCustomObject({
+        group: CNPG_GROUP,
+        version: "v1",
+        namespace: ns,
+        plural: BACKUPS_PLURAL,
+        labelSelector: `${DB_ID_LABEL}=${id}`,
+      })) as { items?: Array<{ metadata?: { name?: string } }> };
+      for (const b of backups.items ?? []) {
+        const name = b.metadata?.name;
+        if (!name) continue;
+        await ignoreMissing(() =>
+          this.objects.deleteNamespacedCustomObject({
+            group: CNPG_GROUP,
+            version: "v1",
+            namespace: ns,
+            plural: BACKUPS_PLURAL,
+            name,
+          }),
+        );
+      }
+    }
     await ignoreMissing(() =>
       this.core.deleteNamespacedService({
         name: serviceName(id),
@@ -915,4 +1025,24 @@ export class Provisioner {
     if (!raw) throw new NotFoundError("the CA secret holds no certificate yet");
     return Buffer.from(raw, "base64").toString("utf8");
   }
+}
+
+// The operator's status, narrowed to what a consumer asked for.
+//
+// The id is the OBJECT NAME, not barman's `backupId`. Barman's is only set once
+// the backup completes, so a POST returned one identifier and the listing
+// returned another for the same backup — a caller storing what POST gave it
+// would never find it again. Measured, on a cluster, immediately.
+//
+// The object name is also what a restore names, so the id a caller is handed is
+// the id the restore path accepts.
+function toBackup(b: CnpgBackup): DatabaseBackup {
+  return {
+    id: b.metadata?.name ?? "",
+    status: b.status?.phase ?? "pending",
+    started_at: b.status?.startedAt,
+    completed_at: b.status?.stoppedAt,
+    ...(b.status?.backupId ? { backup_id: b.status.backupId } : {}),
+    ...(b.status?.error ? { error: b.status.error } : {}),
+  };
 }

@@ -84,6 +84,22 @@ export function buildRoutes(provisioner: Provisioner): Hono {
   );
 
 
+  // Take a backup now. 202, because the operator does the work — this returns
+  // once the request exists, which is the only thing that has actually happened.
+  app.post("/v1/databases/:id/backups", async (c) =>
+    c.json(await provisioner.createBackup(c.req.param("id")), 202),
+  );
+
+  // What can be restored. Never a credential, and an empty list for a database
+  // that has never been backed up — an answer rather than an error.
+  //
+  // Answers for a hibernated database too, which is the point: that is when the
+  // question gets asked, and when there is no pod to ask. drigodb reads the
+  // operator's Backup objects, so it needs neither the pod nor the bucket.
+  app.get("/v1/databases/:id/backups", async (c) =>
+    c.json({ backups: await provisioner.listBackups(c.req.param("id")) }),
+  );
+
   app.delete("/v1/databases/:id", async (c) => {
     await provisioner.delete(c.req.param("id"));
     return c.body(null, 204);

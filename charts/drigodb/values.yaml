@@ -117,12 +117,32 @@ tls:
     duration: 2160h    # 90 days
     renewBefore: 360h  # 15 days
 
-# Backups are not available in this release.
+# Backups, through CloudNativePG's barman-cloud plugin.
 #
-# They were a sidecar in the database's pod template, and decision 0004 gave
-# that template to CloudNativePG. The operator has its own backup machinery and
-# adopting it is issue #95; until then a hosted database has no backup, and
-# GET /v1/databases/{id} says so rather than leaving anyone to infer it.
+# Off unless a bucket and an endpoint are set — an installation with neither
+# gets no ObjectStore and no plugin reference on any Cluster, which is exactly
+# what it had before.
+#
+# One ObjectStore serves the whole installation rather than one per database.
+# Databases are separated inside the bucket by CloudNativePG's serverName, which
+# defaults to the Cluster's name — and drigodb's names are derived from
+# external_id, so they are already distinct.
+#
+# REQUIRES the barman-cloud plugin on the cluster, which requires cert-manager.
+# scripts/cnpg-install.sh installs both; issue #97 makes that declarative.
+backup:
+  # s3://bucket/ — the path backups and WAL are written under.
+  bucket: ""
+  # For S3 itself this can be empty. For anything S3-compatible — DigitalOcean
+  # Spaces, MinIO — it is the endpoint, and without it the plugin talks to AWS.
+  endpoint: ""
+  region: ""
+  # Holds access_key and secret_key, in the database namespace. drigodb never
+  # reads it: it names the Secret and the operator does the reading, which is
+  # why the control plane holds no object-storage credential at all.
+  credentialsSecret: drigodb-backup-credentials
+  # How long backups and WAL are kept. `XXu` where u is d, w or m.
+  retention: 30d
 
 nameOverride: ""
 fullnameOverride: ""

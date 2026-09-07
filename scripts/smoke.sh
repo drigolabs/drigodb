@@ -127,12 +127,17 @@ if k get crd clusters.postgresql.cnpg.io >/dev/null 2>&1; then
   # missing permission that was actually present — a false alarm in a preflight
   # is worse than no preflight, because the next person disables it.
   SA="system:serviceaccount:drigodb-system:$(k -n drigodb-system get deploy drigodb-api -o jsonpath='{.spec.template.spec.serviceAccountName}')"
-  if [ "$(k auth can-i create clusters.postgresql.cnpg.io --as "$SA" -n drigodb-databases 2>/dev/null)" = "yes" ]; then
-    ok "the API may create a Cluster in drigodb-databases"
-  else
-    fail "the API service account cannot create Clusters — provisioning will fail"
-    exit 1
-  fi
+  # Both resources, not just Clusters. The Role granted clusters and not backups,
+  # and a preflight that checked only the first reported everything fine while
+  # every backup request returned 500.
+  for res in clusters backups; do
+    if [ "$(k auth can-i "create" "${res}.postgresql.cnpg.io" --as "$SA" -n drigodb-databases 2>/dev/null)" = "yes" ]; then
+      ok "the API may create a ${res%s} in drigodb-databases"
+    else
+      fail "the API service account cannot create ${res} — that path will fail at runtime"
+      exit 1
+    fi
+  done
 else
   fail "clusters.postgresql.cnpg.io is missing; run scripts/cnpg-install.sh"
   exit 1

@@ -20,7 +20,7 @@ import type {
   V1StatefulSet,
 } from "@kubernetes/client-node";
 
-import { config, serverAuthEnabled } from "../config.js";
+import { backupsEnabled, config, serverAuthEnabled } from "../config.js";
 
 export const DB_ID_LABEL = "drigodb.io/database-id";
 export const EXTERNAL_ID_LABEL = "drigodb.io/external-id";
@@ -60,6 +60,7 @@ export const HIBERNATED_LABEL = "drigodb.io/hibernated";
 // reports itself able to work.
 export const CNPG_GROUP = "postgresql.cnpg.io";
 export const CLUSTERS_PLURAL = "clusters";
+export const BACKUPS_PLURAL = "backups";
 
 // How CloudNativePG is told to put a database down. An annotation rather than a
 // replica count, and drigodb keeps its own HIBERNATED_LABEL beside it: this one
@@ -74,6 +75,13 @@ export const CNPG_HIBERNATION_ANNOTATION = "cnpg.io/hibernation";
 // the Secret alone does not, because CloudNativePG reports the role already
 // `reconciled` and does not look again until something touches the Cluster.
 export const CREDENTIAL_VERSION_ANNOTATION = "drigodb.io/credential-version";
+
+// The backup plugin, and the field a Cluster references it through.
+//
+// isWALArchiver matters: without it the plugin takes base backups and archives
+// no WAL, which is a backup you can restore to the moment it was taken and no
+// further. Point-in-time recovery (#19) is the archive, not the backup.
+export const BARMAN_PLUGIN = "barman-cloud.cloudnative-pg.io";
 
 export const CNPG_NAMESPACE = "cnpg-system";
 export const CNPG_STATUS_PORT = 8000;
@@ -196,6 +204,13 @@ export function secretName(id: string): string {
 // The Cluster carries the name a StatefulSet used to, so nothing that derives a
 // hostname, a Secret name or an id from it has to change — and idempotent create
 // keeps working the same way, because the name is still the lock.
+export function backupName(id: string, at: Date): string {
+  // The timestamp is in the name because a database has many backups and a
+  // Kubernetes name must be unique. Sortable, so a plain listing comes back in
+  // the order anyone wants to read it.
+  return `bk-${id}-${at.toISOString().replace(/[-:T.]/g, "").slice(0, 14)}`;
+}
+
 export function clusterName(id: string): string {
   return `db-${id}`;
 }
@@ -322,6 +337,7 @@ export interface CnpgClusterSpec {
   storage: { size: string; storageClass?: string };
   postgresql: { parameters: Record<string, string>; pg_hba: string[] };
   certificates?: { serverCASecret: string; serverTLSSecret: string };
+  plugins?: Array<{ name: string; isWALArchiver: boolean; parameters: Record<string, string> }>;
   resources: object;
   bootstrap: {
     initdb: { database: string; owner: string; secret: { name: string } };
@@ -384,6 +400,23 @@ export function buildCluster(
         // on the second.
         ...(config.storageClass ? { storageClass: config.storageClass } : {}),
       },
+
+      // Where this database's backups go, when the installation has somewhere to
+      // put them. One ObjectStore serves every database; CloudNativePG separates
+      // them inside the bucket by serverName, which defaults to the Cluster
+      // name — and those are derived from external_id, so they are already
+      // distinct without drigodb passing anything.
+      ...(backupsEnabled()
+        ? {
+            plugins: [
+              {
+                name: BARMAN_PLUGIN,
+                isWALArchiver: true,
+                parameters: { barmanObjectName: config.backup.objectStore },
+              },
+            ],
+          }
+        : {}),
 
       // The server identity a consumer verifies, when this installation issues
       // one. Measured against CNPG 1.27, including the two negatives:
@@ -477,6 +510,29 @@ export function buildCluster(
           },
         ],
       },
+    },
+  };
+}
+
+// Ask CloudNativePG to take a backup now.
+//
+// A Kubernetes object rather than a call to object storage: drigodb declares
+// that a backup should exist and the operator does the work, reports progress
+// in the object's status, and drigodb reads it back. That is why the control
+// plane holds no bucket credential.
+export function buildBackup(id: string, externalId: string, at = new Date()): object {
+  return {
+    apiVersion: `${CNPG_GROUP}/v1`,
+    kind: "Backup",
+    metadata: {
+      name: backupName(id, at),
+      namespace: config.databaseNamespace,
+      labels: labelsFor(id, externalId),
+    },
+    spec: {
+      cluster: { name: clusterName(id) },
+      method: "plugin",
+      pluginConfiguration: { name: BARMAN_PLUGIN },
     },
   };
 }
