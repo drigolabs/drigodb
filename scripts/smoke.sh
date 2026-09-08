@@ -25,6 +25,27 @@ note() { printf "  ${YELLOW}…${RESET} %s\n" "$1"; }
 
 k() { kubectl --context "$CTX" "$@"; }
 
+# Why a database is not coming up.
+#
+# CloudNativePG bootstraps a restore in a Job, and when that Job fails the pod
+# holds the only account of it — PostgreSQL's own words, usually one FATAL line.
+# Nothing else has it: the Cluster reports a phase, the operator reports that it
+# created a Job, and `describe pod` reports `Error`. A restore that fails in CI
+# without this is a fifteen-minute round trip to learn a string the cluster
+# already had.
+explain_stuck_database() {
+  printf "  ${YELLOW}…${RESET} %s\n" "what ${1} was doing:"
+  k get cluster "db-${1}" -n drigodb-databases \
+    -o jsonpath='{range .status.conditions[*]}    {.type}={.status} {.reason} {.message}{"\n"}{end}' 2>/dev/null
+  # --tail so a long recovery does not bury the failure, and every pod of the
+  # Job because each retry is a new one and only the first has the real cause.
+  for pod in $(k get pods -n drigodb-databases \
+      -l "cnpg.io/cluster=db-${1}" -o name 2>/dev/null); do
+    printf "    ---- %s\n" "$pod"
+    k logs "$pod" -n drigodb-databases --all-containers --tail=40 2>&1 | sed 's/^/    /'
+  done
+}
+
 PIDS=()
 cleanup() {
   for p in "${PIDS[@]:-}"; do kill "$p" >/dev/null 2>&1 || true; done
@@ -442,7 +463,11 @@ else
     case "$R_STATE" in ready|failed) break ;; esac
     sleep 3
   done
-  [ "$R_STATE" = "ready" ] || { fail "restored database never became ready (${R_STATE})"; exit 1; }
+  if [ "$R_STATE" != "ready" ]; then
+    fail "restored database never became ready (${R_STATE})"
+    explain_stuck_database "$R_ID"
+    exit 1
+  fi
   ok "restored into ${R_ID}"
 
   # The assertion the whole feature turns on: the restore is the state AT the
@@ -513,7 +538,11 @@ else
     case "$P_STATE" in ready|failed) break ;; esac
     sleep 3
   done
-  [ "$P_STATE" = "ready" ] || { fail "point-in-time restore never became ready (${P_STATE})"; exit 1; }
+  if [ "$P_STATE" != "ready" ]; then
+    fail "point-in-time restore never became ready (${P_STATE})"
+    explain_stuck_database "$P_ID"
+    exit 1
+  fi
 
   SAVED_DB_ID="$DB_ID"; DB_ID="$P_ID"
   P_ROWS="$(psql_in_cluster "$P_URI" "SELECT string_agg(note, ',' ORDER BY id) FROM bk")"
