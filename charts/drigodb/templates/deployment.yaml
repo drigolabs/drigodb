@@ -60,6 +60,13 @@ spec:
               value: {{ .Values.tls.certManager.duration | quote }}
             - name: DRIGODB_TLS_RENEW_BEFORE
               value: {{ .Values.tls.certManager.renewBefore | quote }}
+            {{- if and .Values.backup.bucket .Values.backup.endpoint }}
+            # The name of the ObjectStore, and nothing else. No bucket, no
+            # endpoint, no credential — the operator reads those, and the
+            # control plane never talks to object storage.
+            - name: DRIGODB_BACKUP_OBJECT_STORE
+              value: {{ include "drigodb.objectStoreName" . | quote }}
+            {{- end }}
             - name: DRIGODB_TLS_CA_SECRET
               value: {{ include "drigodb.caSecret" . | quote }}
           # /readyz, not /healthz. Readiness asks whether drigodb can do its job

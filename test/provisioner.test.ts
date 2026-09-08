@@ -17,6 +17,7 @@ import {
   NotFoundError,
   Provisioner,
   ValidationError,
+  validateRestoreFrom,
   validateTier,
 } from "../src/k8s/provisioner.js";
 
@@ -208,5 +209,43 @@ describe("concurrent create", () => {
     // owner, which is what a genuine hash collision would look like from here.
     objects.get(`db-${database.id}`)!.labels["drigodb.io/external-id"] = "someone-else";
     await expect(provisioner.create("app-one")).rejects.toThrow(ValidationError);
+  });
+});
+
+describe("restore_from validation", () => {
+  it("is absent when not asked for", () => {
+    expect(validateRestoreFrom(undefined)).toBeUndefined();
+    expect(validateRestoreFrom(null)).toBeUndefined();
+  });
+
+  it("accepts a database id, with or without a backup", () => {
+    expect(validateRestoreFrom({ database_id: "a1b2c3d4e5f6" })).toEqual({
+      databaseId: "a1b2c3d4e5f6",
+    });
+    expect(
+      validateRestoreFrom({ database_id: "a1b2c3d4e5f6", backup_id: "bk-a1b2c3d4e5f6-20260907" }),
+    ).toEqual({ databaseId: "a1b2c3d4e5f6", backupId: "bk-a1b2c3d4e5f6-20260907" });
+  });
+
+  it("refuses anything that is not a database id", () => {
+    // Both fields end up in a Kubernetes object name. The old shape took a
+    // bucket key and had to be checked for `..` to stop one caller reading
+    // another's prefix; there is no path here now, only ids this service issued.
+    for (const bad of ["", "nope", "../../etc", "A1B2C3D4E5F6", "a1b2c3d4e5f", 12]) {
+      expect(() => validateRestoreFrom({ database_id: bad })).toThrow(ValidationError);
+    }
+  });
+
+  it("refuses a backup id that is not a name", () => {
+    for (const bad of ["../secret", "Bk-Upper", "with spaces", ""]) {
+      expect(() =>
+        validateRestoreFrom({ database_id: "a1b2c3d4e5f6", backup_id: bad }),
+      ).toThrow(ValidationError);
+    }
+  });
+
+  it("refuses a malformed body", () => {
+    expect(() => validateRestoreFrom("a1b2c3d4e5f6")).toThrow(ValidationError);
+    expect(() => validateRestoreFrom({})).toThrow(ValidationError);
   });
 });

@@ -56,6 +56,16 @@ export const config = {
   // without it — bootstrap.sh self-signs and the URI says sslmode=require.
   // What this adds is the client being able to tell it is talking to the
   // database it asked for.
+  // Backups, through CloudNativePG's barman-cloud plugin.
+  //
+  // drigodb names an ObjectStore and the operator does the rest. There is no
+  // bucket credential here and no S3 client: the control plane cannot reach
+  // object storage and does not need to, which is a smaller blast radius than
+  // the sidecar era managed with its own signing code.
+  backup: {
+    objectStore: envOr("DRIGODB_BACKUP_OBJECT_STORE", ""),
+  },
+
   tls: {
     issuer: envOr("DRIGODB_TLS_ISSUER", ""),
     issuerKind: envOr("DRIGODB_TLS_ISSUER_KIND", "Issuer"),
@@ -86,4 +96,10 @@ export function serverAuthEnabled(): boolean {
 // Read lazily so tests and `--help`-style invocations do not need a token.
 export function apiToken(): string {
   return required("DRIGODB_API_TOKEN");
+}
+
+// Backups exist for this installation when the chart rendered an ObjectStore
+// and told the API its name. Nothing else is required of the control plane.
+export function backupsEnabled(): boolean {
+  return config.backup.objectStore !== "";
 }

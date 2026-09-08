@@ -17,9 +17,11 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLUSTER="${DRIGODB_KIND_CLUSTER:-drigodb}"
 LOCAL=0
+BACKUPS=0
 for a in "$@"; do
   case "$a" in
     --local) LOCAL=1 ;;
+    --with-backups) BACKUPS=1 ;;
     *) echo "unknown option: $a" >&2; exit 64 ;;
   esac
 done
@@ -60,8 +62,68 @@ if [ "$LOCAL" = 1 ]; then
   DEPLOY_ENV+=(DRIGODB_API_IMAGE="drigolabs/drigodb-api:dev" DRIGODB_IMAGE_PULL_POLICY=Never)
 fi
 
+if [ "$BACKUPS" = 1 ]; then
+  # Only the values here. The storage itself is stood up AFTER the chart,
+  # because the chart owns the drigodb-databases namespace and Helm refuses to
+  # adopt a namespace something else created — "invalid ownership metadata",
+  # which reads like a chart bug and is not one.
+  DEPLOY_ENV+=(DRIGODB_BACKUP_BUCKET=drigodb DRIGODB_BACKUP_ENDPOINT="http://minio.drigodb-databases:9000")
+fi
+
 step "Deploying, with the same script DOKS uses"
 KUBE_CONTEXT="$CTX" env ${DEPLOY_ENV[@]+"${DEPLOY_ENV[@]}"} bash "${ROOT}/scripts/deploy.sh"
+
+if [ "$BACKUPS" = 1 ]; then
+  step "MinIO, standing in for object storage"
+  # Backups need somewhere S3-shaped to go, and CloudNativePG's plugin does the
+  # talking — drigodb only names the Secret and never reaches object storage
+  # itself. MinIO is S3-compatible and free, which is the whole requirement.
+  #
+  # After the chart, because the chart owns the drigodb-databases namespace and
+  # Helm refuses to adopt one something else created: "invalid ownership
+  # metadata", which reads like a chart bug and is not one.
+  kubectl --context "$CTX" apply -n drigodb-databases -f - >/dev/null <<'YAML'
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: minio, labels: { app: minio } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: minio } }
+  template:
+    metadata: { labels: { app: minio } }
+    spec:
+      containers:
+        - name: minio
+          image: minio/minio
+          args: ["server", "/data"]
+          env:
+            - { name: MINIO_ROOT_USER, value: drigodb }
+            - { name: MINIO_ROOT_PASSWORD, value: drigodb-local-only }
+          ports: [{ containerPort: 9000 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: minio }
+spec:
+  selector: { app: minio }
+  ports: [{ port: 9000, targetPort: 9000 }]
+YAML
+  kubectl --context "$CTX" -n drigodb-databases rollout status deployment/minio --timeout=180s >/dev/null
+
+  # The bucket has to exist; barman does not create it.
+  kubectl --context "$CTX" -n drigodb-databases delete pod drigodb-mkbucket --ignore-not-found >/dev/null 2>&1
+  kubectl --context "$CTX" -n drigodb-databases run drigodb-mkbucket --restart=Never --quiet --image=minio/mc \
+    --command -- sh -c "mc alias set m http://minio:9000 drigodb drigodb-local-only && mc mb -p m/drigodb" >/dev/null
+  kubectl --context "$CTX" -n drigodb-databases wait --for=jsonpath='{.status.phase}'=Succeeded \
+    pod/drigodb-mkbucket --timeout=180s >/dev/null 2>&1
+  kubectl --context "$CTX" -n drigodb-databases delete pod drigodb-mkbucket --wait=false >/dev/null 2>&1
+
+  # Read by the operator, never by drigodb.
+  kubectl --context "$CTX" -n drigodb-databases create secret generic drigodb-backup-credentials \
+    --from-literal=access_key=drigodb --from-literal=secret_key=drigodb-local-only \
+    --dry-run=client -o yaml | kubectl --context "$CTX" apply -f - >/dev/null
+  ok "minio.drigodb-databases:9000, bucket drigodb"
+fi
 
 echo
 printf "${GREEN}${BOLD}drigodb is running on kind.${RESET}  context: ${BOLD}${CTX}${RESET}\n"

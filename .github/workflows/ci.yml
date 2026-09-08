@@ -82,10 +82,16 @@ jobs:
 
       # The same script a laptop runs, deliberately. A second path for CI would
       # drift from the first, which this repository has already been bitten by.
+      #
+      # --with-backups, so the configuration under test is the one with the most
+      # moving parts: cert-manager, the barman-cloud plugin and MinIO on top of
+      # the operator. Backups shipped once with none of this exercised, on a
+      # branch whose whole argument is that only a real cluster finds these bugs
+      # — and it found four in that pull request alone.
       - name: Bring up drigodb on kind
         run: |
           start=$SECONDS
-          DRIGODB_KIND_CLUSTER=ci bash scripts/kind-up.sh --local
+          DRIGODB_KIND_CLUSTER=ci bash scripts/kind-up.sh --local --with-backups
           echo "KIND_UP_SECONDS=$((SECONDS - start))" >> "$GITHUB_ENV"
 
       - name: End to end

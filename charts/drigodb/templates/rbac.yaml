@@ -60,6 +60,16 @@ rules:
   - apiGroups: ["postgresql.cnpg.io"]
     resources: ["clusters"]
     verbs: ["create", "get", "list", "watch", "patch", "delete"]
+  # A backup is an object drigodb asks for and then reads the status of. delete,
+  # because a deleted database's Backup objects would otherwise outlive it,
+  # pointing at a Cluster that no longer exists.
+  #
+  # No rights over objectstores: the chart creates the one, and drigodb only
+  # ever names it. The control plane cannot read the bucket credential and has
+  # no reason to.
+  - apiGroups: ["postgresql.cnpg.io"]
+    resources: ["backups"]
+    verbs: ["create", "get", "list", "delete"]
 {{- if .Values.tls.certManager.enabled }}
   # One Certificate per database, in this namespace, so each serves a certificate
   # for its own Service name and its Secret lands where the pod mounts it.

@@ -1,0 +1,47 @@
+{{/*
+Where every hosted database's backups go.
+
+ONE for the installation, not one per database. CloudNativePG separates
+databases inside the bucket by `serverName`, which defaults to the Cluster's
+name — and drigodb derives those names from external_id, so they are already
+distinct without anything here knowing about them.
+
+Rendered only when a bucket and an endpoint are both set. Half a configuration
+is worse than none: a Cluster referencing an ObjectStore that cannot reach
+storage archives WAL into a failure loop, and PostgreSQL with a stalled archiver
+eventually stops being able to recycle WAL at all.
+
+This is the plugin's CRD, not the operator's. `spec.backup.barmanObjectStore`
+does the same job on CloudNativePG 1.27 and is REMOVED in 1.28 — a deprecation
+nothing in the CRD schema mentions and only the admission webhook prints.
+*/}}
+{{- if and .Values.backup.bucket .Values.backup.endpoint }}
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: {{ include "drigodb.objectStoreName" . }}
+  namespace: {{ .Values.databaseNamespace }}
+  labels:
+    {{- include "drigodb.labels" . | nindent 4 }}
+spec:
+  retentionPolicy: {{ .Values.backup.retention | quote }}
+  configuration:
+    destinationPath: s3://{{ .Values.backup.bucket }}/
+    {{- if .Values.backup.endpoint }}
+    endpointURL: {{ .Values.backup.endpoint | quote }}
+    {{- end }}
+    s3Credentials:
+      accessKeyId:
+        name: {{ .Values.backup.credentialsSecret }}
+        key: access_key
+      secretAccessKey:
+        name: {{ .Values.backup.credentialsSecret }}
+        key: secret_key
+      {{- if .Values.backup.region }}
+      region:
+        name: {{ .Values.backup.credentialsSecret }}
+        key: region
+      {{- end }}
+    wal:
+      compression: gzip
+{{- end }}
