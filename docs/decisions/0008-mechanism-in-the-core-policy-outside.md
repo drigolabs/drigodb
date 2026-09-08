@@ -74,6 +74,28 @@ Naming it makes four earlier records one record.
 Each was argued on its own terms and reached the same place. That is usually a
 sign the principle was already operating and had not been written down.
 
+## Which record is which
+
+Every record in this folder belongs to one of three groups, and the test for
+which is a single question: **does it say what drigodb can do to a database, or
+when to do it?**
+
+| Group | Records |
+|---|---|
+| **Core** — a mechanism, or a constraint on one | [leaving DocumentDB](../leaving-documentdb.md), [0001](0001-instance-per-database-over-a-shared-cluster.md), [0004](0004-cloudnativepg-for-the-data-plane.md), [0005](0005-an-http-api-not-a-crd.md), [0006](0006-nothing-inside-a-hosted-database.md) |
+| **Policy** — deciding when a mechanism runs | [0007](0007-a-proxy-in-the-connection-path.md) |
+| **Neither** — how drigodb itself is operated | [0002](0002-gitops-for-the-control-plane.md), [0003](0003-argo-cd.md) |
+
+The third group is not a hedge. GitOps and Argo CD are policy about drigodb's
+own deployment, which is a different subject from policy about a tenant's
+database; filing them under the same word would make the word useless.
+
+That the policy column holds one record, still `proposed`, is the state this
+decision describes rather than a gap in it.
+
+[The index](README.md) carries the same grouping with each record's decision
+spelled out, and is the copy to update when a record is added.
+
 ## What it means in practice
 
 **The core keeps growing mechanisms.** Point-in-time recovery

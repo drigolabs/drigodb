@@ -1,8 +1,33 @@
 # Working on drigodb
 
 drigodb provisions PostgreSQL databases through an API on Kubernetes. One
-StatefulSet per database (`docs/decisions/0001`), installed with the Helm chart
-in `charts/drigodb`, reconciled by Argo CD (`docs/decisions/0002`, `0003`).
+CloudNativePG `Cluster` per database (`docs/decisions/0001`, `0004`), installed
+with the Helm chart in `charts/drigodb`, reconciled by Argo CD
+(`docs/decisions/0002`, `0003`).
+
+## Where things go
+
+drigodb's core provides **mechanisms** — create, hibernate, wake, resize,
+rotate, back up, restore. It holds no **policy**: it does not decide *when* any
+of them should run. `docs/decisions/0008` is the record, and
+`docs/decisions/README.md` groups every other record by which side it is on.
+
+The test for a change is one question: **does it say what drigodb can do to a
+database, or when to do it?**
+
+- *What* — it belongs in `src/`, behind an endpoint a caller can drive.
+- *When* — it does not belong in this repository. A component deciding when to
+  hibernate a database calls `POST /v1/databases/{id}/hibernate` like any other
+  consumer, and ships as its own deployable.
+
+There is no `core/` directory because every line of `src/` is core, and no
+`services/` directory because nothing lives there yet. When the first policy
+component exists, it gets its own home; an empty folder reserving the future is
+what `docs/decisions/0006` deleted.
+
+The obligation this creates: a mechanism has to be complete enough to be driven
+from outside. An endpoint an external scheduler cannot actually run a fleet on
+is an unfinished mechanism, not a reason to move the decision inwards.
 
 ## Commands
 
@@ -13,7 +38,6 @@ bash scripts/kind-up.sh           a real cluster on a laptop, via scripts/deploy
 bash scripts/kind-down.sh         tear it down — do this, kind clusters are not free RAM
 bash scripts/smoke.sh             end-to-end against a running installation
 bash scripts/chart-determinism-test.sh    renders the chart twice, asserts identical
-bash scripts/migrations-test.sh <pg-image>   the real bootstrap.sh, in a container
 ```
 
 ## Pull requests
@@ -64,11 +88,12 @@ matched nothing once left `create()` ignoring the configured default tier.
 
 ## Do not change silently
 
-- The CI check named `data-plane images work` — branch protection on `main`
-  requires it by that exact string, and renaming it blocks every PR on a check
-  that never reports.
+- The CI job names `typecheck and test`, `drigodb works end to end` and
+  `api image builds` — branch protection on `main` requires them by those exact
+  strings, and renaming one blocks every PR on a check that never reports.
 - The chart must render identically every time: no `lookup`, no `randAlphaNum`,
   no clock. One `lookup` rotated every consumer's bearer token on every Argo sync
   while reporting Synced. `scripts/chart-determinism-test.sh` enforces it.
-- `persistentVolumeClaimRetentionPolicy` on the database StatefulSet. The
-  alternative deletes a customer's data.
+- `DELETE` removes a database's `Backup` records and never the bucket contents.
+  Barman's retention policy owns the data, which is the split that keeps drigodb
+  from destroying a customer's backups by deleting a Kubernetes object.
