@@ -48,7 +48,11 @@ rules:
     verbs: ["create", "get", "list", "delete"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
-    verbs: ["create", "get", "list", "delete"]
+    # update, so a wake can bring an existing database's policy up to what this
+    # build renders. Nothing else rewrites one, and a release that adds a rule —
+    # the metrics rule automatic hibernation reads through, for instance — would
+    # otherwise reach new databases only.
+    verbs: ["create", "get", "list", "update", "delete"]
   # A hosted database is a CloudNativePG Cluster (decision 0004), so these are
   # the verbs that provision, hibernate, wake and delete one. The operator does
   # the rest: it owns the pods, the volumes and the Services, and drigodb never

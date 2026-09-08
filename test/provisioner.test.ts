@@ -79,7 +79,13 @@ function racingCluster() {
     }),
     listNamespacedPersistentVolumeClaim: async () => ({ items: pvcs }),
   };
-  const net = { createNamespacedNetworkPolicy: async () => ({}) };
+  // wake() rewrites the policy, so an existing database gains rules a newer
+  // drigodb renders — the metrics rule automatic hibernation depends on being
+  // the first of them.
+  const net = {
+    createNamespacedNetworkPolicy: async () => ({}),
+    replaceNamespacedNetworkPolicy: async () => ({}),
+  };
   const batch = { readNamespacedJob: async () => { throw notFound(); } };
 
   return {

@@ -67,6 +67,17 @@ spec:
             - name: DRIGODB_BACKUP_OBJECT_STORE
               value: {{ include "drigodb.objectStoreName" . | quote }}
             {{- end }}
+            # Its own namespace, for the NetworkPolicy rule that lets it read a
+            # database's metrics port. From the downward API rather than a
+            # value, because a chart installed into a different namespace must
+            # not have to be told twice where it is.
+            - name: DRIGODB_NAMESPACE
+              valueFrom:
+                fieldRef: { fieldPath: metadata.namespace }
+            - name: DRIGODB_IDLE_AFTER_SECONDS
+              value: {{ .Values.idle.afterSeconds | quote }}
+            - name: DRIGODB_IDLE_CHECK_SECONDS
+              value: {{ .Values.idle.checkIntervalSeconds | quote }}
             - name: DRIGODB_TLS_CA_SECRET
               value: {{ include "drigodb.caSecret" . | quote }}
           # /readyz, not /healthz. Readiness asks whether drigodb can do its job

@@ -82,6 +82,10 @@ fi
 if [ -n "${DRIGODB_STORAGE_CLASS:-}" ]; then
   HELM_ARGS+=(--set "database.storageClass=${DRIGODB_STORAGE_CLASS}")
 fi
+if [ -n "${DRIGODB_IDLE_AFTER_SECONDS:-}" ]; then
+  HELM_ARGS+=(--set "idle.afterSeconds=${DRIGODB_IDLE_AFTER_SECONDS}")
+  HELM_ARGS+=(--set "idle.checkIntervalSeconds=${DRIGODB_IDLE_CHECK_SECONDS:-60}")
+fi
 if [ -n "${DRIGODB_BACKUP_BUCKET:-}" ]; then
   HELM_ARGS+=(--set "backup.bucket=${DRIGODB_BACKUP_BUCKET}" --set "backup.endpoint=${DRIGODB_BACKUP_ENDPOINT:-}")
 fi

@@ -76,6 +76,16 @@ export const CNPG_HIBERNATION_ANNOTATION = "cnpg.io/hibernation";
 // `reconciled` and does not look again until something touches the Cluster.
 export const CREDENTIAL_VERSION_ANNOTATION = "drigodb.io/credential-version";
 
+// When a database was last seen with no application connections, and who put it
+// to sleep.
+//
+// idle-since is a timestamp rather than a counter because the sweep is not the
+// clock: a control plane that restarts, or misses a tick, should not forget how
+// long a database has been quiet. Written on the Cluster, so the answer survives
+// anything happening to drigodb.
+export const IDLE_SINCE_ANNOTATION = "drigodb.io/idle-since";
+export const HIBERNATED_BY_ANNOTATION = "drigodb.io/hibernated-by";
+
 // The backup plugin, and the field a Cluster references it through.
 //
 // isWALArchiver matters: without it the plugin takes base backups and archives
@@ -89,6 +99,11 @@ export const RESTORE_SOURCE_NAME = "origin";
 
 export const CNPG_NAMESPACE = "cnpg-system";
 export const CNPG_STATUS_PORT = 8000;
+
+// Where the instance manager exports its metrics. Not PostgreSQL: drigodb reads
+// this to learn whether anybody is connected, which is the only way to answer
+// that without a database credential it has deliberately never had.
+export const CNPG_METRICS_PORT = 9187;
 
 // The key CNPG reads a username from when it is handed a credential Secret. It
 // wants a kubernetes.io/basic-auth Secret, so the password alone is not enough.
@@ -707,6 +722,28 @@ export function buildNetworkPolicy(
             },
           ],
           ports: [{ protocol: "TCP", port: CNPG_STATUS_PORT }],
+        },
+        {
+          // The control plane, on the metrics port only.
+          //
+          // This is the one place drigodb reaches a database at all, and it is
+          // worth being plain that it is a change: before automatic hibernation
+          // there was no path from the control plane to a hosted database in any
+          // direction. What it buys is the only answer to "is anybody using
+          // this" that does not require a database credential — connection
+          // counts live in pg_stat_activity, and drigodb still cannot log in to
+          // read them.
+          //
+          // 9187, never 5432. The port is the boundary: drigodb can see THAT
+          // there are connections and never what they are.
+          _from: [
+            {
+              namespaceSelector: {
+                matchLabels: { "kubernetes.io/metadata.name": config.controlPlaneNamespace },
+              },
+            },
+          ],
+          ports: [{ protocol: "TCP", port: CNPG_METRICS_PORT }],
         },
         {
           // Instance to instance, for replication. Not needed at one instance

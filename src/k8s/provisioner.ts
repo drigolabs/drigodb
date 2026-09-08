@@ -19,7 +19,8 @@ import {
 import type { V1Job, V1StatefulSet } from "@kubernetes/client-node";
 import type { Tier } from "./manifests.js";
 
-import { backupsEnabled, config, serverAuthEnabled } from "../config.js";
+import { autoHibernateEnabled, backupsEnabled, config, serverAuthEnabled } from "../config.js";
+import { appBackendsOf } from "./idle.js";
 import {
   TIERS,
   TIER_LABEL,
@@ -30,6 +31,9 @@ import {
   DB_USER,
   CNPG_GROUP,
   CNPG_HIBERNATION_ANNOTATION,
+  CNPG_METRICS_PORT,
+  HIBERNATED_BY_ANNOTATION,
+  IDLE_SINCE_ANNOTATION,
   CREDENTIAL_VERSION_ANNOTATION,
   EXTERNAL_ID_LABEL,
   HIBERNATED_LABEL,
@@ -78,6 +82,10 @@ export type Database = {
   // an honest answer rather than an empty list — a consumer that sees no
   // backups should be able to tell "none taken yet" from "none possible".
   backups: "unavailable" | "enabled";
+  // Who put this database to sleep, when it is asleep. "auto" means nothing
+  // asked — a consumer debugging a cold start otherwise has no way to tell an
+  // automatic hibernation from one somebody requested.
+  hibernated_by?: "auto" | "api";
   tier: Tier;
   endpoint: string;
   port: number;
@@ -370,6 +378,14 @@ export class Provisioner {
       external_id: labels[EXTERNAL_ID_LABEL] ?? "",
       status: await this.statusOf(id, labels, cluster),
       backups: backupsEnabled() ? "enabled" : "unavailable",
+      ...(labels[HIBERNATED_LABEL] === "true"
+        ? {
+            hibernated_by:
+              cluster.metadata?.annotations?.[HIBERNATED_BY_ANNOTATION] === "auto"
+                ? ("auto" as const)
+                : ("api" as const),
+          }
+        : {}),
       tier: tierOf(labels),
       endpoint: endpointHost(id),
       port: POSTGRES_PORT,
@@ -620,6 +636,20 @@ export class Provisioner {
     // whatever the patch below would have said.
     if (!cluster) throw new NotFoundError(`no database with id ${id}`);
 
+    // Rewrite the NetworkPolicy on the way up.
+    //
+    // Nothing else does. A database created by an older drigodb keeps the policy
+    // it was born with, and this release adds a rule — the control plane reading
+    // the metrics port — that automatic hibernation depends on. Without this,
+    // upgrading leaves every existing database unscrapeable, the sweep reports
+    // it unreachable, and nothing ever sleeps. Silently, because "unreachable"
+    // is deliberately treated as "leave it alone".
+    //
+    // Waking is where a database picks up changes, which is the shape the old
+    // data plane used for pod templates. A database that never sleeps never
+    // wakes and so never gains this — logged below rather than hidden.
+    await this.ensureNetworkPolicy(id, cluster.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "");
+
     await this.scale(id, 1);
     return this.get(id);
   }
@@ -710,6 +740,17 @@ export class Provisioner {
   // reconciled. A 409 here is normal, not exceptional.
   async scale(id: string, replicas: number): Promise<Database> {
     const want = replicas === 0 ? "true" : "false";
+
+    // A wake clears both markers. `idle-since` because the clock restarts when
+    // a database comes back, and `hibernated-by` because it describes a sleep
+    // that is over — leaving it would have a running database still claiming
+    // something put it to sleep.
+    if (replicas > 0) {
+      await this.annotate(id, {
+        [IDLE_SINCE_ANNOTATION]: null,
+        [HIBERNATED_BY_ANNOTATION]: null,
+      }).catch(() => undefined);
+    }
 
     // One patch, both fields, so the label recording the intent and the
     // annotation acting on it can never disagree. The previous data plane needed
@@ -949,6 +990,79 @@ export class Provisioner {
     return { sourceCluster: clusterName(from.databaseId), barmanBackupId: barmanId };
   }
 
+  // How many connections the application has open, or undefined if the
+  // instance could not be reached. Read from the instance's metrics port — see
+  // src/k8s/idle.ts for why it is not a SQL query.
+  async appConnectionsOf(id: string): Promise<number | undefined> {
+    const pods = await this.core.listNamespacedPod({
+      namespace: config.databaseNamespace,
+      labelSelector: `${DB_ID_LABEL}=${id},cnpg.io/podRole=instance`,
+    });
+    const ip = (pods.items ?? [])[0]?.status?.podIP;
+    if (!ip) return undefined;
+    return appBackendsOf(ip, CNPG_METRICS_PORT);
+  }
+
+  async idleSince(id: string): Promise<Date | undefined> {
+    const at = (await this.clusterFor(id))?.metadata?.annotations?.[IDLE_SINCE_ANNOTATION];
+    if (!at) return undefined;
+    const d = new Date(at);
+    return Number.isNaN(d.getTime()) ? undefined : d;
+  }
+
+  async markIdleSince(id: string, at: Date): Promise<void> {
+    await this.annotate(id, { [IDLE_SINCE_ANNOTATION]: at.toISOString() });
+  }
+
+  async clearIdleSince(id: string): Promise<void> {
+    // Only when there is something to clear. A busy database is the common case
+    // and this runs on every tick for every one of them.
+    if (!(await this.idleSince(id))) return;
+    await this.annotate(id, { [IDLE_SINCE_ANNOTATION]: null });
+  }
+
+  // Hibernate, and record that nobody asked. A consumer debugging a cold start
+  // has no way to tell an automatic sleep from one somebody requested unless
+  // drigodb says which it was.
+  async hibernateAutomatically(id: string): Promise<void> {
+    await this.annotate(id, { [HIBERNATED_BY_ANNOTATION]: "auto" });
+    await this.scale(id, 0);
+  }
+
+  // Replace, not create-if-missing: the point is to bring an existing policy up
+  // to what this build renders, which is exactly what create-if-missing skips.
+  private async ensureNetworkPolicy(id: string, externalId: string): Promise<void> {
+    const body = buildNetworkPolicy(id, externalId);
+    try {
+      await this.net.replaceNamespacedNetworkPolicy({
+        name: clusterName(id),
+        namespace: config.databaseNamespace,
+        body,
+      });
+    } catch (err) {
+      if (!isNotFound(err)) throw err;
+      await this.ensure(() =>
+        this.net.createNamespacedNetworkPolicy({ namespace: config.databaseNamespace, body }),
+      );
+    }
+  }
+
+  private async annotate(id: string, annotations: Record<string, string | null>): Promise<void> {
+    await this.objects.patchNamespacedCustomObject(
+      {
+        group: CNPG_GROUP,
+        version: "v1",
+        namespace: config.databaseNamespace,
+        plural: CLUSTERS_PLURAL,
+        name: clusterName(id),
+        // null removes a key under a merge patch, which is the only way to take
+        // an annotation off without reading and rewriting the whole object.
+        body: { metadata: { annotations } },
+      },
+      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+    );
+  }
+
   async createBackup(id: string): Promise<DatabaseBackup> {
     const cluster = await this.clusterFor(id);
     if (!cluster) throw new NotFoundError(`no database with id ${id}`);
@@ -1132,4 +1246,71 @@ function toBackup(b: CnpgBackup): DatabaseBackup {
     ...(b.status?.backupId ? { backup_id: b.status.backupId } : {}),
     ...(b.status?.error ? { error: b.status.error } : {}),
   };
+}
+
+// Put idle databases to sleep.
+//
+// The first thing drigodb does on a timer rather than on a request, and the
+// reason the control plane is no longer purely reactive. Deliberately small: it
+// reads, it annotates, and once a database has been quiet for long enough it
+// calls the same scale() an operator's hibernate call would.
+//
+// Every decision is written on the Cluster rather than held in memory, so a
+// control plane that restarts does not forget how long a database has been
+// quiet — and two of them would reach the same conclusion rather than fight.
+async function sweepOne(
+  p: Provisioner,
+  db: Database,
+  now: Date,
+): Promise<"skipped" | "busy" | "waiting" | "hibernated" | "unreachable"> {
+  if (db.status !== "ready") return "skipped";
+
+  const backends = await p.appConnectionsOf(db.id);
+  // Unreachable is not idle. A pod mid-restart or a scrape that timed out looks
+  // exactly like nobody being connected, and hibernating on that would put a
+  // busy database to sleep because drigodb could not see it.
+  if (backends === undefined) {
+    // Worth a line, because the shape of the failure is a database that quietly
+    // never sleeps. The commonest cause is a NetworkPolicy written before this
+    // release, which a wake repairs — and a database that never sleeps never
+    // wakes, so it would sit here forever without something saying so.
+    console.warn(
+      `[drigodb] ${db.id}: could not read connection count; not hibernating. ` +
+        "If this persists, its NetworkPolicy may predate the metrics rule — wake it once to repair.",
+    );
+    return "unreachable";
+  }
+
+  if (backends > 0) {
+    await p.clearIdleSince(db.id);
+    return "busy";
+  }
+
+  const since = await p.idleSince(db.id);
+  if (!since) {
+    await p.markIdleSince(db.id, now);
+    return "waiting";
+  }
+  if (now.getTime() - since.getTime() < config.idle.afterSeconds * 1000) return "waiting";
+
+  await p.hibernateAutomatically(db.id);
+  return "hibernated";
+}
+
+export async function sweepIdleDatabases(p: Provisioner, now = new Date()): Promise<void> {
+  if (!autoHibernateEnabled()) return;
+  const databases = await p.list();
+  for (const db of databases) {
+    try {
+      const outcome = await sweepOne(p, db, now);
+      if (outcome === "hibernated") {
+        console.log(`[drigodb] ${db.id}: idle, hibernated automatically`);
+      }
+    } catch (err) {
+      // One database failing must not stop the sweep. The next tick tries again,
+      // and a database that cannot be read is simply left running — the failure
+      // that costs money is preferable to the one that stops a database.
+      console.error(`[drigodb] ${db.id}: idle sweep failed:`, err);
+    }
+  }
 }

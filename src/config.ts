@@ -62,6 +62,23 @@ export const config = {
   // bucket credential here and no S3 client: the control plane cannot reach
   // object storage and does not need to, which is a smaller blast radius than
   // the sidecar era managed with its own signing code.
+  // The namespace the control plane itself runs in, from the downward API. Used
+  // by the NetworkPolicy rule that lets drigodb read a database's metrics port.
+  controlPlaneNamespace: envOr("DRIGODB_NAMESPACE", "drigodb-system"),
+
+  // Automatic hibernation. OFF unless an installation asks for it, because a
+  // feature that stops a customer's database without being asked is not one to
+  // switch on by default.
+  //
+  // idleAfterSeconds is how long a database must have NO application
+  // connections before it is put to sleep. checkIntervalSeconds is how often
+  // that is looked at; it is deliberately not the same number, so raising the
+  // threshold does not make the sweep lazier.
+  idle: {
+    afterSeconds: Number(envOr("DRIGODB_IDLE_AFTER_SECONDS", "0")),
+    checkIntervalSeconds: Number(envOr("DRIGODB_IDLE_CHECK_SECONDS", "60")),
+  },
+
   backup: {
     objectStore: envOr("DRIGODB_BACKUP_OBJECT_STORE", ""),
   },
@@ -102,4 +119,10 @@ export function apiToken(): string {
 // and told the API its name. Nothing else is required of the control plane.
 export function backupsEnabled(): boolean {
   return config.backup.objectStore !== "";
+}
+
+// Automatic hibernation is on when a threshold was configured. Zero is off, and
+// off is the default.
+export function autoHibernateEnabled(): boolean {
+  return Number.isFinite(config.idle.afterSeconds) && config.idle.afterSeconds > 0;
 }

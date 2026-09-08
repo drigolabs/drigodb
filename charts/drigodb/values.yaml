@@ -117,6 +117,34 @@ tls:
     duration: 2160h    # 90 days
     renewBefore: 360h  # 15 days
 
+# Put idle databases to sleep, without anyone asking.
+#
+# OFF by default, and that is deliberate rather than timid: a feature that stops
+# a customer's database is not one to switch on for an operator who has not read
+# about it. Set idleAfterSeconds to turn it on.
+#
+# What it costs when it is on: a database with no application connections for
+# that long is hibernated, and the next connection to it FAILS — nothing wakes a
+# database because a client tried to reach it. A consumer has to call
+# POST /wake and retry, and issue #87 is the argument about whether drigodb
+# should grow something in the connection path to do that for them.
+#
+# So this is right for a fleet of applications whose owner controls the client
+# code and wrong for a database somebody points psql at.
+#
+# It also gives the control plane a network path it did not have before: the
+# NetworkPolicy admits drigodb to each database's METRICS port, because
+# connection counts live in pg_stat_activity and drigodb has no credential to
+# read them with. It learns that there are connections, never what they are, and
+# still cannot log in.
+idle:
+  # Seconds with no application connections before a database is hibernated.
+  # 0 disables it entirely.
+  afterSeconds: 0
+  # How often to look. Not the same number as the threshold, so raising the
+  # threshold does not make the sweep lazier.
+  checkIntervalSeconds: 60
+
 # Backups, through CloudNativePG's barman-cloud plugin.
 #
 # Off unless a bucket and an endpoint are set — an installation with neither

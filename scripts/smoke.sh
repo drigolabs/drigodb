@@ -130,14 +130,25 @@ if k get crd clusters.postgresql.cnpg.io >/dev/null 2>&1; then
   # Both resources, not just Clusters. The Role granted clusters and not backups,
   # and a preflight that checked only the first reported everything fine while
   # every backup request returned 500.
-  for res in clusters backups; do
-    if [ "$(k auth can-i "create" "${res}.postgresql.cnpg.io" --as "$SA" -n drigodb-databases 2>/dev/null)" = "yes" ]; then
-      ok "the API may create a ${res%s} in drigodb-databases"
+  # Verb by verb, because a Role that is right about the resource and wrong
+  # about the verb fails at runtime and nowhere else. Both gaps found in this
+  # data plane were of exactly that shape: `clusters` granted and `backups` not,
+  # then `networkpolicies` granted without `update`, each surfacing as a 403
+  # from a real request rather than from anything that checked.
+  while read -r verb res; do
+    [ -z "$verb" ] && continue
+    if [ "$(k auth can-i "$verb" "$res" --as "$SA" -n drigodb-databases 2>/dev/null)" = "yes" ]; then
+      ok "the API may ${verb} ${res%%.*}"
     else
-      fail "the API service account cannot create ${res} — that path will fail at runtime"
+      fail "the API service account cannot ${verb} ${res} — that path will fail at runtime"
       exit 1
     fi
-  done
+  done <<'PERMS'
+create clusters.postgresql.cnpg.io
+patch clusters.postgresql.cnpg.io
+create backups.postgresql.cnpg.io
+update networkpolicies.networking.k8s.io
+PERMS
 else
   fail "clusters.postgresql.cnpg.io is missing; run scripts/cnpg-install.sh"
   exit 1
@@ -360,6 +371,41 @@ if k wait -n "$NP_NS" --for=condition=Ready "pod/$NP_POD" --timeout=120s >/dev/n
   k delete pod -n "$NP_NS" "$NP_POD" --wait=false >/dev/null 2>&1
 else
   note "could not start a probe pod; skipping the NetworkPolicy check"
+fi
+
+step "Does drigodb know whether anybody is connected?"
+# The integration risk in automatic hibernation is not the arithmetic — that is
+# unit-tested — it is that drigodb cannot READ the connection count. Connection
+# counts live in pg_stat_activity and the control plane has no database
+# credential, so it scrapes each instance's metrics port instead, through a
+# NetworkPolicy rule that has to exist.
+#
+# When it cannot, the sweep correctly does nothing and every database quietly
+# never sleeps. Nothing else in this script would notice.
+#
+# Asserted without letting anything actually hibernate: with a long threshold
+# the sweep still marks an idle database, so `idle-since` appearing proves the
+# whole path works and nothing gets stopped mid-test.
+if [ "$(k get networkpolicy "db-${DB_ID}" -n drigodb-databases \
+     -o jsonpath='{.spec.ingress[*].ports[*].port}' | tr ' ' '\n' | grep -c '^9187$')" = "1" ]; then
+  ok "the policy admits the control plane to the metrics port"
+else
+  fail "no metrics rule in the NetworkPolicy — automatic hibernation could never read a connection count"
+  exit 1
+fi
+
+IDLE_MARKED=""
+for _ in $(seq 1 24); do
+  IDLE_MARKED="$(k get cluster "db-${DB_ID}" -n drigodb-databases \
+    -o jsonpath='{.metadata.annotations.drigodb\.io/idle-since}' 2>/dev/null)"
+  [ -n "$IDLE_MARKED" ] && break
+  sleep 5
+done
+if [ -n "$IDLE_MARKED" ]; then
+  ok "an idle database is seen to be idle (since ${IDLE_MARKED})"
+else
+  fail "the sweep never marked an idle database — it cannot read the connection count"
+  exit 1
 fi
 
 step "Backup and restore"

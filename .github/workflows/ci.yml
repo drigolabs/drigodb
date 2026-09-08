@@ -93,6 +93,12 @@ jobs:
           start=$SECONDS
           DRIGODB_KIND_CLUSTER=ci bash scripts/kind-up.sh --local --with-backups
           echo "KIND_UP_SECONDS=$((SECONDS - start))" >> "$GITHUB_ENV"
+        env:
+          # Long enough that nothing hibernates mid-test, short enough that the
+          # sweep runs and proves it can read a connection count. The scrape is
+          # what fails silently; the arithmetic is unit-tested.
+          DRIGODB_IDLE_AFTER_SECONDS: "3600"
+          DRIGODB_IDLE_CHECK_SECONDS: "10"
 
       - name: End to end
         run: |

@@ -184,7 +184,7 @@ API call.
 
 Two things follow for a consumer:
 
-**Call `wake` before use if it may be hibernated.** It is safe to call on a
+**Call `wake` before use if it may be hibernated**, and be ready to retry the connection. If the operator turned on automatic hibernation, "may be" means "will be, if nobody used it recently". It is safe to call on a
 database that is already awake: a speculative wake must not restart something
 serving traffic, so it does nothing.
 
@@ -222,7 +222,7 @@ spec:
 - **No schema management.** drigodb puts nothing inside your database — no schema, no table, no extension. It is yours entirely.
 - **No automatic backups.** WAL is archived continuously once an installation configures storage, but a base backup is taken when you ask for one — `POST /v1/databases/{id}/backups`. Nothing takes one on a schedule yet.
 - **No restore in place.** Restoring gives you a *new* database from a backup; it never overwrites the one you have. Point your application at the new URI when you are satisfied with it.
-- **No automatic hibernation.** Nothing decides your database is idle.
+- **Automatic hibernation, if the operator turned it on.** A database with no connections for long enough is put to sleep, and `GET` reports `hibernated_by: auto` so you can tell that from one you asked for. **Nothing wakes it when a client connects** — the next connection fails, and your application has to call `wake` and retry. Ask your operator whether it is on, because it changes what your client has to do.
 - **No accounts or quotas.** One token per installation, and every holder can do everything —
   including to databases they did not create. If you are not also the operator, you are trusting
   everyone else who holds that token. See

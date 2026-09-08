@@ -268,6 +268,42 @@ create and approve pull requests* stays off.
 `scripts/deploy.sh` still works by hand — for standing a cluster up outside the
 reconciler, or bootstrapping one. It is the escape hatch, not the route.
 
+## Hibernation
+
+Zero compute, storage only, waking in about twelve seconds. It has always been
+an API call; it can now happen on its own.
+
+```yaml
+idle:
+  afterSeconds: 900   # 0, and off, unless you set it
+```
+
+**Off by default and deliberately so.** A feature that stops a customer's
+database is not one to switch on for an operator who has not read about it. But
+it is the economic argument for the whole design: a fleet of applications that
+are mostly abandoned costs a running pod each, forever, until something puts
+them to sleep.
+
+**Nothing wakes a database because a client connected.** Consumers reach their
+database directly and never through the control plane — the property that makes
+an API outage stop provisioning rather than serving — so there is nothing in the
+connection path to notice a request arriving. An application has to call `wake`
+and retry. That is fine when one party writes every client and wrong for a
+database somebody points `psql` at, and
+[#87](https://github.com/drigolabs/drigodb/issues/87) is the argument about
+whether drigodb should grow a proxy to close it.
+
+`GET /v1/databases/{id}` reports `hibernated_by: auto` or `api`, because a
+consumer debugging a cold start otherwise cannot tell which happened.
+
+**How drigodb knows a database is idle** is the interesting part. Connection
+counts live in `pg_stat_activity` and the control plane has never had a database
+credential — it holds every password and no route to use one. So it reads the
+count from CloudNativePG's metrics port instead, through one NetworkPolicy rule.
+It learns *that* there are connections, never what they are, and still cannot
+log in. The exporter's own connection is excluded, or nothing would ever look
+idle.
+
 ## Backups
 
 Off by default. Set a bucket and an endpoint and every database archives WAL
