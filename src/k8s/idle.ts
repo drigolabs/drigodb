@@ -13,6 +13,33 @@
 // it is worth being explicit that it is a change at all: the policy now admits
 // the control plane to one port on each instance.
 //
+// WHY NOT A SIDECAR IN THE DATABASE POD, watching itself?
+//
+// It is the better shape on paper — observation over the Unix socket with peer
+// auth, no network, no credential, and no path from the control plane into the
+// data plane at all. It is what the backup sidecar did before decision 0004
+// gave the pod template to CloudNativePG.
+//
+// It is not free, and the cost is the wrong way round. Hibernation is a
+// Kubernetes operation: annotating a Cluster. A database pod today can do
+// NOTHING to Kubernetes — measured, not assumed: its ServiceAccount cannot get
+// or patch its own Cluster and cannot read a Secret. Self-hibernation means
+// granting each database pod permission to patch its own Cluster, which trades
+// a narrow READ path from the control plane for a WRITE credential in the data
+// plane. Today a compromised database is a compromised database; then it would
+// also hold a Kubernetes credential.
+//
+// It also needs a CNPG-I plugin to inject the sidecar at all — a Go gRPC
+// service with its own image, deployment and version pin — for one annotation.
+//
+// If the cost that bites is instead scraping N databases from one process, the
+// cheap answer is to query Prometheus rather than each pod: one endpoint, no
+// direct path, no new credential.
+//
+// And issue #87 may delete the question. A proxy in the connection path sees
+// connections arrive and leave directly, and nothing needs scraping at all.
+// Worth settling that before investing further in how idleness is observed.
+//
 // The exporter's own backend is always there — `usename="postgres"`,
 // `application_name="cnpg_metrics_exporter"` — so counting every backend would
 // find no database ever idle. Measured on a cluster before this was written.
