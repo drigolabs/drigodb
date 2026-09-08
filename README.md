@@ -69,6 +69,7 @@ it — on top of [#62](https://github.com/drigolabs/drigodb/issues/62).
 
 ```
 POST   /v1/databases            { external_id, restore_from? }  → 202 + connection_uri
+                                restore_from: { database_id, backup_id? | target_time? }
                                                              → 200 if it already existed (no uri)
 GET    /v1/databases            list
 GET    /v1/databases/{id}       status and endpoint
@@ -287,12 +288,26 @@ POST /v1/databases/{id}/backups   → 202, take one now
 GET  /v1/databases/{id}/backups   → what can be restored
 
 POST /v1/databases  { external_id, restore_from: { database_id, backup_id? } }
+POST /v1/databases  { external_id, restore_from: { database_id, target_time } }
 ```
 
 **A restored database is a new database** — its own id, its own volume, its own
 credentials — and the one it came from is untouched. That is what makes it a
 safe undo: the thing being undone cannot be damaged by undoing it. Omit
 `backup_id` for the latest backup.
+
+**`target_time` recovers to an instant, not to a backup.** WAL is archived for
+every database, so the recoverable moments are not only the ones a backup landed
+on: the difference between restoring yesterday's database and restoring it to
+the second before the statement that emptied a table. RFC3339, and it must carry
+an offset — `2026-09-09T09:30:00Z` — because a timestamp without one resolves
+against whichever timezone the control plane happens to run in.
+
+`backup_id` and `target_time` are alternatives; sending both is a 400 rather
+than a precedence rule. A `target_time` before the earliest backup finished is
+also a 400, at the moment of the request, rather than a database that fails to
+bootstrap several minutes later. The window is bounded by the `ObjectStore`
+retention policy, 30 days by default.
 
 A backup belongs to the database it was taken from, and drigodb refuses a
 `restore_from` that names someone else's — otherwise any backup in the

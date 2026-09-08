@@ -353,7 +353,7 @@ export interface CnpgClusterSpec {
           database: string;
           owner: string;
           secret: { name: string };
-          recoveryTarget?: { backupID: string };
+          recoveryTarget?: { backupID?: string; targetTime?: string };
         };
       };
   externalClusters?: Array<{
@@ -385,6 +385,10 @@ export interface CnpgClusterManifest {
 export interface RestoreSource {
   sourceCluster: string;
   barmanBackupId?: string;
+  // RFC3339, which is what the CRD asks for in those words. A JavaScript
+  // Date.toISOString() is already RFC3339, so this is the string a caller sent
+  // after it has been parsed and re-serialised rather than the raw input.
+  targetTime?: string;
 }
 
 export function buildCluster(
@@ -523,8 +527,21 @@ export function buildCluster(
                 database: DB_NAME,
                 owner: DB_USER,
                 secret: { name: secretName(id) },
+                // A backup id recovers to that backup. A target time recovers to
+                // that instant, and CloudNativePG picks the base backup to
+                // replay from: "if empty (default) the operator will
+                // automatically detect the backup based on targetTime", which is
+                // a better choice than a caller could make.
+                //
+                // Never both. The CRD does allow it — a backup id there narrows
+                // which backup the replay starts from — but the API rejects the
+                // combination rather than carry a precedence rule, and
+                // validateRestoreFrom is where that is enforced.
                 ...(restore.barmanBackupId
                   ? { recoveryTarget: { backupID: restore.barmanBackupId } }
+                  : {}),
+                ...(restore.targetTime
+                  ? { recoveryTarget: { targetTime: restore.targetTime } }
                   : {}),
               },
             },
