@@ -124,14 +124,24 @@ the connection path.
 
 ## The immediate consequence
 
-[#99](https://github.com/drigolabs/drigodb/pull/99) does not merge as it stands.
-The parts of it that are mechanism — a NetworkPolicy that reconciles on wake, an
-RBAC verb that was missing, permission checks that test verbs rather than
-resources, and reporting who hibernated a database — are correct and belong in
-the core. The sampling sweep is policy, and it was policy built on a signal the
-core cannot see.
+[#99](https://github.com/drigolabs/drigodb/pull/99) did not merge. Its
+mechanisms went to [#103](https://github.com/drigolabs/drigodb/pull/103) instead
+— a NetworkPolicy that reconciles on wake, an RBAC verb that was missing, and
+permission checks that test verbs rather than resources. Splitting it that way
+turned up something worth having: the reconcile was an ordinary bug with nothing
+to do with hibernation, and only a feature that needed a new rule was ever going
+to find it.
 
-The NetworkPolicy rule admitting the control plane to each database's metrics
-port goes with it. It is the only thing in that branch that costs something
-permanently, and it exists solely to feed the signal this record says the core
-should not be reading.
+The sampling sweep stayed behind, and so did the NetworkPolicy rule admitting
+the control plane to each database's metrics port. That rule was the only thing
+in the branch that cost something permanently — it opened the first path from
+the control plane to a hosted database in any direction — and it existed solely
+to feed the signal this record says the core should not be reading.
+
+One piece looked like mechanism and was not. `hibernated_by` reports `auto`
+against `api`, and with the sweep gone nothing in the core writes `auto`, so the
+field is a constant; worse, a policy layer hibernates through `POST /hibernate`
+and would report `api`, indistinguishable from a person. The mechanism-shaped
+version is an attribution the *caller* supplies and drigodb records — which is
+this record's own rule applied to a field that had quietly broken it, and it is
+unbuilt.
