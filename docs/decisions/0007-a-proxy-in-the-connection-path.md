@@ -82,6 +82,72 @@ database's Service.
 already open and waiting on a handshake, so a twelve-second wake is a slow
 connect rather than a failure. **No client needs retry logic.**
 
+## The spike
+
+Built as a throwaway to answer what this record asserted and had not shown —
+`docs/spikes/connection-proxy/proxy.mjs`, about a hundred lines, kept as
+evidence rather than as a component. Run on kind, in front of a real
+CloudNativePG database, with drigodb's own Service repointed at it so clients
+connected at **the hostname they already hold**.
+
+Four questions, four answers.
+
+**Does splicing work at all?** Yes. `psql`, unmodified URI, through the proxy:
+
+```
+THROUGH THE PROXY
+proxy: b09f17ea1b5c: already awake
+```
+
+**Does a client tolerate a wake mid-connection?** Yes, and this is the result
+the whole design rests on. The database was hibernated, then a client connected
+with **no retry logic and no wake call**:
+
+```
+WOKE ON CONNECT
+client waited 11s
+proxy: b09f17ea1b5c: woke in 10953ms
+```
+
+Eleven seconds, spent inside `connect()`. The client's socket was already open
+and blocked on a handshake that had not begun, so a wake looks like a slow
+connect rather than a failure.
+
+**Does `verify-full` survive a spliced handshake?** Yes. With server
+authentication on, the URI issued as `sslmode=verify-full`, and the CA fetched
+from `GET /v1/ca`:
+
+```
+VERIFY-FULL THROUGH THE PROXY
+```
+
+The client validated the **database's** certificate through a proxy that holds
+none and never saw a plaintext byte.
+
+**Does a shared proxy collapse the per-database NetworkPolicy?** Yes, and it is
+worse than an argument on paper. A pod carrying no `drigodb.io/allow-database`
+label — the thing the policy exists to stop:
+
+```
+through the proxy:  REACHED IT WITHOUT THE LABEL
+direct:             psql: error: connection to server … failed
+```
+
+The policy still works. The proxy is simply on the right side of it, and every
+client is on the right side of the proxy.
+
+### What the spike changes
+
+**The mechanism is not the risk.** It works, it is small, and the pleasant parts
+are more pleasant than claimed: no client changes at all, not even a retry.
+
+**The costs are exactly the two architectural ones**, and one of them is now
+demonstrated rather than predicted. This is no longer a feasibility question. It
+is a decision about whether drigodb is willing to put serving on its own
+availability, and to give up per-database network isolation — or to re-implement
+it inside a proxy that would have to resolve a source IP to a pod and read its
+labels on every connection.
+
 ## What it buys
 
 - Wake-on-connect, which is what makes automatic hibernation usable by anything
@@ -135,13 +201,19 @@ approximate them.
 
 ## Recommendation
 
-**Not yet, and not never.** Ship nothing that depends on it until the
-consumer is real: integrate App Maker against wake-and-retry, find out whether
-the retry is actually a burden, and let that decide.
+**Not yet, and not never** — unchanged by the spike, and better founded because
+of it.
 
-The reason to wait is not the work, it is that this trades a property away
-permanently and the case for it is currently theoretical. Nobody has yet been
-annoyed by a retry.
+The spike removes feasibility from the argument entirely. What is left is two
+properties, and neither is bought back cheaply once traded: serving becomes
+dependent on drigodb, and per-database network isolation reduces to the password
+unless a proxy re-implements it per connection.
+
+So: integrate App Maker against wake-and-retry, find out whether the retry is
+actually a burden, and let that decide. The reason to wait is not the work — the
+work turned out to be a hundred lines — it is that nobody has yet been annoyed
+by a retry, and this trades away two properties permanently to fix an annoyance
+nobody has reported.
 
 The reason it may still be right is that the property being traded is worth less
 than it sounds once hibernation is on: a database that is asleep is already
