@@ -269,13 +269,25 @@ describe("restore_from validation", () => {
 describe("restore_from target_time", () => {
   const NOW = new Date("2026-09-09T12:00:00.000Z");
 
-  it("accepts an RFC3339 instant and normalises it", () => {
-    // One spelling reaches the Cluster whichever legal one arrived: the offset
-    // form and the Z form name the same instant and must not produce two
-    // different recovery targets.
-    expect(
-      validateRestoreFrom({ database_id: "a1b2c3d4e5f6", target_time: "2026-09-09T09:30:00+02:00" }, NOW),
-    ).toEqual({ databaseId: "a1b2c3d4e5f6", targetTime: "2026-09-09T07:30:00.000Z" });
+  it("normalises to a +00:00 offset, never to Z", () => {
+    // The one spelling CloudNativePG can pass on. It rewrites this into
+    // PostgreSQL's configuration file — `T` to a space, milliseconds to
+    // microseconds — keeping the zone as given, and PostgreSQL rejects
+    // `2026-09-08 22:48:13.394000Z` outright:
+    //
+    //   LOG:  invalid value for parameter "recovery_target_time"
+    //
+    // The database never starts and the recovery Job retries until it gives up.
+    // Both spellings are accepted from a caller; only this one is sent onward.
+    for (const sent of [
+      "2026-09-09T09:30:00+02:00",
+      "2026-09-09T07:30:00Z",
+      "2026-09-09T07:30:00.000Z",
+    ]) {
+      expect(
+        validateRestoreFrom({ database_id: "a1b2c3d4e5f6", target_time: sent }, NOW),
+      ).toEqual({ databaseId: "a1b2c3d4e5f6", targetTime: "2026-09-09T07:30:00.000+00:00" });
+    }
   });
 
   it("refuses a timestamp with no UTC offset", () => {

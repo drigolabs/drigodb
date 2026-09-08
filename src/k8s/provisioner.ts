@@ -244,8 +244,24 @@ export function validateRestoreFrom(
       );
     }
     // Re-serialised rather than passed through, so what reaches the Cluster is
-    // one format regardless of which legal RFC3339 spelling arrived.
-    targetTime = at.toISOString();
+    // one format regardless of which legal RFC3339 spelling arrived — and that
+    // format is the `+00:00` offset, never `Z`.
+    //
+    // Not cosmetic. CloudNativePG rewrites this value into PostgreSQL's
+    // configuration file, turning the `T` into a space and the milliseconds
+    // into microseconds, and it keeps whatever zone spelling it was given. A
+    // `Z` therefore arrives as `2026-09-08 22:48:13.394000Z`, which PostgreSQL
+    // refuses:
+    //
+    //   LOG:  invalid value for parameter "recovery_target_time"
+    //   FATAL: configuration file "custom.conf" contains errors
+    //
+    // The database then never starts, the recovery Job retries until it gives
+    // up, and the only account of it is in a pod nothing was reading. `+00:00`
+    // survives the same rewrite and names the same instant. Both spellings are
+    // legal RFC3339 and both are accepted FROM a caller; only one of them can
+    // be sent onward.
+    targetTime = at.toISOString().replace(/Z$/, "+00:00");
   }
 
   return {
