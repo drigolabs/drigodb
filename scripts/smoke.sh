@@ -297,11 +297,20 @@ ok "hibernated — zero compute, volume retained"
 # smoke run: a database provisioned by an older drigodb, whose policy predates a
 # rule this build renders. Nothing reconciles one — that is the point — so an
 # emptied ingress list is the same situation reached in one command.
-NP_RULES_BEFORE="$(k get networkpolicy "db-${DB_ID}" -n drigodb-databases \
-  -o jsonpath='{.spec.ingress}' | jq 'length')"
+#
+# Counted through `// []` rather than jsonpath, because `ingress` is omitempty:
+# an emptied list comes back ABSENT, not as `[]`, and `jsonpath | jq length` on
+# a missing field prints nothing at all. The first version of this compared that
+# nothing against "0" and reported it could not empty the policy — which was the
+# guard working, on a real cluster, for a reason no unit test could have had.
+np_rules() {
+  k get networkpolicy "db-${DB_ID}" -n drigodb-databases -o json | jq '(.spec.ingress // []) | length'
+}
+
+NP_RULES_BEFORE="$(np_rules)"
 k patch networkpolicy "db-${DB_ID}" -n drigodb-databases --type=merge \
   -p '{"spec":{"ingress":[]}}' >/dev/null
-[ "$(k get networkpolicy "db-${DB_ID}" -n drigodb-databases -o jsonpath='{.spec.ingress}' | jq 'length')" = "0" ] \
+[ "$(np_rules)" = "0" ] \
   || { fail "could not empty the NetworkPolicy; the reconcile assertion below would pass for the wrong reason"; exit 1; }
 ok "emptied the NetworkPolicy's ${NP_RULES_BEFORE} ingress rules"
 
@@ -322,8 +331,7 @@ ok "woke in $(( $(date +%s) - t0 ))s"
 # And the wake put the policy back. Without the reconcile this is 0, and the
 # database comes up reachable by anything in the cluster — which is why an
 # out-of-date policy is worth repairing rather than leaving.
-NP_RULES_AFTER="$(k get networkpolicy "db-${DB_ID}" -n drigodb-databases \
-  -o jsonpath='{.spec.ingress}' | jq 'length')"
+NP_RULES_AFTER="$(np_rules)"
 if [ "$NP_RULES_AFTER" = "$NP_RULES_BEFORE" ]; then
   ok "the wake rewrote the NetworkPolicy — ${NP_RULES_AFTER} ingress rules back"
 else
