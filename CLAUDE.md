@@ -65,7 +65,23 @@ someone using the thing, not which files moved — `fix: half the default volume
 was reserved for WAL nobody chose`.
 
 Branch from `main`, always. Branching from a feature branch has twice produced a
-PR with nothing left to merge.
+PR with nothing left to merge, and once left a decision record on no branch
+`main` could see.
+
+If a PR is ever stacked anyway, **check that its content reached `main` — not
+that GitHub says merged.** A stacked PR merges into its base branch, so when the
+base is squashed to `main` first, the squash is taken from the commit before the
+stacked one landed. Both PRs then report `MERGED`, truthfully, and neither one
+is on `main`:
+
+```
+git ls-tree origin/main <a path the PR added>
+```
+
+`--is-ancestor` will not tell you: every merge here is a squash, so the branch is
+never an ancestor of `main` even when it landed. That is also why the branch
+looks stale and deletable afterwards — both branches holding
+`docs/decisions/0008` were on the delete list while it existed nowhere else.
 
 ## Comments
 
