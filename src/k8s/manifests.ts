@@ -385,9 +385,10 @@ export interface CnpgClusterManifest {
 export interface RestoreSource {
   sourceCluster: string;
   barmanBackupId?: string;
-  // RFC3339, which is what the CRD asks for in those words. A JavaScript
-  // Date.toISOString() is already RFC3339, so this is the string a caller sent
-  // after it has been parsed and re-serialised rather than the raw input.
+  // PostgreSQL's timestamp format, not RFC3339, and not the caller's raw input.
+  // validateRestoreFrom explains why at length: CloudNativePG rewrites RFC3339
+  // into something PostgreSQL rejects, and only the PostgreSQL spelling passes
+  // through it untouched.
   targetTime?: string;
 }
 

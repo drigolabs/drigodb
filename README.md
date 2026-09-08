@@ -301,7 +301,9 @@ every database, so the recoverable moments are not only the ones a backup landed
 on: the difference between restoring yesterday's database and restoring it to
 the second before the statement that emptied a table. RFC3339, and it must carry
 an offset — `2026-09-09T09:30:00Z` — because a timestamp without one resolves
-against whichever timezone the control plane happens to run in.
+against whichever timezone the control plane happens to run in. Either spelling
+of UTC is accepted; drigodb converts what it sends onward, for a reason recorded
+in `validateRestoreFrom`.
 
 `backup_id` and `target_time` are alternatives; sending both is a 400 rather
 than a precedence rule. A `target_time` before the earliest backup finished is

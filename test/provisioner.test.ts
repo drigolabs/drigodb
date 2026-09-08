@@ -269,24 +269,23 @@ describe("restore_from validation", () => {
 describe("restore_from target_time", () => {
   const NOW = new Date("2026-09-09T12:00:00.000Z");
 
-  it("normalises to a +00:00 offset, never to Z", () => {
-    // The one spelling CloudNativePG can pass on. It rewrites this into
-    // PostgreSQL's configuration file — `T` to a space, milliseconds to
-    // microseconds — keeping the zone as given, and PostgreSQL rejects
-    // `2026-09-08 22:48:13.394000Z` outright:
+  it("sends PostgreSQL's timestamp format, which is the only spelling that survives", () => {
+    // Not cosmetic and not RFC3339 by mistake. CloudNativePG rewrites an
+    // RFC3339 value with a Go layout whose zero-offset form is a literal `Z`,
+    // and PostgreSQL refuses `recovery_target_time = '... .389000Z'` outright —
+    // the instance never starts. A space-separated timestamp is not RFC3339, so
+    // the rewrite cannot parse it and passes it through untouched.
     //
-    //   LOG:  invalid value for parameter "recovery_target_time"
-    //
-    // The database never starts and the recovery Job retries until it gives up.
-    // Both spellings are accepted from a caller; only this one is sent onward.
+    // Every spelling below names the same instant and must produce one value.
     for (const sent of [
       "2026-09-09T09:30:00+02:00",
       "2026-09-09T07:30:00Z",
       "2026-09-09T07:30:00.000Z",
+      "2026-09-09T07:30:00.000+00:00",
     ]) {
       expect(
         validateRestoreFrom({ database_id: "a1b2c3d4e5f6", target_time: sent }, NOW),
-      ).toEqual({ databaseId: "a1b2c3d4e5f6", targetTime: "2026-09-09T07:30:00.000+00:00" });
+      ).toEqual({ databaseId: "a1b2c3d4e5f6", targetTime: "2026-09-09 07:30:00.000000+00:00" });
     }
   });
 

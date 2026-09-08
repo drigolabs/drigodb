@@ -243,25 +243,39 @@ export function validateRestoreFrom(
         `restore_from.target_time is in the future: ${v.target_time}`,
       );
     }
-    // Re-serialised rather than passed through, so what reaches the Cluster is
-    // one format regardless of which legal RFC3339 spelling arrived — and that
-    // format is the `+00:00` offset, never `Z`.
+    // Re-serialised into PostgreSQL's timestamp format — a SPACE separator and
+    // an explicit +00:00 — rather than passed through as RFC3339.
     //
-    // Not cosmetic. CloudNativePG rewrites this value into PostgreSQL's
-    // configuration file, turning the `T` into a space and the milliseconds
-    // into microseconds, and it keeps whatever zone spelling it was given. A
-    // `Z` therefore arrives as `2026-09-08 22:48:13.394000Z`, which PostgreSQL
-    // refuses:
+    // This looks like the wrong format to send an API that documents RFC3339,
+    // and it is deliberate. CloudNativePG does not forward this value: it runs
+    // it through machinery's ConvertToPostgresFormat, which parses RFC3339 and
+    // re-emits it with the Go layout `2006-01-02 15:04:05.000000Z07:00`. Go's
+    // `Z07:00` writes a literal `Z` at zero offset, so every UTC instant —
+    // however it was spelled on the way in, `Z` or `+00:00` — reaches
+    // PostgreSQL as `2026-09-08 23:03:26.389000Z`. PostgreSQL then refuses it:
     //
-    //   LOG:  invalid value for parameter "recovery_target_time"
+    //   LOG:   invalid value for parameter "recovery_target_time"
     //   FATAL: configuration file "custom.conf" contains errors
     //
-    // The database then never starts, the recovery Job retries until it gives
-    // up, and the only account of it is in a pod nothing was reading. `+00:00`
-    // survives the same rewrite and names the same instant. Both spellings are
-    // legal RFC3339 and both are accepted FROM a caller; only one of them can
-    // be sent onward.
-    targetTime = at.toISOString().replace(/Z$/, "+00:00");
+    // The instance never starts and the recovery Job retries until it gives up.
+    // Confirmed against the pinned PostgreSQL image: `postgres -C
+    // recovery_target_time -c recovery_target_time=<value>` accepts `+00:00`,
+    // `+02:00` and ` UTC`, and rejects both `Z` spellings — while `::timestamptz`
+    // accepts all of them, which is why this survives every test that checks the
+    // string is a valid timestamp.
+    //
+    // ConvertToPostgresFormat cannot parse a space-separated timestamp as
+    // RFC3339, so it returns this unchanged, which is the only way to get a
+    // usable value past it. machinery v0.4.0 fixed the underlying bug — "the Z
+    // suffix may not be tolerated in use, so prefer +00:00" — but CloudNativePG
+    // 1.27.0 pins v0.3.1, which has not. That fix also states that input already
+    // in PostgreSQL format is returned unchanged, so this keeps working after
+    // the operator pin moves and nothing here has to be remembered.
+    //
+    // Microseconds because that is the precision the format carries;
+    // JavaScript only has milliseconds, so the last three digits are zeros.
+    const iso = at.toISOString();
+    targetTime = `${iso.slice(0, 10)} ${iso.slice(11, 23)}000+00:00`;
   }
 
   return {

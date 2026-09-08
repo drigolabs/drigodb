@@ -305,9 +305,9 @@ describe("backups", () => {
     const m = await withBackups();
     const rec = m.buildCluster(ID, EXT, "small", {
       sourceCluster: `db-${ID}`,
-      targetTime: "2026-09-09T07:30:00.000Z",
+      targetTime: "2026-09-09 07:30:00.000000+00:00",
     }).spec.bootstrap as RecoveryBootstrap;
-    expect(rec.recovery.recoveryTarget?.targetTime).toBe("2026-09-09T07:30:00.000Z");
+    expect(rec.recovery.recoveryTarget?.targetTime).toBe("2026-09-09 07:30:00.000000+00:00");
     expect(rec.recovery.recoveryTarget).not.toHaveProperty("backupID");
   });
 
