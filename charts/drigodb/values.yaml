@@ -119,9 +119,18 @@ tls:
 
 # Put idle databases to sleep, without anyone asking.
 #
-# OFF by default, and that is deliberate rather than timid: a feature that stops
-# a customer's database is not one to switch on for an operator who has not read
-# about it. Set idleAfterSeconds to turn it on.
+# ON by default, at four hours. Set afterSeconds to 0 to turn it off.
+#
+# On rather than off because it is the economic argument for the whole design: a
+# fleet of applications that are mostly abandoned costs a running pod each,
+# forever, until something puts them to sleep. An operator who wants databases
+# that never sleep should say so, rather than every operator who has not thought
+# about it paying for them.
+#
+# UPGRADING AN EXISTING INSTALLATION TURNS THIS ON. Databases that have been
+# running untouched will begin hibernating, and nothing wakes one because a
+# client connected — the next connection fails until something calls wake. If
+# that is not what you want, set afterSeconds to 0 before you upgrade.
 #
 # What it costs when it is on: a database with no application connections for
 # that long is hibernated, and the next connection to it FAILS — nothing wakes a
@@ -140,10 +149,32 @@ tls:
 idle:
   # Seconds with no application connections before a database is hibernated.
   # 0 disables it entirely.
-  afterSeconds: 0
-  # How often to look. Not the same number as the threshold, so raising the
-  # threshold does not make the sweep lazier.
-  checkIntervalSeconds: 60
+  #
+  # Four hours: long enough that a database somebody is working against during a
+  # workday does not disappear between tasks, short enough that an application
+  # nobody opened today stops costing a pod overnight.
+  afterSeconds: 14400
+  # How often to look, and NOT a knob to save requests with.
+  #
+  # Idleness is sampled — drigodb counts open connections at each check — so a
+  # workload that connects, queries and disconnects can be missed by every
+  # sample and be hibernated while in use. How likely that is depends entirely
+  # on this number, because a shorter interval both takes more samples and makes
+  # each one likelier to land on a live connection.
+  #
+  # For a database used once a minute by a 100ms connection, over the 4h
+  # threshold above:
+  #
+  #   every 60s → 240 samples → 67% chance of wrongly sleeping it
+  #   every 30s → 480 samples → 20%
+  #   every 15s → 960 samples →  0.2%
+  #
+  # Hence 15. The cost is 960 cheap HTTP requests per database per window,
+  # which is nothing next to hibernating a database somebody is using.
+  #
+  # An application that holds a pooled connection — the ordinary case — is not
+  # affected by any of this: its connection is open at every sample.
+  checkIntervalSeconds: 15
 
 # Backups, through CloudNativePG's barman-cloud plugin.
 #

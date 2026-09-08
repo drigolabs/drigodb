@@ -275,14 +275,34 @@ an API call; it can now happen on its own.
 
 ```yaml
 idle:
-  afterSeconds: 900   # 0, and off, unless you set it
+  afterSeconds: 14400      # four hours. 0 turns it off
+  checkIntervalSeconds: 15
 ```
 
-**Off by default and deliberately so.** A feature that stops a customer's
-database is not one to switch on for an operator who has not read about it. But
-it is the economic argument for the whole design: a fleet of applications that
-are mostly abandoned costs a running pod each, forever, until something puts
-them to sleep.
+**On by default**, because it is the economic argument for the whole design: a
+fleet of applications that are mostly abandoned costs a running pod each,
+forever, until something puts them to sleep. An operator who wants databases
+that never sleep should say so, rather than every operator who has not thought
+about it paying for them.
+
+**Upgrading an existing installation turns this on.** Databases running
+untouched will begin hibernating, and nothing wakes one because a client
+connected. Set `afterSeconds: 0` before upgrading if that is not what you want.
+
+**Idleness is sampled, and the interval is not a knob for saving requests.**
+drigodb counts open connections at each check, so an application that connects,
+queries and disconnects can be missed by every sample and hibernated while in
+use. A shorter interval both takes more samples and makes each likelier to land
+on a live connection — for a database used once a minute by a 100ms connection,
+over four hours, checking every 60s misses it 67% of the time and every 15s
+0.2%. An application holding a pooled connection is unaffected either way.
+
+A cumulative transaction counter would sidestep the sampling entirely, and
+CloudNativePG exports one. It is unusable: `pg_stat_database` is per-database
+rather than per-user, and the operator's own housekeeping commits against the
+application database continuously — measured at roughly one transaction a
+second with nothing connected. The connection count can be filtered by role,
+which is the only reason it works.
 
 **Nothing wakes a database because a client connected.** Consumers reach their
 database directly and never through the control plane — the property that makes

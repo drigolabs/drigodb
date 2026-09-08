@@ -66,17 +66,21 @@ export const config = {
   // by the NetworkPolicy rule that lets drigodb read a database's metrics port.
   controlPlaneNamespace: envOr("DRIGODB_NAMESPACE", "drigodb-system"),
 
-  // Automatic hibernation. OFF unless an installation asks for it, because a
-  // feature that stops a customer's database without being asked is not one to
-  // switch on by default.
+  // Automatic hibernation. On at four hours; zero turns it off.
+  //
+  // idleAfterSeconds is how long a database must have had NO application
+  // connections. checkIntervalSeconds is how often that is sampled, and it is
+  // not a knob for saving requests: idleness is a sample, so a shorter interval
+  // is what stops a connect-per-query workload being missed by every check and
+  // hibernated while in use. charts/drigodb/values.yaml carries the arithmetic.
   //
   // idleAfterSeconds is how long a database must have NO application
   // connections before it is put to sleep. checkIntervalSeconds is how often
   // that is looked at; it is deliberately not the same number, so raising the
   // threshold does not make the sweep lazier.
   idle: {
-    afterSeconds: Number(envOr("DRIGODB_IDLE_AFTER_SECONDS", "0")),
-    checkIntervalSeconds: Number(envOr("DRIGODB_IDLE_CHECK_SECONDS", "60")),
+    afterSeconds: Number(envOr("DRIGODB_IDLE_AFTER_SECONDS", "14400")),
+    checkIntervalSeconds: Number(envOr("DRIGODB_IDLE_CHECK_SECONDS", "15")),
   },
 
   backup: {
