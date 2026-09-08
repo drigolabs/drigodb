@@ -130,14 +130,25 @@ if k get crd clusters.postgresql.cnpg.io >/dev/null 2>&1; then
   # Both resources, not just Clusters. The Role granted clusters and not backups,
   # and a preflight that checked only the first reported everything fine while
   # every backup request returned 500.
-  for res in clusters backups; do
-    if [ "$(k auth can-i "create" "${res}.postgresql.cnpg.io" --as "$SA" -n drigodb-databases 2>/dev/null)" = "yes" ]; then
-      ok "the API may create a ${res%s} in drigodb-databases"
+  # Verb by verb, because a Role that is right about the resource and wrong
+  # about the verb fails at runtime and nowhere else. Both gaps found in this
+  # data plane were of exactly that shape: `clusters` granted and `backups` not,
+  # then `networkpolicies` granted without `update`, each surfacing as a 403
+  # from a real request rather than from anything that checked.
+  while read -r verb res; do
+    [ -z "$verb" ] && continue
+    if [ "$(k auth can-i "$verb" "$res" --as "$SA" -n drigodb-databases 2>/dev/null)" = "yes" ]; then
+      ok "the API may ${verb} ${res%%.*}"
     else
-      fail "the API service account cannot create ${res} — that path will fail at runtime"
+      fail "the API service account cannot ${verb} ${res} — that path will fail at runtime"
       exit 1
     fi
-  done
+  done <<'PERMS'
+create clusters.postgresql.cnpg.io
+patch clusters.postgresql.cnpg.io
+create backups.postgresql.cnpg.io
+update networkpolicies.networking.k8s.io
+PERMS
 else
   fail "clusters.postgresql.cnpg.io is missing; run scripts/cnpg-install.sh"
   exit 1
@@ -279,6 +290,21 @@ for _ in $(seq 1 60); do
 done
 ok "hibernated — zero compute, volume retained"
 
+# Damage the NetworkPolicy while the database is down, so the wake below has
+# something to repair.
+#
+# This stands in for the real case, which is slower and not reproducible in a
+# smoke run: a database provisioned by an older drigodb, whose policy predates a
+# rule this build renders. Nothing reconciles one — that is the point — so an
+# emptied ingress list is the same situation reached in one command.
+NP_RULES_BEFORE="$(k get networkpolicy "db-${DB_ID}" -n drigodb-databases \
+  -o jsonpath='{.spec.ingress}' | jq 'length')"
+k patch networkpolicy "db-${DB_ID}" -n drigodb-databases --type=merge \
+  -p '{"spec":{"ingress":[]}}' >/dev/null
+[ "$(k get networkpolicy "db-${DB_ID}" -n drigodb-databases -o jsonpath='{.spec.ingress}' | jq 'length')" = "0" ] \
+  || { fail "could not empty the NetworkPolicy; the reconcile assertion below would pass for the wrong reason"; exit 1; }
+ok "emptied the NetworkPolicy's ${NP_RULES_BEFORE} ingress rules"
+
 # The template reconcile this used to stale-and-check is gone: CloudNativePG
 # owns the pod template and rolls it itself, so there is no drigodb-rendered
 # hash for a wake to bring forward. What is still drigodb's, and still worth
@@ -292,6 +318,18 @@ done
 [ "$(api "localhost:${API_PORT}/v1/databases/${DB_ID}" | jqf '["status"]')" = "ready" ] \
   || { fail "never came back from hibernation"; exit 1; }
 ok "woke in $(( $(date +%s) - t0 ))s"
+
+# And the wake put the policy back. Without the reconcile this is 0, and the
+# database comes up reachable by anything in the cluster — which is why an
+# out-of-date policy is worth repairing rather than leaving.
+NP_RULES_AFTER="$(k get networkpolicy "db-${DB_ID}" -n drigodb-databases \
+  -o jsonpath='{.spec.ingress}' | jq 'length')"
+if [ "$NP_RULES_AFTER" = "$NP_RULES_BEFORE" ]; then
+  ok "the wake rewrote the NetworkPolicy — ${NP_RULES_AFTER} ingress rules back"
+else
+  fail "the wake left ${NP_RULES_AFTER} ingress rules, expected ${NP_RULES_BEFORE}"
+  exit 1
+fi
 
 # The data survived the cycle. Cheap, and it is the assertion that makes
 # hibernation a feature rather than a way to lose a volume.

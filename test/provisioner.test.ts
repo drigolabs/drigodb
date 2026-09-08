@@ -79,13 +79,27 @@ function racingCluster() {
     }),
     listNamespacedPersistentVolumeClaim: async () => ({ items: pvcs }),
   };
-  const net = { createNamespacedNetworkPolicy: async () => ({}) };
+  // wake() rewrites the policy rather than leaving whatever is there, so the
+  // fake records the call: a database provisioned by an older drigodb is the
+  // only way an out-of-date policy exists, and nothing else repairs one.
+  const netCalls: Array<{ name: string; ingress: unknown[] }> = [];
+  const net = {
+    createNamespacedNetworkPolicy: async () => ({}),
+    replaceNamespacedNetworkPolicy: async (req: {
+      name: string;
+      body: { spec?: { ingress?: unknown[] } };
+    }) => {
+      netCalls.push({ name: req.name, ingress: req.body.spec?.ingress ?? [] });
+      return {};
+    },
+  };
   const batch = { readNamespacedJob: async () => { throw notFound(); } };
 
   return {
     created,
     objects,
     pvcs,
+    netCalls,
     provisioner: new Provisioner(
       {} as never, core as never, net as never, batch as never, objectsApi as never,
     ),
@@ -247,5 +261,28 @@ describe("restore_from validation", () => {
   it("refuses a malformed body", () => {
     expect(() => validateRestoreFrom("a1b2c3d4e5f6")).toThrow(ValidationError);
     expect(() => validateRestoreFrom({})).toThrow(ValidationError);
+  });
+});
+
+// A rule added after a database was provisioned reaches that database only if
+// something rewrites its policy. Nothing did: the policy was written once at
+// create and never looked at again, so every existing database kept the rules
+// it was born with while new ones got the current set.
+//
+// Waking is where the repair happens, which makes the limit worth stating in a
+// test too: a database that never sleeps never wakes, and so never gains one.
+describe("wake reconciles the NetworkPolicy", () => {
+  it("rewrites the policy to what this build renders", async () => {
+    const { provisioner, netCalls } = racingCluster();
+    const { database } = await provisioner.create(EXT);
+
+    expect(netCalls).toHaveLength(0);
+    await provisioner.wake(database.id);
+
+    expect(netCalls).toHaveLength(1);
+    expect(netCalls[0]?.name).toBe(`db-${database.id}`);
+    // Non-empty, because the failure this prevents is a database coming back
+    // with a policy that admits everything or nothing.
+    expect(netCalls[0]?.ingress.length).toBeGreaterThan(0);
   });
 });
