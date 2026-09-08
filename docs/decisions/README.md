@@ -18,6 +18,7 @@ than by whoever implements it first.
 | [0005 — An HTTP API, not a CRD](0005-an-http-api-not-a-crd.md) | Desired state arrives over HTTP because OpenVoid is the consumer; the CRD is shelved with the trigger that would revive it |
 | [0006 — Nothing inside a hosted database](0006-nothing-inside-a-hosted-database.md) | drigodb owns the database, the role and the volume and puts no schema of its own inside; the migration runner and its ledger are removed |
 | [0007 — A proxy in the connection path](0007-a-proxy-in-the-connection-path.md) | **Proposed.** Whether a client's connection should pass through drigodb, which would buy wake-on-connect and an exact idleness signal at the cost of serving no longer being independent of the control plane |
+| [0008 — Mechanism in the core, policy outside](0008-mechanism-in-the-core-policy-outside.md) | drigodb provides hibernate, wake, backup and the rest; deciding *when* belongs to a layer above it, built after the core is stable |
 
 `leaving-documentdb.md` predates this folder and stays where it is: the README, several issues and a
 merged pull request link to it by path. Worth consolidating the next time something else moves.
