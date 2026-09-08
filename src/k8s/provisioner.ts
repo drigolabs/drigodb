@@ -620,6 +620,20 @@ export class Provisioner {
     // whatever the patch below would have said.
     if (!cluster) throw new NotFoundError(`no database with id ${id}`);
 
+    // Bring the NetworkPolicy up to what this build renders, on the way up.
+    //
+    // Nothing else ever rewrites one. A database created by an older drigodb
+    // keeps the policy it was born with, so every rule added after it was
+    // provisioned reaches new databases and no existing one — silently, because
+    // a policy that is merely out of date is still a valid policy and nothing
+    // reconciles it. The instance-to-instance rule replication needs (#81) is
+    // the next one that would have landed that way.
+    //
+    // A wake is where a database picks up changes, which is the shape the old
+    // data plane used for pod templates. The limit is worth naming: a database
+    // that never sleeps never wakes, and so never gains a new rule.
+    await this.ensureNetworkPolicy(id, cluster.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "");
+
     await this.scale(id, 1);
     return this.get(id);
   }
@@ -855,6 +869,25 @@ export class Provisioner {
   // retry has to be able to finish the job rather than stall on the first one it
   // already made. That is also the loser's path in a race: it never reaches
   // here, but a caller retrying after a partial failure does.
+  // Replace, not create-if-missing: the point is to bring an EXISTING policy up
+  // to what this build renders, which is exactly what create-if-missing skips.
+  // The create is only the path where somebody deleted the policy by hand.
+  private async ensureNetworkPolicy(id: string, externalId: string): Promise<void> {
+    const body = buildNetworkPolicy(id, externalId);
+    try {
+      await this.net.replaceNamespacedNetworkPolicy({
+        name: clusterName(id),
+        namespace: config.databaseNamespace,
+        body,
+      });
+    } catch (err) {
+      if (!isNotFound(err)) throw err;
+      await this.ensure(() =>
+        this.net.createNamespacedNetworkPolicy({ namespace: config.databaseNamespace, body }),
+      );
+    }
+  }
+
   private async ensure(fn: () => Promise<unknown>): Promise<void> {
     try {
       await fn();
