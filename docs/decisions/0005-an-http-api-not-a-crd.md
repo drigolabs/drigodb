@@ -19,12 +19,20 @@ their own cluster are a welcome side effect and do not get a vote on this.
 
 ## The question
 
-drigodb stores its state in labels on the objects it creates —
-`drigodb.io/tier`, `drigodb.io/external-id`, `drigodb.io/template-hash`,
-`drigodb.io/hibernated`. That is an ad-hoc custom resource written in label
-soup, and [0004](0004-cloudnativepg-for-the-data-plane.md) makes it more
-obviously so: once CloudNativePG owns the `Cluster`, drigodb's own object has no
-home but someone else's spec.
+drigodb stores its state in labels and annotations on the objects it creates —
+`drigodb.io/database-id`, `drigodb.io/external-id`, `drigodb.io/tier`,
+`drigodb.io/hibernated`, `drigodb.io/credential-version`. That is an ad-hoc
+custom resource written in label soup, and
+[0004](0004-cloudnativepg-for-the-data-plane.md) makes it more obviously so:
+once CloudNativePG owns the `Cluster`, drigodb's own state has no home but
+someone else's object.
+
+That set is not the one this record was drafted against. `template-hash` went
+when the pod template stopped being drigodb's to render, and
+`credential-version` arrived because replacing a Secret does not rotate a
+password on its own. Which is the argument rather than a footnote to it: a
+schema that changes shape with the data plane underneath it, and that nothing
+validates, is what a CRD would have made explicit.
 
 The alternative posture is a `Database` CRD as the source of truth with the HTTP
 API as a client of it. It is the conventional answer and it is genuinely better
