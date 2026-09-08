@@ -4,6 +4,10 @@ Decisions that shaped drigodb, with the reasoning that produced them and the evi
 recorded so that a later reader can tell a deliberate choice from an accident, and so that reversing one
 means arguing with the reasoning rather than guessing at it.
 
+Most are `decided`. One — [0007](0007-a-proxy-in-the-connection-path.md) — is `proposed`: it reverses a
+property three other records rest on, and is written down so the decision is made deliberately rather
+than by whoever implements it first.
+
 | Record | Decision |
 |---|---|
 | [Leaving DocumentDB](../leaving-documentdb.md) | Drop MongoDB wire-protocol compatibility, the extension and the gateway; applications speak PostgreSQL |
@@ -13,6 +17,7 @@ means arguing with the reasoning rather than guessing at it.
 | [0004 — CloudNativePG for the data plane](0004-cloudnativepg-for-the-data-plane.md) | A hosted database becomes a CNPG `Cluster` rather than a StatefulSet drigodb assembles; high availability is opt-in per database |
 | [0005 — An HTTP API, not a CRD](0005-an-http-api-not-a-crd.md) | Desired state arrives over HTTP because OpenVoid is the consumer; the CRD is shelved with the trigger that would revive it |
 | [0006 — Nothing inside a hosted database](0006-nothing-inside-a-hosted-database.md) | drigodb owns the database, the role and the volume and puts no schema of its own inside; the migration runner and its ledger are removed |
+| [0007 — A proxy in the connection path](0007-a-proxy-in-the-connection-path.md) | **Proposed.** Whether a client's connection should pass through drigodb, which would buy wake-on-connect and an exact idleness signal at the cost of serving no longer being independent of the control plane |
 
 `leaving-documentdb.md` predates this folder and stays where it is: the README, several issues and a
 merged pull request link to it by path. Worth consolidating the next time something else moves.
