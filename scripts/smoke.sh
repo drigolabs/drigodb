@@ -81,8 +81,13 @@ PSQL_RUN=0
 # spent four minutes in CI observing something that had already happened.
 psql_on_primary() { # sql
   local pod
+  # instanceRole=primary, not podRole=instance. With a standby (#81) the latter
+  # matches two pods and `items[0]` is whichever the API returns first — asking
+  # a replica for pg_stat_replication returns nothing and reads as a failure,
+  # and pg_switch_wal on a replica is an error. This is the same label drigodb's
+  # own Service selects on, so it follows a failover for free.
   pod="$(k get pods -n drigodb-databases \
-    -l "drigodb.io/database-id=${DB_ID},cnpg.io/podRole=instance" \
+    -l "drigodb.io/database-id=${DB_ID},cnpg.io/instanceRole=primary" \
     -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
   [ -n "$pod" ] || return 1
   # -h the socket directory CloudNativePG configures, so this is peer
@@ -646,6 +651,121 @@ case "$OUT" in
   *provisioned-by-api*) fail "the OLD credential still works — rotation did not take"; exit 1 ;;
   *) ok "old credential rejected" ;;
 esac
+
+step "Opt-in high availability, and surviving the primary"
+# The one assertion this feature turns on: after the primary dies, the URI the
+# consumer stored still works AND the writes it was told had committed are
+# there. A failover that loses acknowledged writes is worse than the downtime
+# high availability is bought to avoid, and it passes any test that only checks
+# the database came back.
+HA_EXT="${EXTERNAL_ID}-ha"
+HA="$(api -XPOST "localhost:${API_PORT}/v1/databases" \
+  -d "{\"external_id\":\"${HA_EXT}\",\"high_availability\":true}")"
+HA_ID="$(echo "$HA" | jqf '["id"]')"
+HA_URI="$(echo "$HA" | jqf '["connection_uri"]')"
+[ -n "$HA_ID" ] || { fail "could not create a highly available database: ${HA}"; exit 1; }
+
+# Ready is the PRIMARY serving; the standby arrives after. Waiting for the API
+# to report `standby: ready` rather than for the pods directly, because that
+# field is the thing a consumer would trust and it is worth proving it becomes
+# true rather than assuming.
+HA_STANDBY=""
+for _ in $(seq 1 90); do
+  HA_STANDBY="$(api "localhost:${API_PORT}/v1/databases/${HA_ID}" | jqf '["standby"]')"
+  [ "$HA_STANDBY" = "ready" ] && break
+  sleep 3
+done
+if [ "$HA_STANDBY" = "ready" ]; then
+  ok "${HA_ID} has a standby, and the API says so"
+else
+  fail "the standby never became ready (${HA_STANDBY})"
+  explain_stuck_database "$HA_ID"
+  exit 1
+fi
+
+# `False`, capitalised, because jqf prints through Python: a JSON boolean comes
+# back as Python's repr, not as `false`.
+if [ "$(api "localhost:${API_PORT}/v1/databases/${DB_ID}" | jqf '["high_availability"]')" = "False" ]; then
+  ok "a database created without it is still single-instance"
+else
+  fail "high availability leaked onto a database that did not ask for it"
+  exit 1
+fi
+
+SAVED_DB_ID="$DB_ID"; DB_ID="$HA_ID"
+psql_in_cluster "$HA_URI" "CREATE TABLE ha (id int PRIMARY KEY, note text);
+  INSERT INTO ha VALUES (1,'committed-before-failover');" >/dev/null
+
+# Confirm the write is on the STANDBY before killing anything. Without this the
+# test would pass on an asynchronous cluster that simply happened to be caught
+# up, which is the property being asserted.
+# Anything but `async`, rather than the exact string `sync`.
+#
+# The first version of this asserted sync_state = 'sync' and failed against a
+# working cluster. `method: any` is QUORUM-based synchronous replication, and
+# PostgreSQL reports those standbys as `quorum`; `sync` is what priority-based
+# `first` produces. Pinning the spelling tested which method was configured
+# rather than whether commits wait, which is the property that matters.
+#
+# The state is reported rather than reduced to yes/no, because "no" was all the
+# first failure said and it took a CI round trip to learn the word it wanted.
+SYNC_STATE=""
+for _ in $(seq 1 30); do
+  SYNC_STATE="$(psql_on_primary \
+    "SELECT coalesce(string_agg(application_name || '=' || sync_state, ','), 'no-standby-connected')
+       FROM pg_stat_replication" | tr -d ' \r\n')"
+  case "$SYNC_STATE" in *=sync|*=quorum|*=sync,*|*=quorum,*) break ;; esac
+  sleep 2
+done
+case "$SYNC_STATE" in
+  *=sync*|*=quorum*)
+    ok "the standby is replicating synchronously (${SYNC_STATE})" ;;
+  *)
+    fail "no synchronous standby is connected (${SYNC_STATE}); a failover here could lose writes"
+    # What the server was actually told to wait for. Empty means the
+    # synchronous block never reached the Cluster, which is a different bug
+    # from a standby that has not connected yet.
+    note "synchronous_standby_names = [$(psql_on_primary "SHOW synchronous_standby_names" | tr -d '\r\n')]"
+    exit 1 ;;
+esac
+
+PRIMARY_POD="$(k get pods -n drigodb-databases \
+  -l "drigodb.io/database-id=${HA_ID},cnpg.io/instanceRole=primary" \
+  -o jsonpath='{.items[0].metadata.name}')"
+[ -n "$PRIMARY_POD" ] || { fail "could not identify the primary pod"; exit 1; }
+k delete pod "$PRIMARY_POD" -n drigodb-databases --wait=false >/dev/null
+ok "killed the primary (${PRIMARY_POD})"
+
+# The URI is unchanged on purpose: it names the -rw Service, and failover moves
+# that Service rather than issuing the consumer a new address.
+HA_ROWS=""
+for _ in $(seq 1 60); do
+  HA_ROWS="$(psql_in_cluster "$HA_URI" "SELECT note FROM ha WHERE id = 1" 2>&1)"
+  case "$HA_ROWS" in *committed-before-failover*) break ;; esac
+  sleep 3
+done
+case "$HA_ROWS" in
+  *committed-before-failover*)
+    ok "the stored URI still works, and the committed write survived the failover" ;;
+  *)
+    fail "the database did not come back on the same URI with its data (${HA_ROWS})"
+    DB_ID="$SAVED_DB_ID"; explain_stuck_database "$HA_ID"; exit 1 ;;
+esac
+
+NEW_PRIMARY="$(k get pods -n drigodb-databases \
+  -l "drigodb.io/database-id=${HA_ID},cnpg.io/instanceRole=primary" \
+  -o jsonpath='{.items[0].metadata.name}')"
+if [ -n "$NEW_PRIMARY" ] && [ "$NEW_PRIMARY" != "$PRIMARY_POD" ]; then
+  ok "a different pod is primary now (${NEW_PRIMARY}) — it failed over rather than restarted"
+else
+  # Not a failure. The assertion that matters is the one above: the stored URI
+  # works and the committed write is there. How CloudNativePG got there is its
+  # business, and on a one-node kind cluster a restart is a legitimate outcome.
+  note "the same pod is primary again (${NEW_PRIMARY}); it restarted rather than failing over"
+fi
+
+DB_ID="$SAVED_DB_ID"
+api -XDELETE "localhost:${API_PORT}/v1/databases/${HA_ID}" >/dev/null 2>&1 || true
 
 echo
 printf "${GREEN}${BOLD}drigodb works end to end.${RESET}\n"

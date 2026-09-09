@@ -78,6 +78,15 @@ export type Database = {
   // an honest answer rather than an empty list — a consumer that sees no
   // backups should be able to tell "none taken yet" from "none possible".
   backups: "unavailable" | "enabled";
+  // Whether this database was created with a standby, and whether that standby
+  // is currently there.
+  //
+  // Both, separately, because they answer different questions and a database
+  // that believes it is protected while its standby is gone is the worst of the
+  // three states. `high_availability` is what was asked for and never changes;
+  // `standby` is what is true this second.
+  high_availability: boolean;
+  standby?: "ready" | "unavailable";
   tier: Tier;
   endpoint: string;
   port: number;
@@ -285,6 +294,19 @@ export function validateRestoreFrom(
   };
 }
 
+// Opt-in, and only at create.
+//
+// A boolean rather than an `ha-small` / `ha-medium` tier ladder: high
+// availability composes with every tier, and folding it into the tier table
+// doubles the table for one bit of information.
+export function validateHighAvailability(value: unknown): boolean {
+  if (value === undefined || value === null) return false;
+  if (typeof value !== "boolean") {
+    throw new ValidationError("high_availability must be true or false");
+  }
+  return value;
+}
+
 function idFor(externalId: string): string {
   return createHash("sha256").update(externalId).digest("hex").slice(0, 12);
 }
@@ -391,6 +413,69 @@ export class Provisioner {
     }
   }
 
+  // What a caller is told about redundancy.
+  //
+  // The standby's health is counted from ready instance pods for the same
+  // reason statusOf counts them: status.readyInstances is not zeroed on
+  // hibernation and cannot be trusted, and the pods carry drigodb's own labels
+  // through inheritedMetadata.
+  private async availabilityOf(
+    id: string,
+    labels: Record<string, string>,
+    cluster: CnpgCluster,
+  ): Promise<{ high_availability: boolean; standby?: "ready" | "unavailable" }> {
+    const wanted = cluster.spec?.instances ?? 1;
+    if (wanted < 2) return { high_availability: false };
+
+    // A hibernated database has no standby and is not unhealthy for it. Saying
+    // "unavailable" of something deliberately switched off would send somebody
+    // looking for a fault that is not there.
+    if (labels[HIBERNATED_LABEL] === "true") return { high_availability: true };
+
+    return {
+      high_availability: true,
+      standby: (await this.readyInstances(id)) >= wanted ? "ready" : "unavailable",
+    };
+  }
+
+  // Every ready instance pod, primary or standby. This is how MANY are up, not
+  // whether a consumer can connect — see readyPrimaries for that.
+  private async readyInstances(id: string): Promise<number> {
+    return this.readyPods(`${DB_ID_LABEL}=${id},cnpg.io/podRole=instance`);
+  }
+
+  // The pods drigodb's Service will actually route to.
+  //
+  // `instanceRole=primary`, the same selector buildService uses, because that is
+  // what decides whether connecting to the endpoint reaches anything. A pod that
+  // is Ready but not yet primary is not a database a consumer can use, and the
+  // Service has no endpoints for it — connecting to the ClusterIP is refused.
+  //
+  // podRole=instance was wrong here in two ways that both shipped green:
+  //
+  // A RESTORED database comes up in recovery, passes its readiness probe, and is
+  // promoted to primary only after it has replayed. drigodb reported `ready` in
+  // that window and the very next connection was refused. Intermittent, because
+  // the window is a few seconds wide and how long replay takes decides whether a
+  // caller lands in it.
+  //
+  // And with a standby (#81) it is not a race at all: a standby is podRole
+  // instance, so a database whose primary was down and whose standby was up
+  // reported `ready` while its endpoint pointed at nothing.
+  private async readyPrimaries(id: string): Promise<number> {
+    return this.readyPods(`${DB_ID_LABEL}=${id},cnpg.io/instanceRole=primary`);
+  }
+
+  private async readyPods(labelSelector: string): Promise<number> {
+    const pods = await this.core.listNamespacedPod({
+      namespace: config.databaseNamespace,
+      labelSelector,
+    });
+    return (pods.items ?? []).filter((p) =>
+      (p.status?.conditions ?? []).some((c) => c.type === "Ready" && c.status === "True"),
+    ).length;
+  }
+
   private async statusOf(
     id: string,
     labels: Record<string, string>,
@@ -415,15 +500,7 @@ export class Provisioner {
     // counted that job pod as a ready instance and reported the database ready
     // seven seconds in, while nothing was listening yet. Measured: "ready in
     // 7s", then connection refused.
-    const pods = await this.core.listNamespacedPod({
-      namespace: config.databaseNamespace,
-      labelSelector: `${DB_ID_LABEL}=${id},cnpg.io/podRole=instance`,
-    });
-    const ready = (pods.items ?? []).filter((p) =>
-      (p.status?.conditions ?? []).some(
-        (c) => c.type === "Ready" && c.status === "True",
-      ),
-    ).length;
+    const ready = await this.readyPrimaries(id);
 
     // Before the ready check, not after: a database whose migrations failed has
     // a running server and an unusable schema, which is the whole reason this
@@ -447,6 +524,12 @@ export class Provisioner {
       external_id: labels[EXTERNAL_ID_LABEL] ?? "",
       status: await this.statusOf(id, labels, cluster),
       backups: backupsEnabled() ? "enabled" : "unavailable",
+      // Read from the Cluster's own spec rather than from a drigodb label.
+      // Unlike the tier — where the live PVC is the truth and the spec's
+      // volumeClaimTemplate permanently disagrees with it after a resize —
+      // instances IS the desired state, and there is nothing for a label to
+      // know that the spec does not.
+      ...(await this.availabilityOf(id, labels, cluster)),
       tier: tierOf(labels),
       endpoint: endpointHost(id),
       port: POSTGRES_PORT,
@@ -567,6 +650,7 @@ export class Provisioner {
   async create(
     externalId: string,
     restoreFrom?: { databaseId: string; backupId?: string; targetTime?: string },
+    highAvailability = false,
   ): Promise<{ database: Database; uri: string; created: boolean }> {
     const id = idFor(externalId);
     const password = newPassword();
@@ -636,7 +720,7 @@ export class Provisioner {
         version: "v1",
         namespace: ns,
         plural: CLUSTERS_PLURAL,
-        body: buildCluster(id, externalId, defaultTier(), restore),
+        body: buildCluster(id, externalId, defaultTier(), restore, highAvailability),
       });
     } catch (err) {
       if (!isAlreadyExists(err)) throw err;

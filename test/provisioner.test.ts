@@ -17,6 +17,7 @@ import {
   NotFoundError,
   Provisioner,
   ValidationError,
+  validateHighAvailability,
   validateRestoreFrom,
   validateTier,
 } from "../src/k8s/provisioner.js";
@@ -457,5 +458,165 @@ describe("recovering to an instant", () => {
     await expect(
       provisioner.create("app", { databaseId: SOURCE, targetTime: "2026-09-09T11:00:00Z" }),
     ).resolves.toBeDefined();
+  });
+});
+
+describe("high_availability validation", () => {
+  it("defaults to off when not asked for", () => {
+    expect(validateHighAvailability(undefined)).toBe(false);
+    expect(validateHighAvailability(null)).toBe(false);
+    expect(validateHighAvailability(false)).toBe(false);
+  });
+
+  it("accepts a boolean", () => {
+    expect(validateHighAvailability(true)).toBe(true);
+  });
+
+  it("refuses anything that merely looks like one", () => {
+    // "false" is truthy, and a caller sending the string would otherwise get a
+    // standby, a doubled volume count and a bill for both.
+    for (const bad of ["true", "false", 1, 0, "", "yes", {}, []]) {
+      expect(() => validateHighAvailability(bad)).toThrow(ValidationError);
+    }
+  });
+});
+
+// What a caller is told about redundancy. A database that believes it is
+// protected while its standby is gone is the worst of the three states, so the
+// intent and the current truth are reported separately.
+describe("reporting a standby", () => {
+  function clusterWith(instances: number, readyPods: number, hibernated = false) {
+    const notFound = () => Object.assign(new Error("not found"), { code: 404 });
+    const labels: Record<string, string> = {
+      "drigodb.io/database-id": ID,
+      "drigodb.io/external-id": EXT,
+      ...(hibernated ? { "drigodb.io/hibernated": "true" } : {}),
+    };
+    const objectsApi = {
+      getNamespacedCustomObject: async () => ({
+        metadata: { name: `db-${ID}`, labels },
+        spec: { instances },
+        status: { readyInstances: readyPods },
+      }),
+      listNamespacedCustomObject: async () => ({ items: [] }),
+    };
+    const core = {
+      listNamespacedPod: async () => ({
+        items: Array.from({ length: readyPods }, () => ({
+          status: { conditions: [{ type: "Ready", status: "True" }] },
+        })),
+      }),
+      listNamespacedPersistentVolumeClaim: async () => ({ items: [] }),
+    };
+    const net = { createNamespacedNetworkPolicy: async () => ({}) };
+    const batch = { readNamespacedJob: async () => { throw notFound(); } };
+    return new Provisioner(
+      {} as never, core as never, net as never, batch as never, objectsApi as never,
+    );
+  }
+
+  it("says nothing about a standby on a single-instance database", async () => {
+    const db = await clusterWith(1, 1).get(ID);
+    expect(db.high_availability).toBe(false);
+    expect(db).not.toHaveProperty("standby");
+  });
+
+  it("reports a standby that is there", async () => {
+    const db = await clusterWith(2, 2).get(ID);
+    expect(db.high_availability).toBe(true);
+    expect(db.standby).toBe("ready");
+  });
+
+  it("reports a standby that is missing, while the database is still up", async () => {
+    // The state the feature is meant to make visible: one pod ready out of two,
+    // so the database serves and is no longer protected. `ready` and
+    // `unavailable` together, not one or the other.
+    const db = await clusterWith(2, 1).get(ID);
+    expect(db.status).toBe("ready");
+    expect(db.high_availability).toBe(true);
+    expect(db.standby).toBe("unavailable");
+  });
+
+  it("does not call a hibernated database's standby unhealthy", async () => {
+    // Nothing is running because nothing should be. Reporting `unavailable`
+    // here sends somebody looking for a fault that is not there.
+    const db = await clusterWith(2, 0, true).get(ID);
+    expect(db.status).toBe("hibernated");
+    expect(db.high_availability).toBe(true);
+    expect(db).not.toHaveProperty("standby");
+  });
+});
+
+// `ready` has to mean "the endpoint reaches a database", not "some pod is up".
+//
+// drigodb's Service selects cnpg.io/instanceRole=primary, so a pod that is Ready
+// but not yet primary leaves the Service with no endpoints and the ClusterIP
+// refusing connections. Two ways to be in that state: a restored database
+// replaying WAL before promotion, and a database whose standby is up while its
+// primary is not.
+describe("ready means connectable", () => {
+  function clusterWithPods(pods: Record<string, number>, instances = 1) {
+    const notFound = () => Object.assign(new Error("not found"), { code: 404 });
+    const objectsApi = {
+      getNamespacedCustomObject: async () => ({
+        metadata: {
+          name: `db-${ID}`,
+          labels: { "drigodb.io/database-id": ID, "drigodb.io/external-id": EXT },
+        },
+        spec: { instances },
+        status: { readyInstances: 1, phase: "Cluster in healthy state" },
+      }),
+      listNamespacedCustomObject: async () => ({ items: [] }),
+    };
+    const core = {
+      // Honours the selector, unlike the other fakes here — which is the whole
+      // point: the bug this pins is a wrong selector, and a mock that ignores
+      // selectors agrees with every one of them.
+      listNamespacedPod: async (req: { labelSelector: string }) => {
+        const role = req.labelSelector.includes("instanceRole=primary")
+          ? "primary"
+          : "instance";
+        return {
+          items: Array.from({ length: pods[role] ?? 0 }, () => ({
+            status: { conditions: [{ type: "Ready", status: "True" }] },
+          })),
+        };
+      },
+      listNamespacedPersistentVolumeClaim: async () => ({ items: [] }),
+    };
+    const net = { createNamespacedNetworkPolicy: async () => ({}) };
+    const batch = { readNamespacedJob: async () => { throw notFound(); } };
+    return new Provisioner(
+      {} as never, core as never, net as never, batch as never, objectsApi as never,
+    );
+  }
+
+  it("is not ready while a restored instance is up but not yet promoted", async () => {
+    // One instance pod, Ready, and no primary: recovery has replayed enough to
+    // pass the probe and CloudNativePG has not promoted it. Reporting `ready`
+    // here is what made a restore hand back a URI that refused connections.
+    const db = await clusterWithPods({ instance: 1, primary: 0 }).get(ID);
+    expect(db.status).toBe("provisioning");
+  });
+
+  it("is ready once a primary exists", async () => {
+    const db = await clusterWithPods({ instance: 1, primary: 1 }).get(ID);
+    expect(db.status).toBe("ready");
+  });
+
+  it("is not ready when only the standby is up", async () => {
+    // Not a race: a standby is podRole=instance forever. Counting those made a
+    // database with a dead primary report ready while its endpoint pointed at
+    // nothing.
+    const db = await clusterWithPods({ instance: 1, primary: 0 }, 2).get(ID);
+    expect(db.status).toBe("provisioning");
+  });
+
+  it("still counts both instances when reporting the standby", async () => {
+    // The standby's health is a different question from connectability and
+    // still uses every instance pod.
+    const db = await clusterWithPods({ instance: 2, primary: 1 }, 2).get(ID);
+    expect(db.status).toBe("ready");
+    expect(db.standby).toBe("ready");
   });
 });

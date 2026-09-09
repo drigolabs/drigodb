@@ -56,6 +56,10 @@ other consumer does, and the day one exists it will be its own deployable.
 `leaving-documentdb.md` predates this folder and stays where it is: the README, several issues and a
 merged pull request link to it by path. Worth consolidating the next time something else moves.
 
+[high-availability.md](../diagrams/high-availability.md) draws what 0004's opt-in standby actually does
+— the commit path, the failover, and the degraded window where the durability guarantee is relaxed
+rather than blocking writes.
+
 [deploy-flow.md](../diagrams/deploy-flow.md) draws where the second of those decisions leads — how a merge
 should reach a cluster, and which credential each step holds. It is a target, and it names the issues
 that close the gap.

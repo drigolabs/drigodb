@@ -19,6 +19,7 @@ import {
   buildService,
   buildCluster,
   connectionUri,
+  TIERS,
 } from "../src/k8s/manifests.js";
 import { ValidationError, validateExternalId } from "../src/k8s/provisioner.js";
 
@@ -350,5 +351,57 @@ describe("backups", () => {
     const late = (m.buildBackup(ID, EXT, new Date("2026-11-12T13:14:15Z")) as { metadata: { name: string } }).metadata.name;
     expect([late, early].sort()).toEqual([early, late]);
     expect(early).toMatch(/^bk-[0-9a-f]{12}-\d{14}$/);
+  });
+});
+
+// Opt-in high availability (#81). ADR 0004 decided opt-in; ADR 0001 is why —
+// a standby doubles pods and volumes on nodes that are already the constraint.
+describe("high availability", () => {
+  it("is off unless asked for, and one instance is the default", () => {
+    const spec = buildCluster(ID, EXT).spec;
+    expect(spec.instances).toBe(1);
+    // No synchronous block at all, rather than one asking for zero standbys:
+    // synchronous_standby_names with nothing in it is a different thing from
+    // asynchronous replication.
+    expect(spec.postgresql).not.toHaveProperty("synchronous");
+  });
+
+  it("gives a standby, and makes the commit wait for it", () => {
+    // The failure this exists to survive is the primary dying. Asynchronous
+    // replication acknowledges a commit before the standby holds it, so a
+    // promotion silently loses the difference — worse than the downtime the
+    // feature is bought to avoid.
+    const spec = buildCluster(ID, EXT, "small", undefined, true).spec;
+    expect(spec.instances).toBe(2);
+    expect(spec.postgresql.synchronous).toEqual({
+      method: "any",
+      number: 1,
+      dataDurability: "preferred",
+    });
+  });
+
+  it("prefers durability rather than requiring it", () => {
+    // `required` stops a database accepting writes the moment its only standby
+    // is unavailable — a drained node, a rolled image. Turning high
+    // availability on would make a database LESS available.
+    const spec = buildCluster(ID, EXT, "small", undefined, true).spec;
+    expect(spec.postgresql.synchronous?.dataDurability).not.toBe("required");
+  });
+
+  it("composes with the tier rather than doubling the tier table", () => {
+    for (const tier of ["small", "medium", "large"] as const) {
+      const spec = buildCluster(ID, EXT, tier, undefined, true).spec;
+      expect(spec.instances).toBe(2);
+      expect(spec.storage.size).toBe(TIERS[tier].storage);
+      expect(spec.postgresql.parameters.max_wal_size).toBe(TIERS[tier].maxWalSize);
+    }
+  });
+
+  it("restores into a highly available database", () => {
+    // A restore is a create with a source, so the two options are independent
+    // and both have to survive being asked for together.
+    const spec = buildCluster(ID, EXT, "small", { sourceCluster: `db-${ID}` }, true).spec;
+    expect(spec.instances).toBe(2);
+    expect(spec.bootstrap).toHaveProperty("recovery");
   });
 });
