@@ -326,6 +326,21 @@ failure promotes it **without the stored URI changing** — the endpoint drigodb
 issues selects the primary by label, so a failover moves it rather than issuing
 a new address.
 
+**A failover is not transparent to the client.** While it happens the endpoint
+selects no pod, so in-flight connections are dropped and new ones are refused
+until the standby is promoted — measured at 14 seconds on kind. **A client that
+does not reconnect sees an error.** Anything with a connection pool and retries
+rides through it; anything that treats one failed connection as fatal does not.
+What is guaranteed is the address and the data, not the socket.
+
+**Nothing needs to be done afterwards.** A failed instance is recreated by
+CloudNativePG, not by the caller — `instances: 2` is desired state and the
+operator converges on it. The old primary restarts, notices it is no longer the
+primary and rejoins as the standby, and a standby that dies is replaced on its
+own. The promoted standby stays primary; there is no failback, and no reason to
+want one. `standby: "unavailable"` is therefore information, not a task: it says
+you are temporarily unprotected, not that somebody must act.
+
 `GET /v1/databases/{id}` reports two things, because they answer different
 questions:
 

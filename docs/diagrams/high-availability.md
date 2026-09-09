@@ -110,6 +110,10 @@ sequenceDiagram
     CNPG->>S: label instanceRole=primary
     Svc->>S: now selected
 
+    P->>P: restarts, sees it is no longer primary
+    P->>S: rejoins as the standby
+    Note over P,S: Nobody asked for this. instances is desired<br/>state and CloudNativePG converges on it, so<br/>the pair heals itself and the promoted<br/>standby simply stays primary. No failback.
+
     App->>Svc: connect (SAME URI, unchanged)
     Svc->>S: routed
     App->>S: SELECT — the committed row is there
@@ -153,7 +157,12 @@ sequenceDiagram
 ## What this does not give you
 
 - **Zero downtime.** Failover is fast, not instant, and in-flight connections are
-  dropped. A client that does not reconnect sees an error.
+  dropped. A client that does not reconnect sees an error — what survives is the
+  address and the data, not the socket. Anything with a pool and retries rides
+  through it.
+- **Anything for the caller to do afterwards.** That is not a gap, it is the
+  point: a failed instance is replaced by CloudNativePG rather than by whoever
+  noticed. `standby: "unavailable"` is information, not a task.
 - **A read replica.** The endpoint selects the primary, so the standby serves no
   traffic. It is redundancy, not capacity.
 - **Durability while degraded.** Section 4 is the hole, and it is deliberate:
