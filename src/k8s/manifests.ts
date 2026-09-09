@@ -339,7 +339,18 @@ export interface CnpgClusterSpec {
   imageName: string;
   inheritedMetadata: { labels: Record<string, string> };
   storage: { size: string; storageClass?: string };
-  postgresql: { parameters: Record<string, string>; pg_hba: string[] };
+  postgresql: {
+    parameters: Record<string, string>;
+    pg_hba: string[];
+    // Only on a database with a standby. See buildCluster for the durability
+    // trade this encodes, which is the whole of what "high availability" means
+    // here beyond a second pod.
+    synchronous?: {
+      method: "any";
+      number: number;
+      dataDurability: "required" | "preferred";
+    };
+  };
   certificates?: { serverCASecret: string; serverTLSSecret: string };
   plugins?: Array<{ name: string; isWALArchiver: boolean; parameters: Record<string, string> }>;
   resources: object;
@@ -392,11 +403,18 @@ export interface RestoreSource {
   targetTime?: string;
 }
 
+// A standby doubles a database's pods and volumes, so it is asked for rather
+// than assumed. ADR 0004 decided opt-in; ADR 0001 is why it matters — a 1500 MiB
+// node fits three databases, and DigitalOcean caps a node at 15 attached
+// volumes, so turning this on halves how many databases a node holds.
+export const HA_INSTANCES = 2;
+
 export function buildCluster(
   id: string,
   externalId: string,
   tier: Tier = "small",
   restore?: RestoreSource,
+  highAvailability = false,
 ): CnpgClusterManifest {
   const labels = { ...labelsFor(id, externalId), [TIER_LABEL]: tier };
   return {
@@ -413,7 +431,7 @@ export function buildCluster(
       labels: { ...labels, [HIBERNATED_LABEL]: "false" },
     },
     spec: {
-      instances: 1,
+      instances: highAvailability ? HA_INSTANCES : 1,
       imageName: config.pgImage,
 
       // What makes the NetworkPolicy keep working. Without this the pods carry
@@ -478,6 +496,37 @@ export function buildCluster(
         : {}),
 
       postgresql: {
+        // Synchronous replication, but not at any price.
+        //
+        // The failure high availability exists to survive is the primary dying,
+        // and the way that goes wrong is a failover that promotes a standby
+        // missing writes the application was told had committed. Asynchronous
+        // replication permits exactly that: PostgreSQL acknowledges a commit
+        // before the standby has it, so a promotion loses the difference.
+        // Silent data loss is worse than the downtime this feature is bought to
+        // avoid, so the standby must acknowledge before a commit returns.
+        //
+        // dataDurability `preferred`, NOT `required`, and that is the whole
+        // trade. Under `required` a database with one standby stops accepting
+        // writes the moment that standby is unavailable — a node drained, an
+        // image rolled, a pod evicted. Turning on high availability would make a
+        // database LESS available, which is an absurd thing to sell. `preferred`
+        // keeps the guarantee whenever a healthy standby exists and relaxes to
+        // asynchronous when none does.
+        //
+        // What that costs, stated plainly: if the standby is already gone and
+        // then the primary dies, writes accepted in that window can be lost.
+        // The alternative is refusing to accept them at all, and a database that
+        // stops on a single pod failure is not the product.
+        ...(highAvailability
+          ? {
+              synchronous: {
+                method: "any" as const,
+                number: 1,
+                dataDurability: "preferred" as const,
+              },
+            }
+          : {}),
         parameters: {
           max_wal_size: TIERS[tier].maxWalSize,
           // Carried over from the postgresql.conf drigodb used to mount. The

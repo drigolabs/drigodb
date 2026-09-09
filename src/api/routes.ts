@@ -8,6 +8,7 @@ import {
   Provisioner,
   DeletionInFlightError,
   NotConfiguredError,
+  validateHighAvailability,
   validateRestoreFrom,
   ValidationError,
   validateExternalId,
@@ -33,16 +34,29 @@ export function buildRoutes(provisioner: Provisioner): Hono {
   app.post("/v1/databases", async (c) => {
     let externalId: string;
     let restoreFrom: { databaseId: string; backupId?: string; targetTime?: string } | undefined;
+    let highAvailability = false;
     try {
       const body = await c.req.json().catch(() => ({}));
       externalId = validateExternalId((body as { external_id?: unknown }).external_id);
       restoreFrom = validateRestoreFrom((body as { restore_from?: unknown }).restore_from);
+      highAvailability = validateHighAvailability(
+        (body as { high_availability?: unknown }).high_availability,
+      );
     } catch (err) {
       if (err instanceof ValidationError) return c.json({ error: err.message }, 400);
       throw err;
     }
 
-    const { database, uri, created } = await provisioner.create(externalId, restoreFrom);
+    // Only on the request that creates the database. A repeat returns what
+    // exists, `high_availability` included, and does not act on the flag —
+    // adding a standby to a live database is a different operation with its own
+    // failure modes, and it is deliberately not built (#81). A caller that gets
+    // a 200 should read the field rather than assume the request took effect.
+    const { database, uri, created } = await provisioner.create(
+      externalId,
+      restoreFrom,
+      highAvailability,
+    );
     // 202 on create because provisioning is asynchronous — roughly 12 seconds,
     // too long to hold a request open. 200 on a repeat, which returns the
     // existing database without its credentials.

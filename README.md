@@ -68,7 +68,7 @@ it — on top of [#62](https://github.com/drigolabs/drigodb/issues/62).
 ## API
 
 ```
-POST   /v1/databases            { external_id, restore_from? }  → 202 + connection_uri
+POST   /v1/databases            { external_id, restore_from?, high_availability? }  → 202 + connection_uri
                                 restore_from: { database_id, backup_id? | target_time? }
                                                              → 200 if it already existed (no uri)
 GET    /v1/databases            list
@@ -314,6 +314,47 @@ retention policy, 30 days by default.
 A backup belongs to the database it was taken from, and drigodb refuses a
 `restore_from` that names someone else's — otherwise any backup in the
 installation could be read by guessing its id.
+
+### High availability
+
+```
+POST /v1/databases  { external_id, high_availability: true }
+```
+
+Opt-in, per database, at create only. A database gets a standby, and a primary
+failure promotes it **without the stored URI changing** — the endpoint drigodb
+issues selects the primary by label, so a failover moves it rather than issuing
+a new address.
+
+`GET /v1/databases/{id}` reports two things, because they answer different
+questions:
+
+```
+high_availability: true       what was asked for; never changes
+standby: "ready"              what is true this second
+```
+
+A database with `standby: "unavailable"` is serving and unprotected, which is
+the state worth being able to see. A hibernated database reports no `standby` at
+all rather than an unhealthy one.
+
+**Commits wait for the standby**, so a failover cannot promote a replica missing
+writes the application was told had committed — silent data loss is worse than
+the downtime this is bought to avoid. The guarantee relaxes to asynchronous when
+no healthy standby exists, rather than blocking writes: `required` durability
+would mean a database stops accepting writes the moment its only standby is
+drained or rolled, which would make turning this on *reduce* availability. The
+cost of that choice, stated plainly: if the standby is already gone and then the
+primary dies, writes accepted in that window can be lost.
+
+**It cannot be turned on later.** A repeat `POST` returns the existing database
+and does not act on the flag; adding a standby to a live database is a different
+operation and is not built. Read the field rather than assume the request took.
+
+**It costs what it sounds like.** A standby doubles a database's pods and
+volumes. ADR 0001 measured a 1500 MiB node fitting three databases, and
+DigitalOcean caps a node at 15 attached volumes — turning this on roughly halves
+how many databases a node holds, which is why it is not the default.
 
 **drigodb never touches object storage.** It names a Secret, and CloudNativePG's
 barman-cloud plugin does the reading, the archiving and the writing. The control
