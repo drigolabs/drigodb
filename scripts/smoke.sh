@@ -413,7 +413,20 @@ step "Is the network policy actually enforced?"
 # admits a labelled pod from ANY namespace, and probing from inside the database
 # namespace would never exercise that.
 #
-# One pod, relabelled between attempts, so the label is the only variable.
+# THREE pods, each carrying its label from creation, rather than one pod
+# relabelled between attempts.
+#
+# Relabelling was the obvious way to make the label the only variable, and it
+# does not survive Cilium. Cilium derives a pod's security identity from its
+# labels and recomputes asynchronously: measured on DOKS, a correctly relabelled
+# pod took **34 seconds** to be allowed through. The run failed with "labelling
+# the pod correctly did not let it through" against a policy that was working.
+#
+# The slow assertion is not the dangerous half. A pod relabelled to name a
+# DIFFERENT database is still blocked for those 34 seconds no matter what the
+# policy says, so the sharpest assertion in this file — that per-database
+# isolation is real — would have passed on a cluster where it was false. Three
+# pods have their identity right from the start and wait for nothing.
 NP_NS=default
 NP_POD="smoke-np-$$"
 # sslmode=require, deliberately, whatever the issued URI says. This probe is
@@ -422,41 +435,64 @@ NP_POD="smoke-np-$$"
 # exactly like the policy dropping it. It reported the policy as broken when the
 # policy was fine.
 NP_URI="$(printf '%s' "$URI" | sed -E 's/sslmode=[a-z-]+/sslmode=require/')"
-np_try() { # returns 0 if it connected
-  k exec -n "$NP_NS" "$NP_POD" -- psql "${NP_URI}&connect_timeout=10" -tAc "select 1" >/dev/null 2>&1
+np_try() { # pod -> 0 if it connected
+  k exec -n "$NP_NS" "$1" -- psql "${NP_URI}&connect_timeout=10" -tAc "select 1" >/dev/null 2>&1
 }
-k run "$NP_POD" -n "$NP_NS" --restart=Never --quiet \
-  --image="${SMOKE_PG_IMAGE:-ghcr.io/cloudnative-pg/postgresql:18}" \
-  --command -- sleep 300 >/dev/null 2>&1
-if k wait -n "$NP_NS" --for=condition=Ready "pod/$NP_POD" --timeout=120s >/dev/null 2>&1; then
-  if np_try; then
+np_start() { # pod [labels]
+  k run "$1" -n "$NP_NS" --restart=Never --quiet \
+    --image="${SMOKE_PG_IMAGE:-ghcr.io/cloudnative-pg/postgresql:18}" \
+    ${2:+--labels="$2"} \
+    --command -- sleep 300 >/dev/null 2>&1
+}
+np_start "${NP_POD}-none"
+np_start "${NP_POD}-other" "drigodb.io/allow-database=not-this-one"
+np_start "${NP_POD}-right" "drigodb.io/allow-database=${DB_ID}"
+
+NP_READY=yes
+for p in none other right; do
+  k wait -n "$NP_NS" --for=condition=Ready "pod/${NP_POD}-${p}" --timeout=180s >/dev/null 2>&1 || NP_READY=no
+done
+
+if [ "$NP_READY" = "yes" ]; then
+  # The ALLOW case first, and it is the one that may legitimately need a moment:
+  # a pod's policy is programmed shortly after it starts. Proving the datapath
+  # works before asserting anything is blocked is what stops a deny from passing
+  # because nothing was plumbed yet.
+  NP_ALLOWED=no
+  for _ in $(seq 1 30); do
+    if np_try "${NP_POD}-right"; then NP_ALLOWED=yes; break; fi
+    sleep 2
+  done
+  if [ "$NP_ALLOWED" = "yes" ]; then
+    ok "a correctly labelled pod reaches the database"
+  else
+    fail "a correctly labelled pod could not reach the database"
+    exit 1
+  fi
+
+  # Now the denials mean something: policy is demonstrably programmed on this
+  # cluster, so a pod that cannot get through is being stopped rather than
+  # waiting.
+  if np_try "${NP_POD}-none"; then
     warn "an UNLABELLED pod in ${NP_NS} reached the database"
     warn "this cluster does not enforce NetworkPolicy — the policies exist and drop nothing,"
     warn "so one of drigodb's three isolation layers is decorative here"
   else
     ok "an unlabelled pod in ${NP_NS} cannot reach it"
-
-    # The sharpest assertion: a label naming a DIFFERENT database must not work.
-    # Without this, a policy that admitted any drigodb consumer at all would pass
-    # the test above and still be broken in the way that matters.
-    k label pod -n "$NP_NS" "$NP_POD" "drigodb.io/allow-database=not-this-one" >/dev/null 2>&1
-    if np_try; then
-      fail "a pod labelled for a DIFFERENT database reached this one — isolation is not per-database"
-      exit 1
-    fi
-    ok "a pod labelled for another database cannot reach it either"
-
-    k label pod -n "$NP_NS" "$NP_POD" "drigodb.io/allow-database=${DB_ID}" --overwrite >/dev/null 2>&1
-    if np_try; then
-      ok "the same pod reaches it with the right label — the policy is load-bearing"
-    else
-      fail "labelling the pod correctly did not let it through"
-      exit 1
-    fi
   fi
-  k delete pod -n "$NP_NS" "$NP_POD" --wait=false >/dev/null 2>&1
+
+  # The sharpest assertion: a label naming a DIFFERENT database must not work.
+  # Without this, a policy that admitted any drigodb consumer at all would pass
+  # the test above and still be broken in the way that matters.
+  if np_try "${NP_POD}-other"; then
+    fail "a pod labelled for a DIFFERENT database reached this one — isolation is not per-database"
+    exit 1
+  fi
+  ok "a pod labelled for another database cannot reach it either"
+
+  k delete pod -n "$NP_NS" "${NP_POD}-none" "${NP_POD}-other" "${NP_POD}-right" --wait=false >/dev/null 2>&1
 else
-  note "could not start a probe pod; skipping the NetworkPolicy check"
+  note "could not start the probe pods; skipping the NetworkPolicy check"
 fi
 
 step "Backup and restore"
