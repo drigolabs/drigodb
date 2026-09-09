@@ -438,10 +438,38 @@ export class Provisioner {
     };
   }
 
+  // Every ready instance pod, primary or standby. This is how MANY are up, not
+  // whether a consumer can connect — see readyPrimaries for that.
   private async readyInstances(id: string): Promise<number> {
+    return this.readyPods(`${DB_ID_LABEL}=${id},cnpg.io/podRole=instance`);
+  }
+
+  // The pods drigodb's Service will actually route to.
+  //
+  // `instanceRole=primary`, the same selector buildService uses, because that is
+  // what decides whether connecting to the endpoint reaches anything. A pod that
+  // is Ready but not yet primary is not a database a consumer can use, and the
+  // Service has no endpoints for it — connecting to the ClusterIP is refused.
+  //
+  // podRole=instance was wrong here in two ways that both shipped green:
+  //
+  // A RESTORED database comes up in recovery, passes its readiness probe, and is
+  // promoted to primary only after it has replayed. drigodb reported `ready` in
+  // that window and the very next connection was refused. Intermittent, because
+  // the window is a few seconds wide and how long replay takes decides whether a
+  // caller lands in it.
+  //
+  // And with a standby (#81) it is not a race at all: a standby is podRole
+  // instance, so a database whose primary was down and whose standby was up
+  // reported `ready` while its endpoint pointed at nothing.
+  private async readyPrimaries(id: string): Promise<number> {
+    return this.readyPods(`${DB_ID_LABEL}=${id},cnpg.io/instanceRole=primary`);
+  }
+
+  private async readyPods(labelSelector: string): Promise<number> {
     const pods = await this.core.listNamespacedPod({
       namespace: config.databaseNamespace,
-      labelSelector: `${DB_ID_LABEL}=${id},cnpg.io/podRole=instance`,
+      labelSelector,
     });
     return (pods.items ?? []).filter((p) =>
       (p.status?.conditions ?? []).some((c) => c.type === "Ready" && c.status === "True"),
@@ -472,7 +500,7 @@ export class Provisioner {
     // counted that job pod as a ready instance and reported the database ready
     // seven seconds in, while nothing was listening yet. Measured: "ready in
     // 7s", then connection refused.
-    const ready = await this.readyInstances(id);
+    const ready = await this.readyPrimaries(id);
 
     // Before the ready check, not after: a database whose migrations failed has
     // a running server and an unusable schema, which is the whole reason this
