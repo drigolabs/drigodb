@@ -358,6 +358,11 @@ standby can miss a row its own primary has already acknowledged, and closing
 that gap means `synchronous_commit = remote_apply` and paying a replay round
 trip on every commit.
 
+[docs/diagrams/high-availability.md](docs/diagrams/high-availability.md) draws
+all of this step by step: creating one, what a commit actually waits for, what
+happens when the primary dies, and what happens when the standby is the one that
+dies.
+
 **It cannot be turned on later.** A repeat `POST` returns the existing database
 and does not act on the flag; adding a standby to a live database is a different
 operation and is not built. Read the field rather than assume the request took.
