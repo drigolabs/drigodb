@@ -66,6 +66,31 @@ jqf() { python3 -c "import json,sys; d=json.load(sys.stdin); print(d$1)"; }
 # difference between connecting and not. Whether this cluster ENFORCES that is
 # checked separately below rather than assumed either way.
 PSQL_RUN=0
+# Run SQL on the database's own primary, as postgres.
+#
+# psql_in_cluster below connects the way a CONSUMER does — a separate pod, the
+# Service, the NetworkPolicy, the issued URI — which is the point of it and what
+# most assertions here want. This is for the things a consumer cannot do:
+# `appuser` owns one database and is not a superuser, so anything reading
+# server-wide state or driving the WAL needs the postgres role over the local
+# socket.
+#
+# It is also about a hundred times cheaper. psql_in_cluster creates a pod, waits
+# for it to schedule, pull, run and terminate, then deletes it — six seconds or
+# so. In a poll loop that is the entire runtime: the WAL-archive wait below
+# spent four minutes in CI observing something that had already happened.
+psql_on_primary() { # sql
+  local pod
+  pod="$(k get pods -n drigodb-databases \
+    -l "drigodb.io/database-id=${DB_ID},cnpg.io/podRole=instance" \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+  [ -n "$pod" ] || return 1
+  # -h the socket directory CloudNativePG configures, so this is peer
+  # authentication and no password is involved.
+  k exec -n drigodb-databases "$pod" -c postgres -- \
+    psql -U postgres -h /controller/run -tAc "$1" 2>&1
+}
+
 psql_in_cluster() { # uri sql
   local name out phase
   PSQL_RUN=$((PSQL_RUN + 1))
@@ -515,14 +540,29 @@ else
   # replay WAL that was archived, so without this the target is inside a segment
   # still open on the primary and the restore stops short of it — intermittently,
   # depending on how much was written.
-  psql_in_cluster "$URI" "SELECT pg_switch_wal()" >/dev/null
+  #
+  # As postgres, not as the URI's role, and the result is CHECKED. Written the
+  # obvious way this line was `psql_in_cluster "$URI" ... >/dev/null`, and every
+  # run of it failed with
+  #
+  #   ERROR:  permission denied for function pg_switch_wal
+  #
+  # into /dev/null. `appuser` owns one database and is not a superuser. Nothing
+  # noticed, because the wait below then sat there until the segment was archived
+  # on its own timer and reported success — four minutes of CI, every run, for a
+  # command that never ran.
+  SWITCHED="$(psql_on_primary "SELECT pg_switch_wal() IS NOT NULL" | tr -d ' \r\n')"
+  [ "$SWITCHED" = "t" ] \
+    || { fail "could not switch WAL on the primary (${SWITCHED}); the wait below would pass on a timer instead"; exit 1; }
+  ok "forced a WAL switch"
+
   ARCHIVED=""
-  for _ in $(seq 1 40); do
-    ARCHIVED="$(psql_in_cluster "$URI" \
+  for _ in $(seq 1 60); do
+    ARCHIVED="$(psql_on_primary \
       "SELECT CASE WHEN last_archived_time > '${TARGET}'::timestamptz THEN 'yes' ELSE 'no' END
          FROM pg_stat_archiver" | tr -d ' \r\n')"
     [ "$ARCHIVED" = "yes" ] && break
-    sleep 3
+    sleep 2
   done
   [ "$ARCHIVED" = "yes" ] \
     || { fail "no WAL was archived after the target time; the restore below could not reach it"; exit 1; }
