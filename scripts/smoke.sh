@@ -699,17 +699,35 @@ psql_in_cluster "$HA_URI" "CREATE TABLE ha (id int PRIMARY KEY, note text);
 # Confirm the write is on the STANDBY before killing anything. Without this the
 # test would pass on an asynchronous cluster that simply happened to be caught
 # up, which is the property being asserted.
-REPLAYED=""
+# Anything but `async`, rather than the exact string `sync`.
+#
+# The first version of this asserted sync_state = 'sync' and failed against a
+# working cluster. `method: any` is QUORUM-based synchronous replication, and
+# PostgreSQL reports those standbys as `quorum`; `sync` is what priority-based
+# `first` produces. Pinning the spelling tested which method was configured
+# rather than whether commits wait, which is the property that matters.
+#
+# The state is reported rather than reduced to yes/no, because "no" was all the
+# first failure said and it took a CI round trip to learn the word it wanted.
+SYNC_STATE=""
 for _ in $(seq 1 30); do
-  REPLAYED="$(psql_on_primary \
-    "SELECT CASE WHEN count(*) = 1 THEN 'yes' ELSE 'no' END
-       FROM pg_stat_replication WHERE sync_state = 'sync'" | tr -d ' \r\n')"
-  [ "$REPLAYED" = "yes" ] && break
+  SYNC_STATE="$(psql_on_primary \
+    "SELECT coalesce(string_agg(application_name || '=' || sync_state, ','), 'no-standby-connected')
+       FROM pg_stat_replication" | tr -d ' \r\n')"
+  case "$SYNC_STATE" in *=sync|*=quorum|*=sync,*|*=quorum,*) break ;; esac
   sleep 2
 done
-[ "$REPLAYED" = "yes" ] \
-  || { fail "no synchronous standby is connected (${REPLAYED}); a failover here could lose writes"; exit 1; }
-ok "the standby is replicating synchronously"
+case "$SYNC_STATE" in
+  *=sync*|*=quorum*)
+    ok "the standby is replicating synchronously (${SYNC_STATE})" ;;
+  *)
+    fail "no synchronous standby is connected (${SYNC_STATE}); a failover here could lose writes"
+    # What the server was actually told to wait for. Empty means the
+    # synchronous block never reached the Cluster, which is a different bug
+    # from a standby that has not connected yet.
+    note "synchronous_standby_names = [$(psql_on_primary "SHOW synchronous_standby_names" | tr -d '\r\n')]"
+    exit 1 ;;
+esac
 
 PRIMARY_POD="$(k get pods -n drigodb-databases \
   -l "drigodb.io/database-id=${HA_ID},cnpg.io/instanceRole=primary" \
