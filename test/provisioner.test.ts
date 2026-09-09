@@ -620,3 +620,84 @@ describe("ready means connectable", () => {
     expect(db.standby).toBe("ready");
   });
 });
+
+// Every patch this service sends needs the merge-patch content type, and a
+// mocked client will accept any of them — which is how resize shipped broken.
+//
+// The fake below records the OPTIONS argument, because that is where the bug
+// was: the request body was right, the URL was right, and the API server
+// rejected it for its content type alone.
+describe("patches declare their content type", () => {
+  function recordingProvisioner() {
+    const patches: Array<{ name?: string; options: unknown }> = [];
+    const notFound = () => Object.assign(new Error("not found"), { code: 404 });
+    const cluster = {
+      metadata: {
+        name: `db-${ID}`,
+        labels: { "drigodb.io/database-id": ID, "drigodb.io/external-id": EXT, "drigodb.io/tier": "small" },
+      },
+      spec: { instances: 1, storage: { size: "1Gi" } },
+      status: { readyInstances: 1 },
+    };
+    const objectsApi = {
+      getNamespacedCustomObject: async () => cluster,
+      listNamespacedCustomObject: async () => ({ items: [] }),
+      patchNamespacedCustomObject: async (req: { name?: string }, options: unknown) => {
+        patches.push({ name: req.name, options });
+        return {};
+      },
+    };
+    const core = {
+      listNamespacedPod: async () => ({
+        items: [{ status: { conditions: [{ type: "Ready", status: "True" }] } }],
+      }),
+      listNamespacedPersistentVolumeClaim: async () => ({ items: [] }),
+    };
+    const net = { createNamespacedNetworkPolicy: async () => ({}) };
+    const batch = { readNamespacedJob: async () => { throw notFound(); } };
+    return {
+      patches,
+      provisioner: new Provisioner(
+        {} as never, core as never, net as never, batch as never, objectsApi as never,
+      ),
+    };
+  }
+
+  // setHeaderOptions does not return a headers map — it returns middleware whose
+  // `pre` calls request.setHeaderParam. Running it against a stub request is the
+  // only way to assert the header that actually goes on the wire, rather than
+  // asserting that some options object was passed.
+  function contentType(options: unknown): string | undefined {
+    const middleware =
+      (options as { middleware?: Array<{ pre: (r: unknown) => unknown }> })?.middleware ?? [];
+    const headers: Record<string, string> = {};
+    const request = {
+      setHeaderParam: (k: string, v: string) => {
+        headers[k] = v;
+      },
+    };
+    for (const m of middleware) m.pre(request);
+    return headers["Content-Type"];
+  }
+
+  it("resize patches the Cluster as a merge patch", async () => {
+    // Without this, every resize on every cluster returned:
+    //   error decoding patch: json: cannot unmarshal object into Go value of
+    //   type []handlers.jsonPatchOp
+    const { provisioner, patches } = recordingProvisioner();
+    await provisioner.resize(ID, "medium");
+    expect(patches.length).toBeGreaterThan(0);
+    for (const p of patches) {
+      expect(contentType(p.options)).toBe("application/merge-patch+json");
+    }
+  });
+
+  it("scale patches the Cluster as a merge patch", async () => {
+    const { provisioner, patches } = recordingProvisioner();
+    await provisioner.scale(ID, 0);
+    expect(patches.length).toBeGreaterThan(0);
+    for (const p of patches) {
+      expect(contentType(p.options)).toBe("application/merge-patch+json");
+    }
+  });
+});

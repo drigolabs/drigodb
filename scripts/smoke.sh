@@ -495,6 +495,59 @@ else
   note "could not start the probe pods; skipping the NetworkPolicy check"
 fi
 
+step "Growing a database"
+# resize had NO end-to-end coverage at all, and was broken on every cluster from
+# the day the data plane moved to CloudNativePG: the Cluster patch was missing
+# its merge-patch content type, so the API server rejected it and every resize
+# returned 500.
+#
+# It survived because the only place this ran was kind, whose local-path
+# provisioner reports allowVolumeExpansion: false. A resize there cannot grow a
+# volume whatever drigodb sends, so there was nothing to notice.
+#
+# Hence two assertions rather than one. What the StorageClass allows decides
+# which applies, and neither can pass by accident: on a cluster that cannot
+# expand, the error must be ABOUT expansion — the content-type failure is not a
+# storage limitation and must not be read as one.
+SC="$(k get pvc "db-${DB_ID}-1" -n drigodb-databases -o jsonpath='{.spec.storageClassName}' 2>/dev/null)"
+CAN_EXPAND="$(k get storageclass "$SC" -o jsonpath='{.allowVolumeExpansion}' 2>/dev/null)"
+RESIZE="$(api -XPOST "localhost:${API_PORT}/v1/databases/${DB_ID}/resize" -d '{"tier":"medium"}')"
+case "$RESIZE" in
+  *jsonPatchOp*)
+    fail "resize sent the wrong patch content type — this is the bug, not a storage limitation"
+    fail "  ${RESIZE}"
+    exit 1 ;;
+esac
+
+if [ "$CAN_EXPAND" = "true" ]; then
+  GREW=""
+  for _ in $(seq 1 60); do
+    GREW="$(k get pvc "db-${DB_ID}-1" -n drigodb-databases -o jsonpath='{.status.capacity.storage}' 2>/dev/null)"
+    [ "$GREW" = "5Gi" ] && break
+    sleep 5
+  done
+  if [ "$GREW" = "5Gi" ]; then
+    ok "the volume grew to ${GREW} on ${SC}, online"
+  else
+    fail "${SC} allows expansion and the volume stayed at ${GREW}"
+    exit 1
+  fi
+  # Growing a volume must not cost the data on it.
+  case "$(psql_in_cluster "$URI" "SELECT proof FROM smoke")" in
+    *provisioned-by-api*) ok "the data survived the resize" ;;
+    *) fail "data did not survive the resize"; exit 1 ;;
+  esac
+else
+  # A refusal is the correct answer here, but only for the right reason.
+  case "$RESIZE" in
+    *xpansion*|*expand*)
+      note "${SC} cannot expand volumes; drigodb refused with the storage layer's own words" ;;
+    *)
+      fail "${SC} cannot expand, but the refusal does not mention expansion: ${RESIZE}"
+      exit 1 ;;
+  esac
+fi
+
 step "Backup and restore"
 # Skipped when this installation has nowhere to put a backup, which is what the
 # API says rather than something this script infers. An installation without
