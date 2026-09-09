@@ -518,6 +518,18 @@ export function buildCluster(
         // then the primary dies, writes accepted in that window can be lost.
         // The alternative is refusing to accept them at all, and a database that
         // stops on a single pod failure is not the product.
+        //
+        // synchronous_commit is deliberately NOT set here, which leaves
+        // PostgreSQL's default `on`: a commit waits for the standby to FLUSH the
+        // WAL to disk, not to replay it. That is exactly enough for the promise
+        // above, because a promoted standby replays what it holds — and the two
+        // servers are consequently not byte-identical at any instant.
+        //
+        // Do not "fix" that to remote_apply. It buys nothing today: the endpoint
+        // drigodb issues selects the primary, so nothing ever reads a standby.
+        // It becomes a real question the day read replicas are exposed, and it
+        // costs a replay round trip on every commit — which is a decision to
+        // make then, on the record, rather than a default to drift into.
         ...(highAvailability
           ? {
               synchronous: {

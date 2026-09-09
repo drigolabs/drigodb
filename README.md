@@ -347,6 +347,17 @@ drained or rolled, which would make turning this on *reduce* availability. The
 cost of that choice, stated plainly: if the standby is already gone and then the
 primary dies, writes accepted in that window can be lost.
 
+**Waiting means flushed, not applied.** A commit returns once the standby has
+written that WAL to its own disk; the standby has not necessarily replayed it
+into its data files yet. That is what makes the failover guarantee hold — a
+promoted standby replays what it holds, so no acknowledged write is lost — while
+leaving the two servers not byte-identical at any given instant. Nothing reads
+the standby today, because the endpoint drigodb issues selects the primary, so
+this is invisible until read replicas exist. When they do, a read served by a
+standby can miss a row its own primary has already acknowledged, and closing
+that gap means `synchronous_commit = remote_apply` and paying a replay round
+trip on every commit.
+
 **It cannot be turned on later.** A repeat `POST` returns the existing database
 and does not act on the flag; adding a standby to a live database is a different
 operation and is not built. Read the field rather than assume the request took.
