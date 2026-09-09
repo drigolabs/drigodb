@@ -191,12 +191,13 @@ export function validateExternalId(value: unknown): string {
 // service issued itself.
 export function validateRestoreFrom(
   value: unknown,
-): { databaseId: string; backupId?: string } | undefined {
+  now: Date = new Date(),
+): { databaseId: string; backupId?: string; targetTime?: string } | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== "object") {
     throw new ValidationError("restore_from must be an object");
   }
-  const v = value as { database_id?: unknown; backup_id?: unknown };
+  const v = value as { database_id?: unknown; backup_id?: unknown; target_time?: unknown };
   if (typeof v.database_id !== "string" || !/^[0-9a-f]{12}$/.test(v.database_id)) {
     throw new ValidationError("restore_from.database_id must be a database id");
   }
@@ -205,7 +206,83 @@ export function validateRestoreFrom(
       throw new ValidationError("restore_from.backup_id must be a backup id from GET /backups");
     }
   }
-  return { databaseId: v.database_id, ...(v.backup_id ? { backupId: v.backup_id } : {}) };
+
+  // Two ways of saying where to stop, and asking for both is a mistake rather
+  // than a combination. CloudNativePG would accept it — a backup id narrows
+  // which base backup the replay starts from — but a caller sending both
+  // usually means one of them, and guessing which is how a restore silently
+  // lands somewhere nobody asked for.
+  if (v.target_time !== undefined && v.backup_id !== undefined) {
+    throw new ValidationError(
+      "restore_from takes backup_id or target_time, not both: a backup id restores to that backup, a target time restores to that instant",
+    );
+  }
+
+  let targetTime: string | undefined;
+  if (v.target_time !== undefined) {
+    if (typeof v.target_time !== "string") {
+      throw new ValidationError("restore_from.target_time must be an RFC3339 timestamp");
+    }
+    const at = new Date(v.target_time);
+    if (Number.isNaN(at.getTime())) {
+      throw new ValidationError(
+        `restore_from.target_time is not a timestamp: ${v.target_time}`,
+      );
+    }
+    // A bare date, or a time with no zone, is the mistake worth catching here.
+    // `new Date("2026-09-09")` parses as midnight UTC and `new Date("2026-09-09
+    // 10:00")` as local time on whichever machine the control plane runs on —
+    // both succeed and both recover to an instant the caller did not name.
+    if (!/(?:Z|[+-]\d{2}:?\d{2})$/.test(v.target_time)) {
+      throw new ValidationError(
+        `restore_from.target_time must carry a UTC offset (RFC3339), so the instant does not depend on the server's timezone: ${v.target_time}`,
+      );
+    }
+    if (at.getTime() > now.getTime()) {
+      throw new ValidationError(
+        `restore_from.target_time is in the future: ${v.target_time}`,
+      );
+    }
+    // Re-serialised into PostgreSQL's timestamp format — a SPACE separator and
+    // an explicit +00:00 — rather than passed through as RFC3339.
+    //
+    // This looks like the wrong format to send an API that documents RFC3339,
+    // and it is deliberate. CloudNativePG does not forward this value: it runs
+    // it through machinery's ConvertToPostgresFormat, which parses RFC3339 and
+    // re-emits it with the Go layout `2006-01-02 15:04:05.000000Z07:00`. Go's
+    // `Z07:00` writes a literal `Z` at zero offset, so every UTC instant —
+    // however it was spelled on the way in, `Z` or `+00:00` — reaches
+    // PostgreSQL as `2026-09-08 23:03:26.389000Z`. PostgreSQL then refuses it:
+    //
+    //   LOG:   invalid value for parameter "recovery_target_time"
+    //   FATAL: configuration file "custom.conf" contains errors
+    //
+    // The instance never starts and the recovery Job retries until it gives up.
+    // Confirmed against the pinned PostgreSQL image: `postgres -C
+    // recovery_target_time -c recovery_target_time=<value>` accepts `+00:00`,
+    // `+02:00` and ` UTC`, and rejects both `Z` spellings — while `::timestamptz`
+    // accepts all of them, which is why this survives every test that checks the
+    // string is a valid timestamp.
+    //
+    // ConvertToPostgresFormat cannot parse a space-separated timestamp as
+    // RFC3339, so it returns this unchanged, which is the only way to get a
+    // usable value past it. machinery v0.4.0 fixed the underlying bug — "the Z
+    // suffix may not be tolerated in use, so prefer +00:00" — but CloudNativePG
+    // 1.27.0 pins v0.3.1, which has not. That fix also states that input already
+    // in PostgreSQL format is returned unchanged, so this keeps working after
+    // the operator pin moves and nothing here has to be remembered.
+    //
+    // Microseconds because that is the precision the format carries;
+    // JavaScript only has milliseconds, so the last three digits are zeros.
+    const iso = at.toISOString();
+    targetTime = `${iso.slice(0, 10)} ${iso.slice(11, 23)}000+00:00`;
+  }
+
+  return {
+    databaseId: v.database_id,
+    ...(v.backup_id ? { backupId: v.backup_id } : {}),
+    ...(targetTime ? { targetTime } : {}),
+  };
 }
 
 function idFor(externalId: string): string {
@@ -489,7 +566,7 @@ export class Provisioner {
   // leak database credentials.
   async create(
     externalId: string,
-    restoreFrom?: { databaseId: string; backupId?: string },
+    restoreFrom?: { databaseId: string; backupId?: string; targetTime?: string },
   ): Promise<{ database: Database; uri: string; created: boolean }> {
     const id = idFor(externalId);
     const password = newPassword();
@@ -934,9 +1011,48 @@ export class Provisioner {
   // name. CloudNativePG's recoveryTarget wants BARMAN's id, which only exists
   // once the backup completed. Translating here means the two identifiers a
   // consumer sees are the ones drigodb issued, and the operator's is internal.
+  // A target time with no completed backup before it cannot be recovered to.
+  //
+  // Checked here rather than left to the operator, because the failure is
+  // otherwise a Cluster that bootstraps, replays, gives up and reports it
+  // minutes later — by which point the caller has a database id, a 202 and a
+  // URI for something that will never come up. A 400 naming the earliest
+  // recoverable instant is the same information, at the moment it is useful.
+  //
+  // Only the base backups are consulted. WAL beyond the newest one is what
+  // makes recovery to an arbitrary instant possible in the first place, so
+  // there is no upper bound to check: a target time after the last backup is
+  // the ordinary case this feature exists for.
+  private async assertRecoverableTo(databaseId: string, targetTime: string): Promise<void> {
+    const backups = (await this.backupObjects(databaseId)).map(toBackup);
+    // When a backup FINISHED, not when it started. A base backup is only
+    // consistent at its end — that is the earliest instant WAL can replay
+    // forward from — so a target between a backup's start and stop is inside a
+    // window nothing can recover to, and checking against started_at would call
+    // it satisfiable.
+    const completed = backups
+      .filter((b) => b.status === "completed" && b.completed_at)
+      .map((b) => new Date(b.completed_at as string))
+      .filter((d) => !Number.isNaN(d.getTime()))
+      .sort((a, b) => a.getTime() - b.getTime());
+
+    if (completed.length === 0) {
+      throw new ValidationError(
+        `database ${databaseId} has no completed backup, so there is no point for WAL to replay from`,
+      );
+    }
+    const earliest = completed[0] as Date;
+    if (new Date(targetTime).getTime() < earliest.getTime()) {
+      throw new ValidationError(
+        `target_time ${targetTime} is before database ${databaseId}'s earliest backup completed (${earliest.toISOString()}), so there is nothing to replay from`,
+      );
+    }
+  }
+
   private async resolveRestore(from: {
     databaseId: string;
     backupId?: string;
+    targetTime?: string;
   }): Promise<RestoreSource> {
     if (!backupsEnabled()) {
       throw new NotConfiguredError(
@@ -947,7 +1063,11 @@ export class Provisioner {
     // somebody deleted is a legitimate thing to want, and its backups outlive
     // it in the bucket. What must exist is the backup, when one was named.
     if (!from.backupId) {
-      return { sourceCluster: clusterName(from.databaseId) };
+      if (from.targetTime) await this.assertRecoverableTo(from.databaseId, from.targetTime);
+      return {
+        sourceCluster: clusterName(from.databaseId),
+        ...(from.targetTime ? { targetTime: from.targetTime } : {}),
+      };
     }
     const backup = (await this.objects
       .getNamespacedCustomObject({
@@ -1009,6 +1129,17 @@ export class Provisioner {
     if (!backupsEnabled()) {
       throw new NotConfiguredError("backups are not configured for this installation");
     }
+    return (await this.backupObjects(id))
+      .map(toBackup)
+      .sort((a, b) => (a.started_at ?? "").localeCompare(b.started_at ?? ""));
+  }
+
+  // The Backup objects for a database, with no check that the database still
+  // exists. listBackups wants that check — asking for the backups of a database
+  // that is not there is a 404 — but a restore does not: recovering from a
+  // database somebody deleted is the case restore exists for, and its backups
+  // outlive it in the bucket.
+  private async backupObjects(id: string): Promise<CnpgBackup[]> {
     const list = (await this.objects.listNamespacedCustomObject({
       group: CNPG_GROUP,
       version: "v1",
@@ -1016,9 +1147,7 @@ export class Provisioner {
       plural: BACKUPS_PLURAL,
       labelSelector: `${DB_ID_LABEL}=${id}`,
     })) as { items?: CnpgBackup[] };
-    return (list.items ?? [])
-      .map(toBackup)
-      .sort((a, b) => (a.started_at ?? "").localeCompare(b.started_at ?? ""));
+    return list.items ?? [];
   }
 
   async delete(id: string): Promise<void> {

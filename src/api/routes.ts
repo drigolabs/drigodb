@@ -24,9 +24,15 @@ export function buildRoutes(provisioner: Provisioner): Hono {
   // and its own credentials. The one it was restored from is untouched, which
   // is what makes this the safe shape — an undo that cannot damage the thing
   // being undone.
+  //
+  // `target_time` recovers to an instant rather than to a backup (#19). WAL has
+  // been archived for every database since backups shipped, so this asks for
+  // something drigodb was already paying to keep and could not previously
+  // offer. Which instant is the caller's decision, which is the whole of
+  // drigodb's part in it (decision 0008).
   app.post("/v1/databases", async (c) => {
     let externalId: string;
-    let restoreFrom: { databaseId: string; backupId?: string } | undefined;
+    let restoreFrom: { databaseId: string; backupId?: string; targetTime?: string } | undefined;
     try {
       const body = await c.req.json().catch(() => ({}));
       externalId = validateExternalId((body as { external_id?: unknown }).external_id);

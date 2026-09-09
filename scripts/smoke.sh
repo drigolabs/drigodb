@@ -25,6 +25,27 @@ note() { printf "  ${YELLOW}…${RESET} %s\n" "$1"; }
 
 k() { kubectl --context "$CTX" "$@"; }
 
+# Why a database is not coming up.
+#
+# CloudNativePG bootstraps a restore in a Job, and when that Job fails the pod
+# holds the only account of it — PostgreSQL's own words, usually one FATAL line.
+# Nothing else has it: the Cluster reports a phase, the operator reports that it
+# created a Job, and `describe pod` reports `Error`. A restore that fails in CI
+# without this is a fifteen-minute round trip to learn a string the cluster
+# already had.
+explain_stuck_database() {
+  printf "  ${YELLOW}…${RESET} %s\n" "what ${1} was doing:"
+  k get cluster "db-${1}" -n drigodb-databases \
+    -o jsonpath='{range .status.conditions[*]}    {.type}={.status} {.reason} {.message}{"\n"}{end}' 2>/dev/null
+  # --tail so a long recovery does not bury the failure, and every pod of the
+  # Job because each retry is a new one and only the first has the real cause.
+  for pod in $(k get pods -n drigodb-databases \
+      -l "cnpg.io/cluster=db-${1}" -o name 2>/dev/null); do
+    printf "    ---- %s\n" "$pod"
+    k logs "$pod" -n drigodb-databases --all-containers --tail=40 2>&1 | sed 's/^/    /'
+  done
+}
+
 PIDS=()
 cleanup() {
   for p in "${PIDS[@]:-}"; do kill "$p" >/dev/null 2>&1 || true; done
@@ -442,7 +463,11 @@ else
     case "$R_STATE" in ready|failed) break ;; esac
     sleep 3
   done
-  [ "$R_STATE" = "ready" ] || { fail "restored database never became ready (${R_STATE})"; exit 1; }
+  if [ "$R_STATE" != "ready" ]; then
+    fail "restored database never became ready (${R_STATE})"
+    explain_stuck_database "$R_ID"
+    exit 1
+  fi
   ok "restored into ${R_ID}"
 
   # The assertion the whole feature turns on: the restore is the state AT the
@@ -462,6 +487,85 @@ else
     *before-backup*after-backup*) ok "the source database is untouched" ;;
     *) fail "the source lost data during a restore (${SRC_ROWS})"; exit 1 ;;
   esac
+
+  # Point in time, not just to a backup (#19).
+  #
+  # The assertion that matters is the one a restore-to-backup cannot make: two
+  # rows written AFTER the last backup, a target time between them, and only the
+  # first one present afterwards. A restore that replayed everything, or nothing,
+  # passes every other check in this file.
+  psql_in_cluster "$URI" "INSERT INTO bk VALUES (3,'before-target') ON CONFLICT DO NOTHING;" >/dev/null
+
+  # The DATABASE's clock, not the shell's. They are the same machine under kind
+  # and are not in general, and a target time taken from the wrong one is off by
+  # the skew — which is exactly the failure that looks like PITR not working.
+  # Formatted with an explicit Z: the API refuses a timestamp with no offset,
+  # because one resolves against whatever timezone the control plane runs in.
+  TARGET="$(psql_in_cluster "$URI" \
+    "SELECT to_char(now() AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')" | tr -d ' \r\n')"
+  case "$TARGET" in
+    ????-??-??T??:??:??.???Z) ok "target time ${TARGET}" ;;
+    *) fail "could not read a target time from the database (${TARGET})"; exit 1 ;;
+  esac
+
+  sleep 2
+  psql_in_cluster "$URI" "INSERT INTO bk VALUES (4,'after-target') ON CONFLICT DO NOTHING;" >/dev/null
+
+  # Force the segment out and wait for it to reach the bucket. Recovery can only
+  # replay WAL that was archived, so without this the target is inside a segment
+  # still open on the primary and the restore stops short of it — intermittently,
+  # depending on how much was written.
+  psql_in_cluster "$URI" "SELECT pg_switch_wal()" >/dev/null
+  ARCHIVED=""
+  for _ in $(seq 1 40); do
+    ARCHIVED="$(psql_in_cluster "$URI" \
+      "SELECT CASE WHEN last_archived_time > '${TARGET}'::timestamptz THEN 'yes' ELSE 'no' END
+         FROM pg_stat_archiver" | tr -d ' \r\n')"
+    [ "$ARCHIVED" = "yes" ] && break
+    sleep 3
+  done
+  [ "$ARCHIVED" = "yes" ] \
+    || { fail "no WAL was archived after the target time; the restore below could not reach it"; exit 1; }
+  ok "WAL past the target is archived"
+
+  PITR="$(api -XPOST "localhost:${API_PORT}/v1/databases" \
+    -d "{\"external_id\":\"${EXTERNAL_ID}-pitr\",\"restore_from\":{\"database_id\":\"${DB_ID}\",\"target_time\":\"${TARGET}\"}}")"
+  P_ID="$(echo "$PITR" | jqf '["id"]')"
+  P_URI="$(echo "$PITR" | jqf '["connection_uri"]')"
+  [ -n "$P_ID" ] || { fail "point-in-time restore was refused: ${PITR}"; exit 1; }
+  for _ in $(seq 1 90); do
+    P_STATE="$(api "localhost:${API_PORT}/v1/databases/${P_ID}" | jqf '["status"]')"
+    case "$P_STATE" in ready|failed) break ;; esac
+    sleep 3
+  done
+  if [ "$P_STATE" != "ready" ]; then
+    fail "point-in-time restore never became ready (${P_STATE})"
+    explain_stuck_database "$P_ID"
+    exit 1
+  fi
+
+  SAVED_DB_ID="$DB_ID"; DB_ID="$P_ID"
+  P_ROWS="$(psql_in_cluster "$P_URI" "SELECT string_agg(note, ',' ORDER BY id) FROM bk")"
+  DB_ID="$SAVED_DB_ID"
+  case "$P_ROWS" in
+    *after-target*) fail "recovered PAST the target time: ${P_ROWS}"; exit 1 ;;
+    *before-target*) ok "recovered to ${TARGET}, which is after the last backup and before the last write" ;;
+    *) fail "point-in-time restore stopped short of the target (${P_ROWS})"; exit 1 ;;
+  esac
+
+  # A target before any backup finished cannot be replayed to, and saying so now
+  # is the difference between a 400 and a database that fails minutes later.
+  EARLY="$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" \
+    -H 'content-type: application/json' -XPOST "localhost:${API_PORT}/v1/databases" \
+    -d "{\"external_id\":\"${EXTERNAL_ID}-early\",\"restore_from\":{\"database_id\":\"${DB_ID}\",\"target_time\":\"2020-01-01T00:00:00Z\"}}")"
+  if [ "$EARLY" = "400" ]; then
+    ok "a target before the earliest backup is refused up front"
+  else
+    fail "a target before the earliest backup returned ${EARLY}, not 400"
+    exit 1
+  fi
+
+  api -XDELETE "localhost:${API_PORT}/v1/databases/${P_ID}" >/dev/null 2>&1 || true
 
   # Restoring someone else's backup is reading their data. A 400 here is a
   # security property, not a validation nicety.

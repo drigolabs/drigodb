@@ -22,6 +22,12 @@ import {
 } from "../src/k8s/manifests.js";
 import { ValidationError, validateExternalId } from "../src/k8s/provisioner.js";
 
+// buildCluster's bootstrap is a union — initdb for a new database, recovery for
+// a restored one. These tests are all about the second arm.
+type RecoveryBootstrap = {
+  recovery: { recoveryTarget?: { backupID?: string; targetTime?: string } };
+};
+
 const ID = "a1b2c3d4e5f6";
 const EXT = "openvoid-app-01JQ";
 
@@ -289,6 +295,39 @@ describe("backups", () => {
     // recovery is the archive, not the backup.
     const m = await withBackups();
     expect(m.buildCluster(ID, EXT).spec.plugins?.[0]?.isWALArchiver).toBe(true);
+  });
+
+  it("recovers to an instant when given one, and lets the operator pick the base backup", async () => {
+    // The CRD is explicit that an empty backupID means "the operator will
+    // automatically detect the backup based on targetTime", which is a better
+    // choice than a caller could make — so a target time must NOT also pin a
+    // backup id.
+    const m = await withBackups();
+    const rec = m.buildCluster(ID, EXT, "small", {
+      sourceCluster: `db-${ID}`,
+      targetTime: "2026-09-09 07:30:00.000000+00:00",
+    }).spec.bootstrap as RecoveryBootstrap;
+    expect(rec.recovery.recoveryTarget?.targetTime).toBe("2026-09-09 07:30:00.000000+00:00");
+    expect(rec.recovery.recoveryTarget).not.toHaveProperty("backupID");
+  });
+
+  it("recovers to a backup when given one, and names no time", async () => {
+    const m = await withBackups();
+    const rec = m.buildCluster(ID, EXT, "small", {
+      sourceCluster: `db-${ID}`,
+      barmanBackupId: "20260907T071816",
+    }).spec.bootstrap as RecoveryBootstrap;
+    expect(rec.recovery.recoveryTarget?.backupID).toBe("20260907T071816");
+    expect(rec.recovery.recoveryTarget).not.toHaveProperty("targetTime");
+  });
+
+  it("recovers to the latest state when given neither", async () => {
+    // No recoveryTarget at all, which is what replays every archived segment.
+    const m = await withBackups();
+    const rec = m.buildCluster(ID, EXT, "small", { sourceCluster: `db-${ID}` })
+      .spec.bootstrap as RecoveryBootstrap;
+    expect(rec.recovery).toBeDefined();
+    expect(rec.recovery).not.toHaveProperty("recoveryTarget");
   });
 
   it("asks the operator for a backup rather than reaching for the bucket", async () => {
