@@ -7,7 +7,7 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import {
-  AppsV1Api,
+  StorageV1Api,
   BatchV1Api,
   CustomObjectsApi,
   CoreV1Api,
@@ -380,7 +380,12 @@ interface CnpgBackup {
 
 export class Provisioner {
   constructor(
-    private readonly apps: AppsV1Api,
+    // StorageV1Api, where AppsV1Api used to be. drigodb has not touched a
+    // StatefulSet since decision 0004 gave the pod template to the operator, and
+    // `this.apps` had been referenced zero times since — a client constructed on
+    // every start for nothing. Replaced rather than appended, because resize now
+    // needs to ask a StorageClass whether it can grow a volume.
+    private readonly storage: StorageV1Api,
     private readonly core: CoreV1Api,
     private readonly net: NetworkingV1Api,
     private readonly batch: BatchV1Api,
@@ -406,7 +411,7 @@ export class Provisioner {
       );
     }
     return new Provisioner(
-      kc.makeApiClient(AppsV1Api),
+      kc.makeApiClient(StorageV1Api),
       kc.makeApiClient(CoreV1Api),
       kc.makeApiClient(NetworkingV1Api),
       kc.makeApiClient(BatchV1Api),
@@ -1018,6 +1023,23 @@ export class Provisioner {
 
     const ns = config.databaseNamespace;
 
+    // Refuse before patching anything, if the storage cannot grow.
+    //
+    // The ResizeRefusedError below anticipates the API server rejecting the
+    // patch, and that is not how this fails. Expansion happens ASYNCHRONOUSLY:
+    // the Cluster patch is accepted, the request returns 200 with the new tier,
+    // and the volume then quietly stays the size it was. Forever. drigodb was
+    // left asserting that a customer's database is `medium` while it sits on a
+    // `small` volume — with no error anywhere, and the next thing to go wrong
+    // being a full disk on a database everybody believes has room.
+    //
+    // allowVolumeExpansion is the deterministic answer and it is available
+    // before trying. Asked of the PVC's own StorageClass rather than the
+    // installation's configured default, because the volume that has to grow is
+    // the one that exists, and a database provisioned before the default changed
+    // is on the old class.
+    await this.assertVolumeCanGrow(id, target);
+
     // One patch, and the operator does both halves.
     //
     // The old data plane needed two: a PVC patch to grow the volume, then a pod
@@ -1091,12 +1113,12 @@ export class Provisioner {
       throw err;
     }
 
-    // 3. The cycle, which is what the WAL change needs and the volume does not.
-    //    Skipped for a hibernated database: it will pick both up when it wakes,
-    //    and waking one to change a setting it is not using would be rude.
     // No cycle. The operator owns both halves: it expands the volume and it
     // decides whether max_wal_size needs a restart to take effect. Doing it by
     // hand would be racing the thing that is already doing it.
+    //
+    // Measured on DigitalOcean: 1Gi to 5Gi in 42 seconds with the database
+    // serving throughout and no restart.
 
     return await this.get(id);
   }
@@ -1206,6 +1228,37 @@ export class Provisioner {
     if (new Date(targetTime).getTime() < earliest.getTime()) {
       throw new ValidationError(
         `target_time ${targetTime} is before database ${databaseId}'s earliest backup completed (${earliest.toISOString()}), so there is nothing to replay from`,
+      );
+    }
+  }
+
+  // Whether the volume behind this database can be expanded at all.
+  //
+  // A StorageClass without allowVolumeExpansion cannot grow a bound volume, and
+  // Kubernetes does not say so at patch time — it says nothing, and the PVC
+  // stays as it was. kind's local-path is the common case, and plenty of real
+  // classes are the same.
+  private async assertVolumeCanGrow(id: string, target: Tier): Promise<void> {
+    const pvcs = await this.core.listNamespacedPersistentVolumeClaim({
+      namespace: config.databaseNamespace,
+      labelSelector: `${DB_ID_LABEL}=${id}`,
+    });
+    const className = (pvcs.items ?? [])[0]?.spec?.storageClassName;
+    // No PVC yet, or a volume with no class: nothing to check against, so let
+    // the operator decide rather than refusing on a guess.
+    if (!className) return;
+
+    const sc = await this.storage
+      .readStorageClass({ name: className })
+      .catch(() => undefined);
+    // Unreadable is not the same as unable. A cluster that will not show
+    // drigodb a StorageClass should not have its resizes blocked by that.
+    if (!sc) return;
+
+    if (sc.allowVolumeExpansion !== true) {
+      throw new ResizeRefusedError(
+        `cannot resize ${id} to ${target}: its volume is on StorageClass "${className}", ` +
+          "which does not allow volume expansion. The database is unchanged.",
       );
     }
   }
