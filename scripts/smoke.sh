@@ -779,6 +779,17 @@ for _ in $(seq 1 90); do
 done
 if [ "$HA_STANDBY" = "ready" ]; then
   ok "${HA_ID} has a standby, and the API says so"
+  # Archiving has to be healthy for the failover below to be the case anyone
+  # cares about. With it broken the demoted primary cannot rejoin and the pair
+  # never re-protects — reported as `blocked` rather than `unavailable` (#116).
+  # Asserting it here so a run on a cluster with a bad bucket says THAT rather
+  # than failing later for a reason that looks unrelated.
+  HA_ARCHIVING="$(api "localhost:${API_PORT}/v1/databases/${HA_ID}" | jqf '["archiving"]' 2>/dev/null || echo "")"
+  case "$HA_ARCHIVING" in
+    healthy) ok "WAL archiving is healthy, so a demoted primary can rejoin" ;;
+    failing) fail "WAL archiving is failing — a failover here would not heal; fix the bucket first"; exit 1 ;;
+    *)       note "no archiving state reported (backups ${BACKUPS_STATE}); the failover below still stands" ;;
+  esac
 else
   fail "the standby never became ready (${HA_STANDBY})"
   explain_stuck_database "$HA_ID"

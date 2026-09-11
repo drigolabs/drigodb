@@ -111,8 +111,10 @@ sequenceDiagram
     Svc->>S: now selected
 
     P->>P: restarts, sees it is no longer primary
+    P->>P: archives the WAL it wrote before demotion
     P->>S: rejoins as the standby
-    Note over P,S: Nobody asked for this. instances is desired<br/>state and CloudNativePG converges on it, so<br/>the pair heals itself and the promoted<br/>standby simply stays primary. No failback.
+    Note over P,S: Nobody asked for this. Measured at 21s from<br/>the kill, with the ORIGINAL pod rejoining<br/>rather than being rebuilt. The promoted<br/>standby stays primary. No failback.
+    Note over P,S: The archive step is load-bearing. If WAL<br/>cannot reach the bucket the demoted instance<br/>never rejoins, and the API says standby:<br/>blocked rather than unavailable.
 
     App->>Svc: connect (SAME URI, unchanged)
     Svc->>S: routed
@@ -149,7 +151,8 @@ sequenceDiagram
 | `status` | `high_availability` | `standby` | What is true |
 |---|---|---|---|
 | `provisioning` | `true` | absent | no instance ready yet |
-| `ready` | `true` | `unavailable` | serving on one instance; commits are not waiting for anyone |
+| `ready` | `true` | `unavailable` | serving on one instance, standby being rebuilt — back on its own in ~21s |
+| `ready` | `true` | `blocked` | serving on one instance and it will STAY that way: the demoted instance cannot archive its WAL, so it cannot rejoin. `archiving: "failing"` says why |
 | `ready` | `true` | `ready` | serving, and every commit is on two disks |
 | `hibernated` | `true` | absent | switched off on purpose — not a fault, and deliberately not reported as one |
 | `ready` | `false` | absent | one instance, and that is what was asked for |

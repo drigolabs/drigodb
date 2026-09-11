@@ -28,6 +28,7 @@ import {
   BACKUPS_PLURAL,
   CLUSTERS_PLURAL,
   DB_USER,
+  CNPG_ARCHIVING_CONDITION,
   CNPG_GROUP,
   CNPG_HIBERNATION_ANNOTATION,
   CREDENTIAL_VERSION_ANNOTATION,
@@ -85,8 +86,22 @@ export type Database = {
   // that believes it is protected while its standby is gone is the worst of the
   // three states. `high_availability` is what was asked for and never changes;
   // `standby` is what is true this second.
+  //
+  // `blocked` is the third value and the reason this field is not a boolean: a
+  // standby that is being rebuilt comes back on its own in about twenty seconds,
+  // and one that cannot archive WAL never comes back at all. Measured — see the
+  // comment on archivingOf. Both look identical from outside, and only one is
+  // something to act on.
   high_availability: boolean;
-  standby?: "ready" | "unavailable";
+  standby?: "ready" | "unavailable" | "blocked";
+  // Whether WAL is actually reaching the bucket, when this installation has one.
+  //
+  // Separate from `backups`, which says only that a destination is CONFIGURED.
+  // An installation can be configured and failing every write, and until this
+  // existed nothing said so: the database serves, commits succeed, and the only
+  // evidence is in pg_stat_archiver and the Backup objects. A misconfigured
+  // credential cost a whole debugging session precisely because this was silent.
+  archiving?: "healthy" | "failing";
   tier: Tier;
   endpoint: string;
   port: number;
@@ -113,6 +128,10 @@ interface CnpgCluster {
   status?: {
     readyInstances?: number;
     phase?: string;
+    // CloudNativePG's own verdict on whether WAL is reaching the bucket. The
+    // type is `ContinuousArchiving` and it is the only place this is visible
+    // without asking a database directly, which drigodb cannot do.
+    conditions?: Array<{ type?: string; status?: string; reason?: string; message?: string }>;
     managedRolesStatus?: {
       passwordStatus?: Record<string, { resourceVersion?: string }>;
     };
@@ -419,11 +438,34 @@ export class Provisioner {
   // reason statusOf counts them: status.readyInstances is not zeroed on
   // hibernation and cannot be trusted, and the pods carry drigodb's own labels
   // through inheritedMetadata.
+  // Whether WAL is reaching the bucket, as CloudNativePG sees it.
+  //
+  // Read from the Cluster's `ContinuousArchiving` condition, which the operator
+  // maintains and which is the only view of this drigodb can have: it holds no
+  // object-storage credential and never connects to a hosted database, so it
+  // cannot check the bucket or read pg_stat_archiver itself.
+  //
+  // Absent rather than "healthy" when this installation has nowhere to put a
+  // backup, and absent until the condition exists. Reporting healthy for
+  // something nobody is doing would be a lie of exactly the kind this field was
+  // added to stop.
+  private archivingOf(cluster: CnpgCluster): "healthy" | "failing" | undefined {
+    if (!backupsEnabled()) return undefined;
+    const c = (cluster.status?.conditions ?? []).find(
+      (x) => x.type === CNPG_ARCHIVING_CONDITION,
+    );
+    if (!c?.status) return undefined;
+    return c.status === "True" ? "healthy" : "failing";
+  }
+
   private async availabilityOf(
     id: string,
     labels: Record<string, string>,
     cluster: CnpgCluster,
-  ): Promise<{ high_availability: boolean; standby?: "ready" | "unavailable" }> {
+  ): Promise<{
+    high_availability: boolean;
+    standby?: "ready" | "unavailable" | "blocked";
+  }> {
     const wanted = cluster.spec?.instances ?? 1;
     if (wanted < 2) return { high_availability: false };
 
@@ -432,9 +474,27 @@ export class Provisioner {
     // looking for a fault that is not there.
     if (labels[HIBERNATED_LABEL] === "true") return { high_availability: true };
 
+    if ((await this.readyInstances(id)) >= wanted) {
+      return { high_availability: true, standby: "ready" };
+    }
+
+    // A standby that is missing, and whether it is coming back.
+    //
+    // These two states look identical from outside and are not remotely the
+    // same thing. Measured on a cluster: with WAL archiving healthy, a killed
+    // primary is demoted, rejoins as the standby, and the pair is protected
+    // again 21 seconds later, untouched. With archiving failing it NEVER comes
+    // back — the demoted instance holds WAL it wrote before demotion, it must
+    // archive that before it can rejoin, and it cannot. Seven minutes in, the
+    // database still reported `ready` with no standby, and would have reported
+    // that forever.
+    //
+    // So the difference is "wait twenty seconds" against "nothing will fix this
+    // without you". A caller cannot infer which from a database that is serving
+    // normally, and drigodb can, so it says.
     return {
       high_availability: true,
-      standby: (await this.readyInstances(id)) >= wanted ? "ready" : "unavailable",
+      standby: this.archivingOf(cluster) === "failing" ? "blocked" : "unavailable",
     };
   }
 
@@ -530,6 +590,7 @@ export class Provisioner {
       // instances IS the desired state, and there is nothing for a label to
       // know that the spec does not.
       ...(await this.availabilityOf(id, labels, cluster)),
+      ...(this.archivingOf(cluster) ? { archiving: this.archivingOf(cluster) } : {}),
       tier: tierOf(labels),
       endpoint: endpointHost(id),
       port: POSTGRES_PORT,

@@ -87,6 +87,11 @@ export const BARMAN_PLUGIN = "barman-cloud.cloudnative-pg.io";
 // to one manifest — nothing outside it ever sees this string.
 export const RESTORE_SOURCE_NAME = "origin";
 
+// The Cluster condition CloudNativePG uses to report whether WAL archiving is
+// working. Its reasons are ContinuousArchivingSuccess and
+// ContinuousArchivingFailing; drigodb reads only the status.
+export const CNPG_ARCHIVING_CONDITION = "ContinuousArchiving";
+
 export const CNPG_NAMESPACE = "cnpg-system";
 export const CNPG_STATUS_PORT = 8000;
 

@@ -333,13 +333,30 @@ does not reconnect sees an error.** Anything with a connection pool and retries
 rides through it; anything that treats one failed connection as fatal does not.
 What is guaranteed is the address and the data, not the socket.
 
-**Nothing needs to be done afterwards.** A failed instance is recreated by
-CloudNativePG, not by the caller — `instances: 2` is desired state and the
-operator converges on it. The old primary restarts, notices it is no longer the
-primary and rejoins as the standby, and a standby that dies is replaced on its
-own. The promoted standby stays primary; there is no failback, and no reason to
-want one. `standby: "unavailable"` is therefore information, not a task: it says
-you are temporarily unprotected, not that somebody must act.
+**Nothing needs to be done afterwards — as long as WAL archiving works.** A
+failed instance is recreated by CloudNativePG, not by the caller: `instances: 2`
+is desired state and the operator converges on it. The old primary restarts,
+notices it is no longer the primary and rejoins as the standby. Measured on
+DigitalOcean: 9 seconds to serve again on the same URI, and **21 seconds to be
+protected again**, with the original pod rejoining rather than being rebuilt.
+The promoted standby stays primary; there is no failback, and no reason to want
+one.
+
+**The condition on that sentence is real, and the API reports it.** A demoted
+primary holds WAL it wrote before demotion and must archive it before it can
+rejoin. If archiving is failing — a wrong key, a deleted bucket, a changed
+policy — it never rejoins, and the database sits on one instance reporting
+`ready` indefinitely. That is why a missing standby has two values rather than
+one:
+
+```
+standby: "unavailable"    it is being rebuilt; wait
+standby: "blocked"        it cannot come back without you
+archiving: "failing"      why
+```
+
+`unavailable` is information. **`blocked` is a task**, and the thing to fix is
+the object storage, not the database.
 
 `GET /v1/databases/{id}` reports two things, because they answer different
 questions:
@@ -347,7 +364,13 @@ questions:
 ```
 high_availability: true       what was asked for; never changes
 standby: "ready"              what is true this second
+archiving: "healthy"          whether WAL is reaching the bucket
 ```
+
+`archiving` is reported for any database when the installation has somewhere to
+back up to, not only a highly available one. It is separate from `backups`,
+which says a destination is *configured* — an installation can be configured and
+failing every write, and nothing used to say so.
 
 A database with `standby: "unavailable"` is serving and unprotected, which is
 the state worth being able to see. A hibernated database reports no `standby` at
