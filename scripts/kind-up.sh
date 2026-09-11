@@ -15,6 +15,11 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# MinIO's pinned versions live with every other upstream pin, so a bump is one
+# edit in one file. Sourced here because kind-up.sh is the only script that runs
+# MinIO at all.
+# shellcheck disable=SC1091
+source "${ROOT}/scripts/versions.env"
 CLUSTER="${DRIGODB_KIND_CLUSTER:-drigodb}"
 LOCAL=0
 BACKUPS=0
@@ -82,7 +87,9 @@ if [ "$BACKUPS" = 1 ]; then
   # After the chart, because the chart owns the drigodb-databases namespace and
   # Helm refuses to adopt one something else created: "invalid ownership
   # metadata", which reads like a chart bug and is not one.
-  kubectl --context "$CTX" apply -n drigodb-databases -f - >/dev/null <<'YAML'
+  # Heredoc unquoted, so MINIO_VERSION expands. Nothing else in the block uses
+  # `$`, which is what makes that safe.
+  kubectl --context "$CTX" apply -n drigodb-databases -f - >/dev/null <<YAML
 apiVersion: apps/v1
 kind: Deployment
 metadata: { name: minio, labels: { app: minio } }
@@ -94,7 +101,7 @@ spec:
     spec:
       containers:
         - name: minio
-          image: minio/minio
+          image: quay.io/minio/minio:${MINIO_VERSION}
           args: ["server", "/data"]
           env:
             - { name: MINIO_ROOT_USER, value: drigodb }
@@ -112,7 +119,7 @@ YAML
 
   # The bucket has to exist; barman does not create it.
   kubectl --context "$CTX" -n drigodb-databases delete pod drigodb-mkbucket --ignore-not-found >/dev/null 2>&1
-  kubectl --context "$CTX" -n drigodb-databases run drigodb-mkbucket --restart=Never --quiet --image=minio/mc \
+  kubectl --context "$CTX" -n drigodb-databases run drigodb-mkbucket --restart=Never --quiet --image="quay.io/minio/mc:${MINIO_MC_VERSION}" \
     --command -- sh -c "mc alias set m http://minio:9000 drigodb drigodb-local-only && mc mb -p m/drigodb" >/dev/null
   kubectl --context "$CTX" -n drigodb-databases wait --for=jsonpath='{.status.phase}'=Succeeded \
     pod/drigodb-mkbucket --timeout=180s >/dev/null 2>&1
