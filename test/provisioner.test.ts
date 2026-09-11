@@ -701,3 +701,128 @@ describe("patches declare their content type", () => {
     }
   });
 });
+
+// A standby that is coming back, and one that never will, look identical from
+// outside. Measured on a cluster: healthy archiving re-protects the pair in 21
+// seconds; failing archiving never does, because the demoted instance cannot
+// archive the WAL it wrote before demotion and cannot rejoin until it has.
+describe("a standby that cannot return says so", () => {
+  async function withBackupsAndCluster(opts: {
+    instances: number;
+    readyPods: number;
+    archiving?: "True" | "False";
+    hibernated?: boolean;
+  }) {
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_BACKUP_OBJECT_STORE", "drigodb-api-backups");
+    const { Provisioner: P } = await import("../src/k8s/provisioner.js");
+    const notFound = () => Object.assign(new Error("not found"), { code: 404 });
+    const labels: Record<string, string> = {
+      "drigodb.io/database-id": ID,
+      "drigodb.io/external-id": EXT,
+      ...(opts.hibernated ? { "drigodb.io/hibernated": "true" } : {}),
+    };
+    const objectsApi = {
+      getNamespacedCustomObject: async () => ({
+        metadata: { name: `db-${ID}`, labels },
+        spec: { instances: opts.instances },
+        status: {
+          phase: "Cluster in healthy state",
+          ...(opts.archiving
+            ? { conditions: [{ type: "ContinuousArchiving", status: opts.archiving }] }
+            : {}),
+        },
+      }),
+      listNamespacedCustomObject: async () => ({ items: [] }),
+    };
+    const core = {
+      // Honours the selector: readiness counts primaries, the standby count
+      // counts every instance, and conflating them is its own bug.
+      listNamespacedPod: async (req: { labelSelector: string }) => {
+        const n = req.labelSelector.includes("instanceRole=primary")
+          ? Math.min(opts.readyPods, 1)
+          : opts.readyPods;
+        return {
+          items: Array.from({ length: n }, () => ({
+            status: { conditions: [{ type: "Ready", status: "True" }] },
+          })),
+        };
+      },
+      listNamespacedPersistentVolumeClaim: async () => ({ items: [] }),
+    };
+    const net = { createNamespacedNetworkPolicy: async () => ({}) };
+    const batch = { readNamespacedJob: async () => { throw notFound(); } };
+    return new P(
+      {} as never, core as never, net as never, batch as never, objectsApi as never,
+    ).get(ID);
+  }
+
+  it("calls a missing standby `blocked` when WAL archiving is failing", async () => {
+    // The state that never resolves. Reporting it as `unavailable` tells a
+    // caller to wait for something that is not coming.
+    const db = await withBackupsAndCluster({ instances: 2, readyPods: 1, archiving: "False" });
+    expect(db.status).toBe("ready");
+    expect(db.standby).toBe("blocked");
+    expect(db.archiving).toBe("failing");
+  });
+
+  it("calls it `unavailable` when archiving is healthy", async () => {
+    // The ordinary case: a standby being rebuilt, back on its own.
+    const db = await withBackupsAndCluster({ instances: 2, readyPods: 1, archiving: "True" });
+    expect(db.standby).toBe("unavailable");
+    expect(db.archiving).toBe("healthy");
+  });
+
+  it("does not call a healthy pair blocked, whatever archiving says", async () => {
+    const db = await withBackupsAndCluster({ instances: 2, readyPods: 2, archiving: "False" });
+    expect(db.standby).toBe("ready");
+  });
+
+  it("says nothing about a hibernated database's standby", async () => {
+    const db = await withBackupsAndCluster({
+      instances: 2, readyPods: 0, archiving: "False", hibernated: true,
+    });
+    expect(db.status).toBe("hibernated");
+    expect(db).not.toHaveProperty("standby");
+  });
+
+  it("reports no archiving state at all when the condition is absent", async () => {
+    // Before the operator has looked. Reporting `healthy` here would be a guess.
+    const db = await withBackupsAndCluster({ instances: 1, readyPods: 1 });
+    expect(db).not.toHaveProperty("archiving");
+  });
+
+  it("reports no archiving state when the installation has nowhere to back up to", async () => {
+    // unstub first: vi.stubEnv outlives the test that set it, so without this
+    // the module reloads with the previous test's bucket still configured and
+    // the assertion below passes or fails for the wrong reason.
+    vi.unstubAllEnvs();
+    vi.resetModules();
+    const { Provisioner: P } = await import("../src/k8s/provisioner.js");
+    const notFound = () => Object.assign(new Error("not found"), { code: 404 });
+    const objectsApi = {
+      getNamespacedCustomObject: async () => ({
+        metadata: {
+          name: `db-${ID}`,
+          labels: { "drigodb.io/database-id": ID, "drigodb.io/external-id": EXT },
+        },
+        spec: { instances: 1 },
+        status: { conditions: [{ type: "ContinuousArchiving", status: "True" }] },
+      }),
+      listNamespacedCustomObject: async () => ({ items: [] }),
+    };
+    const core = {
+      listNamespacedPod: async () => ({
+        items: [{ status: { conditions: [{ type: "Ready", status: "True" }] } }],
+      }),
+      listNamespacedPersistentVolumeClaim: async () => ({ items: [] }),
+    };
+    const net = { createNamespacedNetworkPolicy: async () => ({}) };
+    const batch = { readNamespacedJob: async () => { throw notFound(); } };
+    const db = await new P(
+      {} as never, core as never, net as never, batch as never, objectsApi as never,
+    ).get(ID);
+    expect(db.backups).toBe("unavailable");
+    expect(db).not.toHaveProperty("archiving");
+  });
+});
