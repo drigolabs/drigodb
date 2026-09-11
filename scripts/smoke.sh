@@ -501,32 +501,47 @@ step "Growing a database"
 # its merge-patch content type, so the API server rejected it and every resize
 # returned 500.
 #
-# It survived because the only place this ran was kind, whose local-path
-# provisioner reports allowVolumeExpansion: false. A resize there cannot grow a
-# volume whatever drigodb sends, so there was nothing to notice.
+# The assertion that works everywhere is that the PATCH LANDED — the Cluster's
+# own spec now says the new size. That is the thing the bug broke, and it is
+# true on any cluster regardless of what its storage can do.
 #
-# Hence two assertions rather than one. What the StorageClass allows decides
-# which applies, and neither can pass by accident: on a cluster that cannot
-# expand, the error must be ABOUT expansion — the content-type failure is not a
-# storage limitation and must not be read as one.
+# Whether the VOLUME then grows is the storage layer's business and not every
+# cluster can. kind's local-path cannot, and the first version of this step
+# assumed that meant drigodb would refuse — it does not. The patch is accepted,
+# the API returns the database as medium, and the volume quietly stays at 1Gi,
+# because expansion happens asynchronously and the failure never reaches the
+# request. So the second assertion is conditional, and where it does not apply
+# the run says so out loud rather than skipping silently.
 SC="$(k get pvc "db-${DB_ID}-1" -n drigodb-databases -o jsonpath='{.spec.storageClassName}' 2>/dev/null)"
 CAN_EXPAND="$(k get storageclass "$SC" -o jsonpath='{.allowVolumeExpansion}' 2>/dev/null)"
 RESIZE="$(api -XPOST "localhost:${API_PORT}/v1/databases/${DB_ID}/resize" -d '{"tier":"medium"}')"
+
+# The bug this step exists for, named explicitly so it can never be mistaken for
+# a storage limitation.
 case "$RESIZE" in
   *jsonPatchOp*)
-    fail "resize sent the wrong patch content type — this is the bug, not a storage limitation"
+    fail "resize sent the wrong patch content type — the patch never reached the Cluster"
     fail "  ${RESIZE}"
     exit 1 ;;
 esac
+
+WANT_SIZE=5Gi
+SPEC_SIZE="$(k get cluster "db-${DB_ID}" -n drigodb-databases -o jsonpath='{.spec.storage.size}' 2>/dev/null)"
+if [ "$SPEC_SIZE" = "$WANT_SIZE" ]; then
+  ok "the resize reached the Cluster — spec.storage.size is ${SPEC_SIZE}"
+else
+  fail "the Cluster still says ${SPEC_SIZE}, so the patch did not land: ${RESIZE}"
+  exit 1
+fi
 
 if [ "$CAN_EXPAND" = "true" ]; then
   GREW=""
   for _ in $(seq 1 60); do
     GREW="$(k get pvc "db-${DB_ID}-1" -n drigodb-databases -o jsonpath='{.status.capacity.storage}' 2>/dev/null)"
-    [ "$GREW" = "5Gi" ] && break
+    [ "$GREW" = "$WANT_SIZE" ] && break
     sleep 5
   done
-  if [ "$GREW" = "5Gi" ]; then
+  if [ "$GREW" = "$WANT_SIZE" ]; then
     ok "the volume grew to ${GREW} on ${SC}, online"
   else
     fail "${SC} allows expansion and the volume stayed at ${GREW}"
@@ -538,14 +553,12 @@ if [ "$CAN_EXPAND" = "true" ]; then
     *) fail "data did not survive the resize"; exit 1 ;;
   esac
 else
-  # A refusal is the correct answer here, but only for the right reason.
-  case "$RESIZE" in
-    *xpansion*|*expand*)
-      note "${SC} cannot expand volumes; drigodb refused with the storage layer's own words" ;;
-    *)
-      fail "${SC} cannot expand, but the refusal does not mention expansion: ${RESIZE}"
-      exit 1 ;;
-  esac
+  # Not a pass and not a failure: the mechanism drigodb owns worked, and the one
+  # it does not own is absent here. Said plainly, because a database reported as
+  # `medium` on a 1Gi volume is a real gap and this is where somebody will read
+  # about it — see the issue this note names.
+  note "${SC} does not allow volume expansion, so the volume stays at its original size"
+  note "  drigodb still reports this database as medium — see issue #117"
 fi
 
 step "Backup and restore"
