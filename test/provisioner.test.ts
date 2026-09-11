@@ -16,6 +16,7 @@ import {
   DeletionInFlightError,
   NotFoundError,
   Provisioner,
+  ResizeRefusedError,
   ValidationError,
   validateHighAvailability,
   validateRestoreFrom,
@@ -824,5 +825,103 @@ describe("a standby that cannot return says so", () => {
     ).get(ID);
     expect(db.backups).toBe("unavailable");
     expect(db).not.toHaveProperty("archiving");
+  });
+});
+
+// A resize the storage cannot perform used to be reported as success.
+//
+// Expansion is asynchronous: the Cluster patch is accepted, the API returns the
+// new tier, and the volume then stays the size it was — permanently, with no
+// error anywhere. drigodb was left asserting a database is `medium` while it sits
+// on a `small` volume, and the next thing to go wrong is a full disk on a
+// database everyone believes has room.
+describe("resize refuses what the storage cannot do", () => {
+  function provisionerOn(opts: {
+    className?: string;
+    allowExpansion?: boolean;
+    readable?: boolean;
+  }) {
+    const patches: string[] = [];
+    const notFound = () => Object.assign(new Error("not found"), { code: 404 });
+    const objectsApi = {
+      getNamespacedCustomObject: async () => ({
+        metadata: {
+          name: `db-${ID}`,
+          labels: {
+            "drigodb.io/database-id": ID,
+            "drigodb.io/external-id": EXT,
+            "drigodb.io/tier": "small",
+          },
+        },
+        spec: { instances: 1, storage: { size: "1Gi" } },
+        status: { readyInstances: 1 },
+      }),
+      listNamespacedCustomObject: async () => ({ items: [] }),
+      patchNamespacedCustomObject: async (req: { name?: string }) => {
+        patches.push(req.name ?? "");
+        return {};
+      },
+    };
+    const core = {
+      listNamespacedPod: async () => ({
+        items: [{ status: { conditions: [{ type: "Ready", status: "True" }] } }],
+      }),
+      listNamespacedPersistentVolumeClaim: async () => ({
+        items: opts.className
+          ? [{ metadata: { name: `db-${ID}-1` }, spec: { storageClassName: opts.className } }]
+          : [],
+      }),
+    };
+    const storage = {
+      readStorageClass: async () => {
+        if (opts.readable === false) throw notFound();
+        return { metadata: { name: opts.className }, allowVolumeExpansion: opts.allowExpansion };
+      },
+    };
+    const net = { createNamespacedNetworkPolicy: async () => ({}) };
+    const batch = { readNamespacedJob: async () => { throw notFound(); } };
+    return {
+      patches,
+      provisioner: new Provisioner(
+        storage as never, core as never, net as never, batch as never, objectsApi as never,
+      ),
+    };
+  }
+
+  it("refuses when the StorageClass does not allow expansion, and patches nothing", async () => {
+    const { provisioner, patches } = provisionerOn({ className: "standard", allowExpansion: false });
+    await expect(provisioner.resize(ID, "medium")).rejects.toThrow(ResizeRefusedError);
+    // The database must be left exactly as it was. A refusal that already moved
+    // the label would be worse than the silence it replaces.
+    expect(patches).toHaveLength(0);
+  });
+
+  it("names the StorageClass, because that is the thing to change", async () => {
+    const { provisioner } = provisionerOn({ className: "standard", allowExpansion: false });
+    await expect(provisioner.resize(ID, "medium")).rejects.toThrow(/standard/);
+    await expect(provisioner.resize(ID, "medium")).rejects.toThrow(/expansion/);
+  });
+
+  it("proceeds when the StorageClass allows expansion", async () => {
+    const { provisioner, patches } = provisionerOn({
+      className: "do-block-storage",
+      allowExpansion: true,
+    });
+    await provisioner.resize(ID, "medium");
+    expect(patches.length).toBeGreaterThan(0);
+  });
+
+  it("proceeds when the StorageClass cannot be read", async () => {
+    // Unreadable is not the same as unable. A cluster that will not show drigodb
+    // a StorageClass should not have its resizes blocked by that.
+    const { provisioner, patches } = provisionerOn({ className: "opaque", readable: false });
+    await provisioner.resize(ID, "medium");
+    expect(patches.length).toBeGreaterThan(0);
+  });
+
+  it("proceeds when there is no PVC to check yet", async () => {
+    const { provisioner, patches } = provisionerOn({});
+    await provisioner.resize(ID, "medium");
+    expect(patches.length).toBeGreaterThan(0);
   });
 });
