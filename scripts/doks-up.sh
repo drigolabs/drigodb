@@ -86,10 +86,32 @@ else
   # The namespaces come from the chart, but the deployer's Roles live in them and
   # this runs before anything is installed. Created here rather than depending on
   # an install that has not happened yet.
+  #
+  # drigodb-databases is stamped with Helm's ownership metadata as it is created,
+  # because the chart TEMPLATES that namespace and Helm refuses to adopt an object
+  # it did not create:
+  #
+  #   Error: unable to continue with install: Namespace "drigodb-databases" ...
+  #   cannot be imported into the current release: invalid ownership metadata
+  #
+  # So doks-up.sh followed by deploy.sh — the sequence every DOKS instruction
+  # gives — failed on the second step, and had done since the chart landed.
+  # Nothing caught it because CI runs kind-up.sh, which does not pre-create the
+  # namespace, so the documented path was the one path never exercised.
+  #
+  # Stamping it here rather than reordering: the deploy credential is minted
+  # before anything is installed on purpose, and that ordering is worth more than
+  # keeping a Helm detail out of this script. The release namespace needs no such
+  # treatment — Helm creates it with --create-namespace and does not template it.
   for ns in drigodb-system drigodb-databases; do
     kubectl --context "$KCTX" create namespace "$ns" --dry-run=client -o yaml \
       | kubectl --context "$KCTX" apply -f - >/dev/null
   done
+  kubectl --context "$KCTX" label namespace drigodb-databases \
+    app.kubernetes.io/managed-by=Helm --overwrite >/dev/null
+  kubectl --context "$KCTX" annotate namespace drigodb-databases \
+    meta.helm.sh/release-name=drigodb \
+    meta.helm.sh/release-namespace=drigodb-system --overwrite >/dev/null
   kubectl --context "$KCTX" apply -f "${ROOT}/deploy/05-deployer-rbac.yaml" >/dev/null
   ok "drigodb-deployer created"
 
