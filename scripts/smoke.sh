@@ -505,7 +505,16 @@ step "Growing a database"
 # neither may pass by accident.
 SC="$(k get pvc "db-${DB_ID}-1" -n drigodb-databases -o jsonpath='{.spec.storageClassName}' 2>/dev/null)"
 CAN_EXPAND="$(k get storageclass "$SC" -o jsonpath='{.allowVolumeExpansion}' 2>/dev/null)"
-RESIZE="$(api -XPOST "localhost:${API_PORT}/v1/databases/${DB_ID}/resize" -d '{"tier":"medium"}')"
+# NOT through api(), which is `curl -fsS`. Two reasons, and both bite here: `-f`
+# exits non-zero on a 4xx, so `set -e` would kill the run before any assertion,
+# and `-f` also DISCARDS the body — so the refusal's message, the whole point of
+# the assertion, would never arrive. Status and body are captured explicitly.
+RESIZE_BODY=/tmp/drigodb-resize-$$.json
+RESIZE_CODE="$(curl -sS -o "$RESIZE_BODY" -w '%{http_code}' \
+  -H "Authorization: Bearer ${TOKEN}" -H 'content-type: application/json' \
+  -XPOST "localhost:${API_PORT}/v1/databases/${DB_ID}/resize" -d '{"tier":"medium"}')"
+RESIZE="$(cat "$RESIZE_BODY")"
+rm -f "$RESIZE_BODY"
 
 # The original bug, named explicitly so it can never be mistaken for a storage
 # limitation.
@@ -550,13 +559,21 @@ else
   # returned the new tier, and the volume silently stayed put — drigodb asserting
   # a database is `medium` on a `small` volume, permanently. drigodb now reads
   # allowVolumeExpansion up front and refuses.
-  case "$RESIZE" in
-    *expansion*)
-      ok "${SC} cannot expand volumes, and the resize was refused for that reason" ;;
-    *)
-      fail "${SC} cannot expand volumes and resize did not refuse: ${RESIZE}"
-      exit 1 ;;
-  esac
+  # A 409 AND a message about expansion. The code alone would pass on any
+  # conflict, and the message alone would pass on a 200 that happened to mention
+  # the word.
+  if [ "$RESIZE_CODE" = "409" ]; then
+    case "$RESIZE" in
+      *expansion*)
+        ok "${SC} cannot expand volumes, and the resize was refused (409) for that reason" ;;
+      *)
+        fail "refused with 409 but not about expansion: ${RESIZE}"
+        exit 1 ;;
+    esac
+  else
+    fail "${SC} cannot expand volumes and resize returned ${RESIZE_CODE}: ${RESIZE}"
+    exit 1
+  fi
   # And the refusal must have changed nothing.
   STILL="$(api "localhost:${API_PORT}/v1/databases/${DB_ID}" | jqf '["tier"]')"
   if [ "$STILL" = "small" ]; then
