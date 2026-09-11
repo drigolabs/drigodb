@@ -973,22 +973,38 @@ export class Provisioner {
     // Expansion is online — measured on DigitalOcean 2026-09-05, 974M to 2.0G
     // with the database serving and no restart.
     try {
-      await this.objects.patchNamespacedCustomObject({
-        group: CNPG_GROUP,
-        version: "v1",
-        namespace: ns,
-        plural: CLUSTERS_PLURAL,
-        name: clusterName(id),
-        body: {
-          metadata: { labels: { [TIER_LABEL]: target } },
-          spec: {
-            storage: { size: TIERS[target].storage },
-            postgresql: {
-              parameters: { max_wal_size: TIERS[target].maxWalSize },
+      await this.objects.patchNamespacedCustomObject(
+        {
+          group: CNPG_GROUP,
+          version: "v1",
+          namespace: ns,
+          plural: CLUSTERS_PLURAL,
+          name: clusterName(id),
+          body: {
+            metadata: { labels: { [TIER_LABEL]: target } },
+            spec: {
+              storage: { size: TIERS[target].storage },
+              postgresql: {
+                parameters: { max_wal_size: TIERS[target].maxWalSize },
+              },
             },
           },
         },
-      });
+        // The merge-patch content type, which this call was missing and every
+        // other patch in this file has. Without it the client sends a JSON
+        // Patch — an array of operations — and the API server rejects an object:
+        //
+        //   error decoding patch: json: cannot unmarshal object into Go value
+        //   of type []handlers.jsonPatchOp
+        //
+        // So resize returned 500 for every database, on every cluster, from the
+        // day the data plane moved to CloudNativePG. Nothing caught it: a mocked
+        // client accepts any content type, and smoke.sh does not exercise resize
+        // at all. It survived because the only place CI runs — kind, whose
+        // local-path provisioner has allowVolumeExpansion: false — cannot grow a
+        // volume anyway, so there was nothing there to notice it was broken.
+        setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+      );
     } catch (err) {
       // The common cause is a StorageClass with allowVolumeExpansion: false —
       // kind's local-path, and plenty of others. Kubernetes says so clearly and
