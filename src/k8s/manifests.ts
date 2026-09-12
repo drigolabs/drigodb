@@ -131,6 +131,14 @@ export const RESTORE_SOURCE_NAME = "origin";
 // ContinuousArchivingFailing; drigodb reads only the status.
 export const CNPG_ARCHIVING_CONDITION = "ContinuousArchiving";
 
+// The phase CloudNativePG reports while it clones a standby.
+//
+// This is what separates a standby being BUILT from one that has died, and
+// without it the two are indistinguishable — which is the reason adding a
+// standby to a live database could not be reported honestly before (#110).
+// CloudNativePG's own constant, PhaseCreatingReplica, verbatim.
+export const CNPG_CREATING_REPLICA_PHASE = "Creating a new replica";
+
 export const CNPG_NAMESPACE = "cnpg-system";
 export const CNPG_STATUS_PORT = 8000;
 

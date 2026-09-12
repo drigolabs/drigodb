@@ -976,6 +976,107 @@ fi
 DB_ID="$SAVED_DB_ID"
 api -XDELETE "localhost:${API_PORT}/v1/databases/${HA_ID}" >/dev/null 2>&1 || true
 
+step "Adding a standby to a database that already exists"
+# The decision to want high availability usually arrives after the database does
+# (#110), so this is the path a real consumer takes: a database created without a
+# standby, given one later, with data already in it.
+#
+# The clone is a pg_basebackup from the LIVE primary, so it is timed rather than
+# guessed at — the number goes in the README next to the other measured ones.
+HA2_EXT="${EXTERNAL_ID}-addha"
+HA2="$(api -XPOST "localhost:${API_PORT}/v1/databases" -d "{\"external_id\":\"${HA2_EXT}\"}")"
+HA2_ID="$(echo "$HA2" | jqf '["id"]')"
+HA2_URI="$(echo "$HA2" | jqf '["connection_uri"]')"
+[ -n "$HA2_ID" ] || { fail "could not create a database to add a standby to: ${HA2}"; exit 1; }
+for _ in $(seq 1 90); do
+  [ "$(api "localhost:${API_PORT}/v1/databases/${HA2_ID}" | jqf '["status"]')" = "ready" ] && break
+  sleep 3
+done
+
+SAVED_DB_ID="$DB_ID"; DB_ID="$HA2_ID"
+psql_when_reachable "$HA2_URI" "CREATE TABLE addha (id int PRIMARY KEY, note text);
+  INSERT INTO addha VALUES (1,'written-before-the-standby-existed');" >/dev/null
+
+# It starts single-instance, and says so.
+if [ "$(api "localhost:${API_PORT}/v1/databases/${HA2_ID}" | jqf '["high_availability"]')" = "False" ]; then
+  ok "${HA2_ID} starts with no standby, and has data"
+else
+  fail "the database already reports high availability before it was asked for"
+  DB_ID="$SAVED_DB_ID"; exit 1
+fi
+
+# Refuse a body that does not say which way, before doing the real call.
+BAD_CODE="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" \
+  -H 'content-type: application/json' \
+  -XPOST "localhost:${API_PORT}/v1/databases/${HA2_ID}/high-availability" -d '{"enabled":"yes"}')"
+if [ "$BAD_CODE" = "400" ]; then
+  ok "a non-boolean enabled is refused (400)"
+else
+  fail "enabled:\"yes\" returned ${BAD_CODE}, not 400"
+  DB_ID="$SAVED_DB_ID"; exit 1
+fi
+
+t_clone=$(date +%s)
+api -XPOST "localhost:${API_PORT}/v1/databases/${HA2_ID}/high-availability" -d '{"enabled":true}' >/dev/null
+
+# `provisioning` is the state #110 needed: a standby being BUILT looked identical
+# to one that had died. Seen at least once, or the value is decorative.
+SAW_PROVISIONING=no
+HA2_STANDBY=""
+for _ in $(seq 1 120); do
+  HA2_STANDBY="$(api "localhost:${API_PORT}/v1/databases/${HA2_ID}" | jqf '["standby"]')"
+  [ "$HA2_STANDBY" = "provisioning" ] && SAW_PROVISIONING=yes
+  [ "$HA2_STANDBY" = "ready" ] && break
+  [ "$HA2_STANDBY" = "blocked" ] && { fail "the standby is blocked — WAL archiving is failing"; DB_ID="$SAVED_DB_ID"; exit 1; }
+  sleep 3
+done
+if [ "$HA2_STANDBY" = "ready" ]; then
+  ok "standby ready in $(( $(date +%s) - t_clone ))s — the clone cost, measured"
+else
+  fail "the standby never became ready (${HA2_STANDBY})"
+  explain_stuck_database "$HA2_ID"
+  DB_ID="$SAVED_DB_ID"; exit 1
+fi
+if [ "$SAW_PROVISIONING" = "yes" ]; then
+  ok "reported provisioning while it cloned, rather than unavailable"
+else
+  # Not a failure on a tiny database: the clone can finish inside one poll. Said
+  # out loud so nobody reads a silent pass as proof the value works.
+  note "the clone finished before any poll saw 'provisioning' — too fast to observe here"
+fi
+
+# Synchronous replication established with a standby that did not exist a minute
+# ago, and the row written before it did is on it.
+SYNC2="$(psql_on_primary "SELECT coalesce(string_agg(application_name || '=' || sync_state, ','), 'none') FROM pg_stat_replication" | tr -d ' \r\n')"
+case "$SYNC2" in
+  *=sync*|*=quorum*) ok "the new standby is replicating synchronously (${SYNC2})" ;;
+  *) fail "the new standby is not synchronous (${SYNC2})"; DB_ID="$SAVED_DB_ID"; exit 1 ;;
+esac
+
+# And it can be taken away again, which is the half a caller would otherwise ask
+# about. Removing a standby destroys only the standby's volume.
+api -XPOST "localhost:${API_PORT}/v1/databases/${HA2_ID}/high-availability" -d '{"enabled":false}' >/dev/null
+for _ in $(seq 1 60); do
+  [ "$(api "localhost:${API_PORT}/v1/databases/${HA2_ID}" | jqf '["high_availability"]')" = "False" ] && break
+  sleep 3
+done
+if [ "$(api "localhost:${API_PORT}/v1/databases/${HA2_ID}" | jqf '["high_availability"]')" = "False" ]; then
+  ok "the standby can be removed again"
+else
+  fail "high availability could not be turned off"
+  DB_ID="$SAVED_DB_ID"; exit 1
+fi
+
+# The data is still there, on the same URI, after both changes.
+ADDHA_ROWS="$(psql_when_reachable "$HA2_URI" "SELECT note FROM addha WHERE id = 1")"
+DB_ID="$SAVED_DB_ID"
+case "$ADDHA_ROWS" in
+  *written-before-the-standby-existed*) ok "the data survived adding and removing a standby" ;;
+  *) fail "data did not survive (${ADDHA_ROWS})"; exit 1 ;;
+esac
+
+api -XDELETE "localhost:${API_PORT}/v1/databases/${HA2_ID}" >/dev/null 2>&1 || true
+
 step "Restoring over a database, keeping its id"
 # The destructive restore. A throwaway database, because this one cannot be
 # undone: it discards everything written since the target.

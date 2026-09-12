@@ -78,6 +78,7 @@ POST   /v1/databases/{id}/hibernate  → 202
 POST   /v1/databases/{id}/credentials  → 200 + a new connection_uri
 POST   /v1/databases/{id}/resize      { tier }  → 202, or 409 if the volume cannot grow
 POST   /v1/databases/{id}/restore     { confirm, backup_id? | target_time? }  → 202, destructive
+POST   /v1/databases/{id}/high-availability  { enabled }  → 202
 GET    /v1/databases/{id}/backups      what can be restored
 GET    /v1/ca                         the CA consumers verify against
 DELETE /v1/databases/{id}       destroys the data
@@ -393,9 +394,19 @@ the object storage, not the database.
 questions:
 
 ```
-high_availability: true       what was asked for; never changes
+high_availability: true       what was asked for
 standby: "ready"              what is true this second
 archiving: "healthy"          whether WAL is reaching the bucket
+```
+
+`standby` has four values, because a missing standby is four situations and only
+two of them are anything to act on:
+
+```
+"ready"          it is there
+"provisioning"   being cloned right now — wait
+"unavailable"    it existed, it is gone, and it is coming back on its own (~21s)
+"blocked"        it cannot come back; `archiving` says why
 ```
 
 `archiving` is reported for any database when the installation has somewhere to
@@ -432,9 +443,23 @@ all of this step by step: creating one, what a commit actually waits for, what
 happens when the primary dies, and what happens when the standby is the one that
 dies.
 
-**It cannot be turned on later.** A repeat `POST` returns the existing database
-and does not act on the flag; adding a standby to a live database is a different
-operation and is not built. Read the field rather than assume the request took.
+**It can be turned on later, and off again.**
+
+```
+POST /v1/databases/{id}/high-availability  { "enabled": true }
+```
+
+The decision to want high availability usually arrives *after* the database does.
+CloudNativePG clones the standby with `pg_basebackup` from the **live** primary,
+so this costs a sustained read against a serving database and takes as long as a
+base backup of it. Poll `standby`: it reads `provisioning` for the duration.
+
+`{"enabled": false}` removes it again. That destroys only the standby's volume —
+the primary holds everything — so nothing is lost, and it also unwinds the
+synchronous posture rather than leaving the primary waiting on a standby that no
+longer exists.
+
+Asking twice while a clone is running does nothing the second time.
 
 **It costs what it sounds like.** A standby doubles a database's pods and
 volumes. ADR 0001 measured a 1500 MiB node fitting three databases, and

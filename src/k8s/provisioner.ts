@@ -30,6 +30,7 @@ import {
   DB_USER,
   ARCHIVE_GENERATION_ANNOTATION,
   CNPG_ARCHIVING_CONDITION,
+  CNPG_CREATING_REPLICA_PHASE,
   archiveGenerationOf,
   archiveServerName,
   CNPG_GROUP,
@@ -90,13 +91,22 @@ export type Database = {
   // three states. `high_availability` is what was asked for and never changes;
   // `standby` is what is true this second.
   //
-  // `blocked` is the third value and the reason this field is not a boolean: a
-  // standby that is being rebuilt comes back on its own in about twenty seconds,
-  // and one that cannot archive WAL never comes back at all. Measured — see the
-  // comment on archivingOf. Both look identical from outside, and only one is
-  // something to act on.
+  // Four values, because a missing standby is four different situations and only
+  // two of them are anything to act on:
+  //
+  //   provisioning  being cloned right now, for the first time
+  //   unavailable   it existed, it is gone, and it is coming back on its own
+  //   blocked       it cannot come back — WAL archiving is failing
+  //   ready         it is there
+  //
+  // `unavailable` resolves itself in about twenty seconds and `blocked` never
+  // resolves without somebody fixing object storage — measured, see archivingOf.
+  // `provisioning` is the one #110 added: adding a standby to a live database
+  // takes as long as a base backup of that database, and reporting it as
+  // `unavailable` throughout would have a caller watching for a failure that had
+  // not happened.
   high_availability: boolean;
-  standby?: "ready" | "unavailable" | "blocked";
+  standby?: "ready" | "provisioning" | "unavailable" | "blocked";
   // Whether WAL is actually reaching the bucket, when this installation has one.
   //
   // Separate from `backups`, which says only that a destination is CONFIGURED.
@@ -350,6 +360,18 @@ export function validateRestoreInPlace(
   return { ...(backupId ? { backupId } : {}), ...(targetTime ? { targetTime } : {}) };
 }
 
+// What `POST /{id}/high-availability` is allowed to say.
+export function validateHighAvailabilityChange(value: unknown): boolean {
+  if (value === null || typeof value !== "object") {
+    throw new ValidationError('a body is required: {"enabled": true} or {"enabled": false}');
+  }
+  const v = value as { enabled?: unknown };
+  if (typeof v.enabled !== "boolean") {
+    throw new ValidationError('"enabled" must be true or false');
+  }
+  return v.enabled;
+}
+
 // Opt-in, and only at create.
 //
 // A boolean rather than an `ha-small` / `ha-medium` tier ladder: high
@@ -512,7 +534,7 @@ export class Provisioner {
     cluster: CnpgCluster,
   ): Promise<{
     high_availability: boolean;
-    standby?: "ready" | "unavailable" | "blocked";
+    standby?: "ready" | "provisioning" | "unavailable" | "blocked";
   }> {
     const wanted = cluster.spec?.instances ?? 1;
     if (wanted < 2) return { high_availability: false };
@@ -526,16 +548,24 @@ export class Provisioner {
       return { high_availability: true, standby: "ready" };
     }
 
-    // A standby that is missing, and whether it is coming back.
+    // A standby that is missing, and which of three reasons it is missing for.
     //
-    // These two states look identical from outside and are not remotely the
-    // same thing. Measured on a cluster: with WAL archiving healthy, a killed
-    // primary is demoted, rejoins as the standby, and the pair is protected
-    // again 21 seconds later, untouched. With archiving failing it NEVER comes
-    // back — the demoted instance holds WAL it wrote before demotion, it must
-    // archive that before it can rejoin, and it cannot. Seven minutes in, the
-    // database still reported `ready` with no standby, and would have reported
-    // that forever.
+    // Being CLONED first, because it is the only one that is not a fault at all.
+    // CloudNativePG says so itself while it runs pg_basebackup against the live
+    // primary, and that takes as long as a base backup of the database — minutes
+    // for anything with data in it. Reporting `unavailable` throughout would have
+    // a caller watching for a failure that has not happened (#110).
+    if (cluster.status?.phase === CNPG_CREATING_REPLICA_PHASE) {
+      return { high_availability: true, standby: "provisioning" };
+    }
+
+    // The other two look identical from outside and are not remotely the same
+    // thing. Measured on a cluster: with WAL archiving healthy, a killed primary
+    // is demoted, rejoins as the standby, and the pair is protected again 21
+    // seconds later, untouched. With archiving failing it NEVER comes back — the
+    // demoted instance holds WAL it wrote before demotion, it must archive that
+    // before it can rejoin, and it cannot. Seven minutes in, the database still
+    // reported `ready` with no standby, and would have reported that forever.
     //
     // So the difference is "wait twenty seconds" against "nothing will fix this
     // without you". A caller cannot infer which from a database that is serving
@@ -1384,6 +1414,70 @@ export class Provisioner {
       ),
       barmanBackupId: barmanId,
     };
+  }
+
+  // Add a standby to a database that already exists, or take one away.
+  //
+  // One field on the Cluster, and CloudNativePG does the rest: it clones the
+  // standby with pg_basebackup from the LIVE primary and adds it to
+  // synchronous_standby_names. drigodb has no lever on that clone and should not
+  // pretend to — what it owns is saying honestly that it is happening, which is
+  // what `standby: "provisioning"` is for.
+  //
+  // Nothing about the endpoint or the network boundary changes. The Service
+  // selects instanceRole=primary and the NetworkPolicy has admitted
+  // instance-to-instance traffic since it was written, both with comments saying
+  // they were for this.
+  async setHighAvailability(id: string, enabled: boolean): Promise<Database> {
+    const cluster = await this.clusterFor(id);
+    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
+
+    const current = (cluster.spec?.instances ?? 1) > 1;
+    // Idempotent, and deliberately so: asking twice while a clone is running must
+    // not start a second one. Nothing is patched when nothing would change.
+    if (current === enabled) return await this.get(id);
+
+    const externalId = cluster.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "";
+    const tier = tierOf(cluster.metadata?.labels);
+    // Rendered rather than hand-written, so the synchronous posture and its
+    // reasoning live in exactly one place — buildCluster — and turning HA on here
+    // cannot drift from turning it on at create.
+    const wanted = buildCluster(
+      id,
+      externalId,
+      tier,
+      undefined,
+      enabled,
+      archiveGenerationOf(cluster.metadata),
+    ).spec;
+
+    await this.objects.patchNamespacedCustomObject(
+      {
+        group: CNPG_GROUP,
+        version: "v1",
+        namespace: config.databaseNamespace,
+        plural: CLUSTERS_PLURAL,
+        name: clusterName(id),
+        body: {
+          spec: {
+            instances: wanted.instances,
+            postgresql: {
+              // null, not absent. Turning HA off has to REMOVE the synchronous
+              // block, and a merge patch only removes a key when it is explicitly
+              // null — an absent key leaves what is there. Without this the
+              // primary would keep a synchronous_standby_names naming a standby
+              // that no longer exists: harmless today because dataDurability is
+              // `preferred` and relaxes, and a write outage the moment anybody
+              // changes that to `required`.
+              synchronous: wanted.postgresql.synchronous ?? null,
+            },
+          },
+        },
+      },
+      setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
+    );
+
+    return await this.get(id);
   }
 
   // Put a database back to an earlier state, keeping its id and its URI.
