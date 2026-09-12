@@ -38,6 +38,9 @@ note() { printf "  ${YELLOW}…${RESET} %s\n" "$1"; }
 
 k() { kubectl --context "$CTX" "$@"; }
 
+# release-1.27 from 1.27.0. Derived rather than pinned separately, so a version
+# bump cannot leave the branch pointing somewhere else — see versions.env.
+CNPG_RELEASE_BRANCH="release-${CNPG_VERSION%.*}"
 MANIFEST="https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/${CNPG_RELEASE_BRANCH}/releases/cnpg-${CNPG_VERSION}.yaml"
 CERT_MANAGER_MANIFEST="https://github.com/cert-manager/cert-manager/releases/download/${CERT_MANAGER_VERSION}/cert-manager.yaml"
 PLUGIN_MANIFEST="https://github.com/cloudnative-pg/plugin-barman-cloud/releases/download/${BARMAN_PLUGIN_VERSION}/manifest.yaml"
