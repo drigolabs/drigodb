@@ -162,6 +162,42 @@ jobs:
           echo "| kind up, build, install | ${KIND_UP_SECONDS:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| smoke.sh | ${SMOKE_SECONDS:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
 
+  # A diagram that does not parse is invisible in review: not a test failure, not
+  # a type error, and not a visible difference in a diff. GitHub renders an error
+  # box in place of the picture, and the people most likely to see it are the
+  # consumers the document was written for. docs/consuming-drigodb.md shipped
+  # broken and nobody noticed.
+  #
+  # Its own job rather than a step in `typecheck and test`, because it needs
+  # Chromium: the first run downloads it, which would add a minute or two to a
+  # required check on every pull request. Here it runs in parallel and costs that
+  # check nothing.
+  #
+  # NOT YET A REQUIRED CHECK. Branch protection on main matches three checks by
+  # exact name and this is not one of them, so it reports without gating. The
+  # name below is therefore already its permanent one — renaming a job that
+  # protection matches by string blocks every pull request on a check that never
+  # reports, so there is no later moment at which this can be tidied up.
+  diagrams:
+    name: diagrams render
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      # Chromium is the slow part and it does not change between runs. Keyed on
+      # the pinned mermaid-cli version, so a bump fetches once and then caches.
+      - name: Cache the browser mermaid-cli drives
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/puppeteer
+            ~/.npm/_npx
+          key: mermaid-${{ hashFiles('scripts/versions.env') }}
+      - name: Every diagram in docs/ renders
+        run: bash scripts/diagram-render-test.sh
+
   api-image:
     name: api image builds
     runs-on: ubuntu-latest

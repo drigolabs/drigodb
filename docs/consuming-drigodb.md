@@ -33,11 +33,11 @@ sequenceDiagram
     participant API as drigodb-api<br/>drigodb-system
     participant Store as Your secret store<br/>(Secret, SOPS, Vault…)
     participant K8s as Kubernetes
-    participant DB as db-&lt;id&gt;<br/>drigodb-databases
+    participant DB as db-(id)<br/>drigodb-databases
 
     App->>API: POST /v1/databases {external_id}<br/>Authorization: Bearer …
     Note right of API: Idempotent on external_id.<br/>A retry returns the existing<br/>database rather than a second one.
-    API->>K8s: StatefulSet, Service, Secret, NetworkPolicy
+    API->>K8s: Cluster, Service, Secret, NetworkPolicy
     API-->>App: 202 {id, status: "provisioning", connection_uri}
 
     rect rgba(200,80,80,0.14)
@@ -50,7 +50,7 @@ sequenceDiagram
         API-->>App: {status}
     end
 
-    Note over App,DB: Your pod must carry<br/>drigodb.io/allow-database: &lt;id&gt;<br/>or the NetworkPolicy drops the packets
+    Note over App,DB: Your pod must carry the label<br/>drigodb.io/allow-database set to the id<br/>or the NetworkPolicy drops the packets
 
     Store-->>App: connection_uri
     App->>DB: connect (TLS)
