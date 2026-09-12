@@ -1,38 +1,68 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
+  "extends": [
+    "config:recommended"
+  ],
   "timezone": "Europe/Lisbon",
   "dependencyDashboard": true,
   "dependencyDashboardTitle": "Pins that could move",
   "prConcurrentLimit": 3,
   "rebaseWhen": "conflicted",
-  "labels": ["dependencies"],
+  "labels": [
+    "dependencies"
+  ],
   "commitMessagePrefix": "chore(deps):",
   "packageRules": [
     {
-      "description": "One pull request per pin. A batched bump is a batched revert, and these pins fail in unrelated ways — a CloudNativePG minor and a mermaid patch have nothing to say to each other.",
-      "matchManagers": ["custom.regex", "helm-values", "npm", "dockerfile", "github-actions"],
+      "description": "One pull request per pin. A batched bump is a batched revert, and these pins fail in unrelated ways \u2014 a CloudNativePG minor and a mermaid patch have nothing to say to each other.",
+      "matchManagers": [
+        "custom.regex",
+        "helm-values",
+        "npm",
+        "dockerfile",
+        "github-actions"
+      ],
       "groupName": null
     },
     {
-      "description": "MinIO's tags are RELEASE.<timestamp>, not semver, and the registry also carries -cpuv1 and .hotfix. variants. Only the plain form is a candidate; the others are not newer, they are different.",
-      "matchPackageNames": ["quay.io/minio/minio", "quay.io/minio/mc"],
-      "versioning": "loose",
-      "allowedVersions": "/^RELEASE\\.\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2}Z$/"
+      "description": "Label the pins this repository maintains deliberately, so they stay findable. config:recommended also proposes npm and GitHub Actions majors \u2014 fifteen of them on the first run \u2014 and the versions.env pins are the ones that have actually broken things: MinIO vanishing from Docker Hub, and appVersion four releases behind its own chart.",
+      "matchManagers": [
+        "custom.regex"
+      ],
+      "addLabels": [
+        "pins"
+      ]
+    },
+    {
+      "description": "MinIO's tags are RELEASE.<timestamp>, which `loose` versioning cannot parse \u2014 it skipped both pins with skipReason invalid-value, so Renovate could never have proposed a bump for the one dependency that has already broken CI by disappearing. A regex versioning reads the date as major.minor.patch and the time as the build, which orders correctly. It also does the filtering allowedVersions used to attempt: the pattern requires a trailing Z, so the -cpuv1 and .hotfix. variants do not parse and are ignored rather than mistaken for newer.",
+      "matchPackageNames": [
+        "quay.io/minio/minio",
+        "quay.io/minio/mc"
+      ],
+      "versioning": "regex:^RELEASE\\.(?<major>\\d{4})-(?<minor>\\d{2})-(?<patch>\\d{2})T(?<build>[\\d-]+)Z$"
     },
     {
       "description": "The API image this chart deploys is built from this repository, so a bump here is the promotion step decision 0002 says has to be a second merge. It cannot be automerged: the commit being released cannot name the image the release is about to build.",
-      "matchDatasources": ["docker"],
-      "matchPackageNames": ["ghcr.io/drigolabs/drigodb-api"],
+      "matchDatasources": [
+        "docker"
+      ],
+      "matchPackageNames": [
+        "ghcr.io/drigolabs/drigodb-api"
+      ],
       "automerge": false,
-      "labels": ["dependencies", "promotion"]
+      "labels": [
+        "dependencies",
+        "promotion"
+      ]
     }
   ],
   "customManagers": [
     {
       "description": "scripts/versions.env is a bespoke file, so each pin names its own datasource. The comment above each is the reason it is pinned; this is only the address it is pinned to.",
       "customType": "regex",
-      "managerFilePatterns": ["/^scripts/versions\\.env$/"],
+      "managerFilePatterns": [
+        "/^scripts/versions\\.env$/"
+      ],
       "matchStrings": [
         "CNPG_VERSION=(?<currentValue>\\S+)"
       ],
@@ -42,7 +72,9 @@
     },
     {
       "customType": "regex",
-      "managerFilePatterns": ["/^scripts/versions\\.env$/"],
+      "managerFilePatterns": [
+        "/^scripts/versions\\.env$/"
+      ],
       "matchStrings": [
         "CERT_MANAGER_VERSION=(?<currentValue>\\S+)"
       ],
@@ -51,7 +83,9 @@
     },
     {
       "customType": "regex",
-      "managerFilePatterns": ["/^scripts/versions\\.env$/"],
+      "managerFilePatterns": [
+        "/^scripts/versions\\.env$/"
+      ],
       "matchStrings": [
         "BARMAN_PLUGIN_VERSION=(?<currentValue>\\S+)"
       ],
@@ -60,27 +94,33 @@
     },
     {
       "customType": "regex",
-      "managerFilePatterns": ["/^scripts/versions\\.env$/"],
+      "managerFilePatterns": [
+        "/^scripts/versions\\.env$/"
+      ],
       "matchStrings": [
         "MINIO_VERSION=(?<currentValue>\\S+)"
       ],
       "depNameTemplate": "quay.io/minio/minio",
       "datasourceTemplate": "docker",
-      "versioningTemplate": "loose"
+      "versioningTemplate": "regex:^RELEASE\\.(?<major>\\d{4})-(?<minor>\\d{2})-(?<patch>\\d{2})T(?<build>[\\d-]+)Z$"
     },
     {
       "customType": "regex",
-      "managerFilePatterns": ["/^scripts/versions\\.env$/"],
+      "managerFilePatterns": [
+        "/^scripts/versions\\.env$/"
+      ],
       "matchStrings": [
         "MINIO_MC_VERSION=(?<currentValue>\\S+)"
       ],
       "depNameTemplate": "quay.io/minio/mc",
       "datasourceTemplate": "docker",
-      "versioningTemplate": "loose"
+      "versioningTemplate": "regex:^RELEASE\\.(?<major>\\d{4})-(?<minor>\\d{2})-(?<patch>\\d{2})T(?<build>[\\d-]+)Z$"
     },
     {
       "customType": "regex",
-      "managerFilePatterns": ["/^scripts/versions\\.env$/"],
+      "managerFilePatterns": [
+        "/^scripts/versions\\.env$/"
+      ],
       "matchStrings": [
         "MERMAID_CLI_VERSION=(?<currentValue>\\S+)"
       ],
@@ -90,7 +130,9 @@
     {
       "description": "The chart's appVersion IS the API image tag when image.tag is unset, which is the default and the documented path. It sat four releases behind once and a default install could not become ready (#119).",
       "customType": "regex",
-      "managerFilePatterns": ["/^charts/drigodb/Chart\\.yaml$/"],
+      "managerFilePatterns": [
+        "/^charts/drigodb/Chart\\.yaml$/"
+      ],
       "matchStrings": [
         "appVersion:\\s*\"(?<currentValue>[^\"]+)\""
       ],
@@ -100,7 +142,9 @@
     {
       "description": "The PostgreSQL image every hosted database runs. A major here is a PostgreSQL major for every customer, so it is never a quiet bump.",
       "customType": "regex",
-      "managerFilePatterns": ["/^charts/drigodb/values\\.yaml$/"],
+      "managerFilePatterns": [
+        "/^charts/drigodb/values\\.yaml$/"
+      ],
       "matchStrings": [
         "image:\\s*(?<depName>ghcr\\.io/cloudnative-pg/postgresql):(?<currentValue>\\S+)"
       ],
