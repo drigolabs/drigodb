@@ -1,8 +1,8 @@
 // Provisioning operations against Kubernetes.
 //
 // Kubernetes is the source of truth. There is no control-plane database: a
-// hosted database *is* its StatefulSet, and the caller's own identifier lives on
-// it as a label. That keeps v0.0.1 to one moving part, and makes idempotency a
+// hosted database *is* its CloudNativePG Cluster (decision 0004), and the
+// caller's own identifier lives on it as a label. That keeps v0.0.1 to one moving part, and makes idempotency a
 // label lookup rather than a transaction.
 
 import { createHash, randomBytes } from "node:crypto";
@@ -16,7 +16,7 @@ import {
   PatchStrategy,
   setHeaderOptions,
 } from "@kubernetes/client-node";
-import type { V1Job, V1StatefulSet } from "@kubernetes/client-node";
+import type { V1Job } from "@kubernetes/client-node";
 import type { Tier } from "./manifests.js";
 
 import { backupsEnabled, config, serverAuthEnabled } from "../config.js";
@@ -158,8 +158,8 @@ export class NotConfiguredError extends Error {}
 // A create landed on an id whose previous database is still being deleted.
 //
 // Only reachable because ids are derived from external_id: delete-then-recreate
-// now lands on the same StatefulSet name and the same volume name, where random
-// ids gave it a fresh one every time. Retryable, and a caller that waits a few
+// now lands on the same Cluster name and the same volume name, where random ids
+// gave it a fresh one every time. Retryable, and a caller that waits a few
 // seconds gets a clean database.
 export class DeletionInFlightError extends Error {}
 
@@ -198,7 +198,7 @@ export function validateExternalId(value: unknown): string {
 // Idempotency was a read-then-create with no lock: two replicas handling the
 // same external_id both find nothing and both create, which is precisely the
 // failure idempotency exists to prevent. There is no lock to take — so the
-// StatefulSet's NAME becomes one, because Kubernetes will not create two objects
+// Cluster's NAME becomes one, because Kubernetes will not create two objects
 // with the same name and tells the loser so.
 //
 // Twelve hex characters, the same shape the random id had, so nothing that
@@ -730,7 +730,7 @@ export class Provisioner {
     // deleted database's rows behind a password that no longer matches the URI
     // just issued. Refusing is the whole fix: a retry moments later is clean.
     //
-    // Only when the StatefulSet is gone. A PVC beside a live StatefulSet is an
+    // Only when the Cluster is gone. A PVC beside a live Cluster is an
     // ordinary database being created again, which is the idempotent path below.
     const leftover = await this.core.listNamespacedPersistentVolumeClaim({
       namespace: ns,
@@ -831,11 +831,10 @@ export class Provisioner {
     };
   }
 
-  // Bring a database up, on the template this build renders rather than the one
-  // it was created with.
+  // Bring a database up, and bring its NetworkPolicy up to date on the way.
   //
-  // A hosted database is its StatefulSet, and nothing rewrites that StatefulSet
-  // after create — so before this existed, a database kept its original
+  // This used to rewrite the pod template too, because a hosted database was a
+  // StatefulSet that nothing rewrote after create: a database kept its original
   // data-plane images forever, through any number of hibernate/wake cycles. A
   // rebuilt postgres image reached new databases only. So did every pod-template
   // fix: the fsGroupChangePolicy that stopped PostgreSQL waking landed for new
@@ -944,11 +943,12 @@ export class Provisioner {
     }
   }
 
-  // Read-modify-replace on the scale subresource, retried on conflict. The
-  // StatefulSet controller writes status continuously, so the resourceVersion
-  // read a moment ago is routinely stale by the time the replace lands —
-  // especially right after create, where the object is being actively
-  // reconciled. A 409 here is normal, not exceptional.
+  // Hibernate or wake, as one patch on the Cluster.
+  //
+  // This was a read-modify-replace on a StatefulSet's scale subresource, retried
+  // on conflict because the controller rewrites status continuously and the
+  // resourceVersion was routinely stale. None of that survives: there is no
+  // read, so there is no conflict to retry.
   async scale(id: string, replicas: number): Promise<Database> {
     const want = replicas === 0 ? "true" : "false";
 
@@ -979,8 +979,8 @@ export class Provisioner {
       //
       // Written without it here, and hibernate returned 500 on a real cluster
       // while every unit test passed: a mocked client cannot notice a content
-      // type. The same mistake, in the same shape, as the one the StatefulSet
-      // patches carry a comment about.
+      // type. Every patch in this file needs it, and one of them did not have
+      // it: resize returned 500 on every cluster for four releases (#117).
       setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
     );
 
@@ -1433,9 +1433,31 @@ export class Provisioner {
       this.core.deleteNamespacedSecret({ name: secretName(id), namespace: ns }),
     );
 
-    // The retention policy deliberately keeps volumes when a StatefulSet is
-    // removed, so DELETE has to remove them explicitly. This is the point at
-    // which the customer's data actually goes.
+    // The customer's data actually goes here — and this loop is belt, not
+    // braces, which is worth knowing before anyone edits it.
+    //
+    // The comment this replaces said the volumes survive because of a
+    // `persistentVolumeClaimRetentionPolicy` that "deliberately keeps volumes
+    // when a StatefulSet is removed". That field does not appear anywhere in this
+    // repository and has not since decision 0004: there is no StatefulSet to set
+    // it on. The stated reason for deleting PVCs by hand was a field that does
+    // not exist.
+    //
+    // What is actually true, verified on a cluster rather than read: CloudNativePG
+    // stamps every PVC it creates with a CONTROLLER owner reference to the
+    // Cluster — `kind=Cluster name=db-<id> controller=true` — so Kubernetes
+    // garbage-collects them on its own. Deleting the Cluster directly, with
+    // drigodb doing nothing at all, removed the PVC nine seconds later.
+    //
+    // So this stays for two smaller reasons, not the big one it claimed. It makes
+    // the removal immediate rather than waiting on the garbage collector, which
+    // matters because ids are derived from external_id: a delete-then-recreate
+    // lands on the same names, and create() reports DeletionInFlightError for as
+    // long as a PVC outlives its Cluster. And it keeps working if CloudNativePG
+    // ever stops owning them.
+    //
+    // If it is ever removed, the thing to re-measure is that window, not whether
+    // the volumes eventually go.
     const pvcs = await this.core.listNamespacedPersistentVolumeClaim(
       {
         namespace: ns,
@@ -1448,8 +1470,8 @@ export class Provisioner {
       //
       // Written without it here, and hibernate returned 500 on a real cluster
       // while every unit test passed: a mocked client cannot notice a content
-      // type. The same mistake, in the same shape, as the one the StatefulSet
-      // patches carry a comment about.
+      // type. Every patch in this file needs it, and one of them did not have
+      // it: resize returned 500 on every cluster for four releases (#117).
       setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
     );
     for (const pvc of pvcs.items ?? []) {

@@ -17,7 +17,6 @@ import type {
   V1PodTemplateSpec,
   V1Secret,
   V1Service,
-  V1StatefulSet,
 } from "@kubernetes/client-node";
 
 import { backupsEnabled, config, serverAuthEnabled } from "../config.js";
@@ -31,20 +30,23 @@ export const MANAGED_BY_VALUE = "drigodb";
 // across namespaces, so consumers need not live anywhere in particular.
 export const ALLOW_LABEL = "drigodb.io/allow-database";
 
-// Which tier a database is on. On the StatefulSet, because the live PVC is the
-// truth and reading a PVC to answer "how big is this database" is a second API
-// call for something a label already knows.
+// Which tier a database is on. On the Cluster, because reading a PVC to answer
+// "how big is this database" is a second API call for something a label already
+// knows.
 //
-// A StatefulSet's volumeClaimTemplates is immutable, so after a resize the
-// template permanently disagrees with the PVC. That is not drift to reconcile,
-// it is Kubernetes — and the label is how the API reports size without anyone
-// having to know that.
+// The label was originally how the API reported size around an immutable
+// StatefulSet volumeClaimTemplate, which permanently disagreed with the live PVC
+// after a resize. CloudNativePG has no such problem — spec.storage.size IS the
+// desired size and the operator expands the volume to match — so the label is
+// now a convenience rather than a workaround. It is still the thing resize
+// writes, and resize refuses outright when the StorageClass cannot expand, so
+// the two cannot drift the way they used to.
 export const TIER_LABEL = "drigodb.io/tier";
 
 // Whether a database is at zero replicas on purpose.
 //
 // Zero replicas alone cannot answer that. It is also what a create looks like
-// in the window between the StatefulSet — which is the lock, so it is written
+// in the window between the Cluster — which is the lock, so it is written
 // first — and the wake that follows it, and with two API replicas that window
 // is not rare: it is precisely where a concurrent caller lands. Before this
 // label, those callers were told a database being built was hibernated.
