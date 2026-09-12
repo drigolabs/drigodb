@@ -78,6 +78,43 @@ export const CNPG_HIBERNATION_ANNOTATION = "cnpg.io/hibernation";
 // `reconciled` and does not look again until something touches the Cluster.
 export const CREDENTIAL_VERSION_ANNOTATION = "drigodb.io/credential-version";
 
+// Which archive prefix this database's WAL and backups go to.
+//
+// A restore in place cannot reuse the prefix it is restoring FROM. barman refuses
+// outright — "WAL archive check failed for server db-<id>: Expected empty
+// archive" — and it is right to: two timelines archiving under one serverName
+// would corrupt the archive for both, the original history and the restored one.
+//
+// So each in-place restore moves the database to the next generation. Generation
+// 0 is `db-<id>`, which is exactly what CloudNativePG defaults to, so every
+// database created before this existed is already generation 0 and nothing has to
+// be migrated. Generation N is `db-<id>-rN`.
+//
+// The old prefix is left alone, which is deliberate and useful: the history from
+// before a restore is still in the bucket, and a Backup object taken under an
+// earlier generation still names the prefix that holds it.
+export const ARCHIVE_GENERATION_ANNOTATION = "drigodb.io/archive-generation";
+
+// Also a LABEL on each Backup, because a Backup outlives the generation it was
+// taken in and a restore has to know which prefix to read it from.
+export const ARCHIVE_GENERATION_LABEL = "drigodb.io/archive-generation";
+
+export function archiveServerName(id: string, generation = 0): string {
+  return generation > 0 ? `${clusterName(id)}-r${generation}` : clusterName(id);
+}
+
+export function archiveGenerationOf(
+  meta: { annotations?: Record<string, string>; labels?: Record<string, string> } | undefined,
+): number {
+  const raw =
+    meta?.annotations?.[ARCHIVE_GENERATION_ANNOTATION] ??
+    meta?.labels?.[ARCHIVE_GENERATION_LABEL];
+  const n = Number.parseInt(raw ?? "0", 10);
+  // Absent, empty or nonsense is generation 0 — the prefix CloudNativePG would
+  // have chosen anyway. Guessing higher would read an archive that does not exist.
+  return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
 // The backup plugin, and the field a Cluster references it through.
 //
 // isWALArchiver matters: without it the plugin takes base backups and archives
@@ -393,7 +430,14 @@ export interface CnpgClusterSpec {
 export interface CnpgClusterManifest {
   apiVersion: string;
   kind: string;
-  metadata: { name: string; namespace: string; labels: Record<string, string> };
+  metadata: {
+    name: string;
+    namespace: string;
+    labels: Record<string, string>;
+    // Only present above archive generation 0, which is why it is optional: an
+    // untouched database carries no annotation and reads back as 0.
+    annotations?: Record<string, string>;
+  };
   spec: CnpgClusterSpec;
 }
 
@@ -422,6 +466,7 @@ export function buildCluster(
   tier: Tier = "small",
   restore?: RestoreSource,
   highAvailability = false,
+  archiveGeneration = 0,
 ): CnpgClusterManifest {
   const labels = { ...labelsFor(id, externalId), [TIER_LABEL]: tier };
   return {
@@ -436,6 +481,13 @@ export function buildCluster(
       // running", and telling a concurrent caller its database was hibernated
       // was wrong in exactly the case the label exists to distinguish.
       labels: { ...labels, [HIBERNATED_LABEL]: "false" },
+      // Recorded on the Cluster because it has to survive: every later backup,
+      // and every later restore, has to know which prefix this database is
+      // archiving to. Written only above generation 0, so an untouched database
+      // carries no annotation at all and reads back as 0.
+      ...(archiveGeneration > 0
+        ? { annotations: { [ARCHIVE_GENERATION_ANNOTATION]: String(archiveGeneration) } }
+        : {}),
     },
     spec: {
       instances: highAvailability ? HA_INSTANCES : 1,
@@ -459,17 +511,31 @@ export function buildCluster(
       },
 
       // Where this database's backups go, when the installation has somewhere to
-      // put them. One ObjectStore serves every database; CloudNativePG separates
-      // them inside the bucket by serverName, which defaults to the Cluster
-      // name — and those are derived from external_id, so they are already
-      // distinct without drigodb passing anything.
+      // put them. One ObjectStore serves every database, separated inside the
+      // bucket by serverName.
+      //
+      // serverName is passed EXPLICITLY rather than left to default to the
+      // Cluster name, which is what makes restore in place possible at all: a
+      // restored database keeps its Cluster name and must archive somewhere else,
+      // because barman refuses to write a second timeline into a non-empty
+      // archive. See ARCHIVE_GENERATION_ANNOTATION. At generation 0 this produces
+      // exactly the name CloudNativePG would have chosen, so nothing moves for a
+      // database that has never been restored over.
+      //
+      // The plugin's docs are explicit that this belongs here and not on the
+      // ObjectStore: "the serverName parameter in the ObjectStore resource ...
+      // must always be left empty. When needed, use the serverName plugin
+      // parameter in the Cluster configuration instead."
       ...(backupsEnabled()
         ? {
             plugins: [
               {
                 name: BARMAN_PLUGIN,
                 isWALArchiver: true,
-                parameters: { barmanObjectName: config.backup.objectStore },
+                parameters: {
+                  barmanObjectName: config.backup.objectStore,
+                  serverName: archiveServerName(id, archiveGeneration),
+                },
               },
             ],
           }
@@ -672,14 +738,28 @@ export function buildCluster(
 // that a backup should exist and the operator does the work, reports progress
 // in the object's status, and drigodb reads it back. That is why the control
 // plane holds no bucket credential.
-export function buildBackup(id: string, externalId: string, at = new Date()): object {
+export function buildBackup(
+  id: string,
+  externalId: string,
+  at = new Date(),
+  archiveGeneration = 0,
+): object {
   return {
     apiVersion: `${CNPG_GROUP}/v1`,
     kind: "Backup",
     metadata: {
       name: backupName(id, at),
       namespace: config.databaseNamespace,
-      labels: labelsFor(id, externalId),
+      // The generation is a label rather than only an annotation because a
+      // Backup OUTLIVES the generation it was taken in. Restoring from a backup
+      // predating an in-place restore has to read the prefix that actually holds
+      // it, and this is the only record of which one that is.
+      labels: {
+        ...labelsFor(id, externalId),
+        ...(archiveGeneration > 0
+          ? { [ARCHIVE_GENERATION_LABEL]: String(archiveGeneration) }
+          : {}),
+      },
     },
     spec: {
       cluster: { name: clusterName(id) },

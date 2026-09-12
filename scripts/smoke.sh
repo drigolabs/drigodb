@@ -976,6 +976,97 @@ fi
 DB_ID="$SAVED_DB_ID"
 api -XDELETE "localhost:${API_PORT}/v1/databases/${HA_ID}" >/dev/null 2>&1 || true
 
+step "Restoring over a database, keeping its id"
+# The destructive restore. A throwaway database, because this one cannot be
+# undone: it discards everything written since the target.
+#
+# The assertion that matters is not "the data came back" — restore-into-new above
+# already proves recovery works. It is that the SAME id and the SAME connection
+# URI still reach the database afterwards, because that is the entire reason this
+# endpoint exists rather than telling people to restore into a new database and
+# repoint every consumer.
+if [ "$BACKUPS_STATE" != "enabled" ]; then
+  note "backups are ${BACKUPS_STATE}; skipping the in-place restore"
+else
+  IP_EXT="${EXTERNAL_ID}-inplace"
+  IP="$(api -XPOST "localhost:${API_PORT}/v1/databases" -d "{\"external_id\":\"${IP_EXT}\"}")"
+  IP_ID="$(echo "$IP" | jqf '["id"]')"
+  IP_URI="$(echo "$IP" | jqf '["connection_uri"]')"
+  [ -n "$IP_ID" ] || { fail "could not create a database to restore over: ${IP}"; exit 1; }
+  for _ in $(seq 1 90); do
+    [ "$(api "localhost:${API_PORT}/v1/databases/${IP_ID}" | jqf '["status"]')" = "ready" ] && break
+    sleep 3
+  done
+
+  SAVED_DB_ID="$DB_ID"; DB_ID="$IP_ID"
+  psql_when_reachable "$IP_URI" "CREATE TABLE ip (id int PRIMARY KEY, note text);
+    INSERT INTO ip VALUES (1,'before-backup');" >/dev/null
+
+  IP_BK="$(api -XPOST "localhost:${API_PORT}/v1/databases/${IP_ID}/backups" | jqf '["id"]')"
+  for _ in $(seq 1 60); do
+    IP_BK_STATE="$(api "localhost:${API_PORT}/v1/databases/${IP_ID}/backups" \
+      | python3 -c "import json,sys;print(next((b['status'] for b in json.load(sys.stdin)['backups'] if b['id']=='${IP_BK}'),'missing'))")"
+    case "$IP_BK_STATE" in completed|failed) break ;; esac
+    sleep 3
+  done
+  [ "$IP_BK_STATE" = "completed" ] || { fail "backup did not complete (${IP_BK_STATE})"; DB_ID="$SAVED_DB_ID"; exit 1; }
+
+  # Written AFTER the backup, so it must be gone afterwards. Without this the test
+  # would pass on a restore that did nothing at all.
+  psql_in_cluster "$IP_URI" "INSERT INTO ip VALUES (2,'after-backup') ON CONFLICT DO NOTHING;" >/dev/null
+  ok "${IP_ID} has a backup and a row written since it"
+
+  # A confirmation naming a DIFFERENT database must be refused. This is the guard
+  # against a copied script restoring the wrong database, so it is asserted before
+  # the real call rather than trusted.
+  WRONG_CODE="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" \
+    -H 'content-type: application/json' \
+    -XPOST "localhost:${API_PORT}/v1/databases/${IP_ID}/restore" \
+    -d "{\"confirm\":\"${SAVED_DB_ID}\",\"backup_id\":\"${IP_BK}\"}")"
+  if [ "$WRONG_CODE" = "400" ]; then
+    ok "a confirmation naming another database is refused (400)"
+  else
+    fail "a wrong confirmation returned ${WRONG_CODE}, not 400 — this guard is the only thing between a copied script and the wrong database"
+    DB_ID="$SAVED_DB_ID"; exit 1
+  fi
+
+  api -XPOST "localhost:${API_PORT}/v1/databases/${IP_ID}/restore" \
+    -d "{\"confirm\":\"${IP_ID}\",\"backup_id\":\"${IP_BK}\"}" >/dev/null
+  for _ in $(seq 1 120); do
+    IP_STATE="$(api "localhost:${API_PORT}/v1/databases/${IP_ID}" | jqf '["status"]')"
+    case "$IP_STATE" in ready|failed) break ;; esac
+    sleep 3
+  done
+  if [ "$IP_STATE" != "ready" ]; then
+    fail "the restored-in-place database never came back (${IP_STATE})"
+    explain_stuck_database "$IP_ID"
+    DB_ID="$SAVED_DB_ID"; exit 1
+  fi
+
+  # The URI is the ORIGINAL one, unchanged. Not reissued, not looked up again.
+  IP_ROWS="$(psql_when_reachable "$IP_URI" "SELECT string_agg(note, ',' ORDER BY id) FROM ip")"
+  DB_ID="$SAVED_DB_ID"
+  case "$IP_ROWS" in
+    *before-backup*after-backup*)
+      fail "the restore kept data written after the backup — it did not restore"; exit 1 ;;
+    *before-backup*)
+      ok "restored in place: the original URI still works and the later row is gone" ;;
+    *)
+      fail "the restored database has no data (${IP_ROWS})"; exit 1 ;;
+  esac
+
+  # Same id, and still the same endpoint a consumer stored.
+  IP_ENDPOINT="$(api "localhost:${API_PORT}/v1/databases/${IP_ID}" | jqf '["endpoint"]')"
+  if [ "$IP_ENDPOINT" = "db-${IP_ID}.drigodb-databases.svc.cluster.local" ]; then
+    ok "same id, same endpoint — no consumer needs repointing"
+  else
+    fail "the endpoint changed to ${IP_ENDPOINT}"
+    exit 1
+  fi
+
+  api -XDELETE "localhost:${API_PORT}/v1/databases/${IP_ID}" >/dev/null 2>&1 || true
+fi
+
 step "Deleting a database actually deletes it"
 # The path that destroys a customer's data, and until now nothing asserted it.
 # Every other DELETE in this file is cleanup — `>/dev/null 2>&1 || true` — so the

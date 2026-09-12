@@ -20,6 +20,8 @@ import {
   buildCluster,
   connectionUri,
   TIERS,
+  archiveGenerationOf,
+  archiveServerName,
 } from "../src/k8s/manifests.js";
 import { ValidationError, validateExternalId } from "../src/k8s/provisioner.js";
 
@@ -403,5 +405,74 @@ describe("high availability", () => {
     const spec = buildCluster(ID, EXT, "small", { sourceCluster: `db-${ID}` }, true).spec;
     expect(spec.instances).toBe(2);
     expect(spec.bootstrap).toHaveProperty("recovery");
+  });
+});
+
+// A restore in place cannot archive into the prefix it is restoring FROM. barman
+// refuses — "Expected empty archive" — and is right to, because two timelines
+// under one serverName would corrupt the archive for both.
+describe("archive generations", () => {
+  // The backup plugin only appears when the installation has somewhere to put a
+  // backup, so these have to load the module with a bucket configured.
+  async function withBackups() {
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_BACKUP_OBJECT_STORE", "drigodb-api-backups");
+    return await import("../src/k8s/manifests.js");
+  }
+
+  it("is the Cluster name at generation 0, which is what CNPG would default to", () => {
+    // So nothing moves for a database that has never been restored over, and
+    // nothing has to be migrated.
+    expect(archiveServerName(ID)).toBe(`db-${ID}`);
+    expect(archiveServerName(ID, 0)).toBe(`db-${ID}`);
+  });
+
+  it("is a distinct prefix from generation 1 onwards", () => {
+    expect(archiveServerName(ID, 1)).toBe(`db-${ID}-r1`);
+    expect(archiveServerName(ID, 2)).toBe(`db-${ID}-r2`);
+  });
+
+  it("reads back as 0 when absent, empty or nonsense", () => {
+    // Guessing higher would point a restore at an archive that does not exist.
+    expect(archiveGenerationOf(undefined)).toBe(0);
+    expect(archiveGenerationOf({})).toBe(0);
+    expect(archiveGenerationOf({ annotations: {} })).toBe(0);
+    expect(archiveGenerationOf({ annotations: { "drigodb.io/archive-generation": "" } })).toBe(0);
+    expect(archiveGenerationOf({ annotations: { "drigodb.io/archive-generation": "nope" } })).toBe(0);
+    expect(archiveGenerationOf({ annotations: { "drigodb.io/archive-generation": "-3" } })).toBe(0);
+  });
+
+  it("reads an annotation or a label, because the Cluster uses one and Backups the other", () => {
+    expect(archiveGenerationOf({ annotations: { "drigodb.io/archive-generation": "2" } })).toBe(2);
+    expect(archiveGenerationOf({ labels: { "drigodb.io/archive-generation": "3" } })).toBe(3);
+  });
+
+  it("passes serverName to the plugin explicitly, rather than letting it default", async () => {
+    // The whole mechanism. Without an explicit serverName a restored Cluster
+    // archives under its own name, which already holds the original's archive.
+    const m = await withBackups();
+    const p0 = m.buildCluster(ID, EXT).spec.plugins?.[0];
+    expect(p0?.parameters.serverName).toBe(`db-${ID}`);
+    const p2 = m.buildCluster(ID, EXT, "small", undefined, false, 2).spec.plugins?.[0];
+    expect(p2?.parameters.serverName).toBe(`db-${ID}-r2`);
+  });
+
+  it("records the generation on the Cluster, and only above 0", async () => {
+    const m = await withBackups();
+    expect(m.buildCluster(ID, EXT).metadata).not.toHaveProperty("annotations");
+    expect(
+      m.buildCluster(ID, EXT, "small", undefined, false, 1).metadata.annotations,
+    ).toEqual({ "drigodb.io/archive-generation": "1" });
+  });
+
+  it("labels a Backup with the generation it was taken in", async () => {
+    // A Backup outlives its generation, and restoring from one taken before an
+    // in-place restore has to read the prefix that actually holds it.
+    const m = await withBackups();
+    const at = new Date("2026-09-13T07:18:16Z");
+    const b0 = m.buildBackup(ID, EXT, at) as { metadata: { labels: Record<string, string> } };
+    expect(b0.metadata.labels).not.toHaveProperty("drigodb.io/archive-generation");
+    const b2 = m.buildBackup(ID, EXT, at, 2) as { metadata: { labels: Record<string, string> } };
+    expect(b2.metadata.labels["drigodb.io/archive-generation"]).toBe("2");
   });
 });

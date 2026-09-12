@@ -28,7 +28,10 @@ import {
   BACKUPS_PLURAL,
   CLUSTERS_PLURAL,
   DB_USER,
+  ARCHIVE_GENERATION_ANNOTATION,
   CNPG_ARCHIVING_CONDITION,
+  archiveGenerationOf,
+  archiveServerName,
   CNPG_GROUP,
   CNPG_HIBERNATION_ANNOTATION,
   CREDENTIAL_VERSION_ANNOTATION,
@@ -313,6 +316,40 @@ export function validateRestoreFrom(
   };
 }
 
+// What `POST /{id}/restore` is allowed to say.
+//
+// `confirm` must be the database's own id. Not a boolean: `{"force": true}` is
+// something a script sets once and forgets, and naming the database is something
+// a caller has to have looked up. It also cannot be copied between databases by
+// accident, which a boolean can. The same reasoning as scripts/doks-down.sh
+// asking for the cluster name rather than y/n.
+export function validateRestoreInPlace(
+  id: string,
+  value: unknown,
+  now: Date = new Date(),
+): { backupId?: string; targetTime?: string } {
+  if (value === null || typeof value !== "object") {
+    throw new ValidationError("a restore needs a body naming what to restore to");
+  }
+  const v = value as { confirm?: unknown };
+  if (v.confirm !== id) {
+    throw new ValidationError(
+      `restoring over a database destroys everything written since the target, and cannot be undone. ` +
+        `Send {"confirm": "${id}"} to proceed.`,
+    );
+  }
+  // Everything about naming a target is already decided and tested (#19), so
+  // reuse it rather than writing a second, subtly different version. A
+  // database_id is not accepted here: the source is this database.
+  const from = validateRestoreFrom({ ...(value as object), database_id: id }, now);
+  if (!from) throw new ValidationError("a restore needs a backup_id or a target_time");
+  const { backupId, targetTime } = from;
+  if (!backupId && !targetTime) {
+    throw new ValidationError("a restore needs a backup_id or a target_time");
+  }
+  return { ...(backupId ? { backupId } : {}), ...(targetTime ? { targetTime } : {}) };
+}
+
 // Opt-in, and only at create.
 //
 // A boolean rather than an `ha-small` / `ha-medium` tier ladder: high
@@ -368,7 +405,13 @@ export interface DatabaseBackup {
 }
 
 interface CnpgBackup {
-  metadata?: { name?: string; creationTimestamp?: string };
+  // labels, because the archive generation a backup was taken in is recorded
+  // there and a restore cannot find the right prefix without it.
+  metadata?: {
+    name?: string;
+    creationTimestamp?: string;
+    labels?: Record<string, string>;
+  };
   status?: {
     phase?: string;
     backupId?: string;
@@ -1206,8 +1249,18 @@ export class Provisioner {
   // makes recovery to an arbitrary instant possible in the first place, so
   // there is no upper bound to check: a target time after the last backup is
   // the ordinary case this feature exists for.
-  private async assertRecoverableTo(databaseId: string, targetTime: string): Promise<void> {
-    const backups = (await this.backupObjects(databaseId)).map(toBackup);
+  private async assertRecoverableTo(
+    databaseId: string,
+    targetTime: string,
+    generation = 0,
+  ): Promise<void> {
+    // Only the backups of the generation being restored FROM. A backup taken
+    // before an in-place restore is in a different prefix, and the WAL of this
+    // generation does not reach back past the restore that created it — so
+    // counting it would call a target satisfiable that nothing can replay to.
+    const backups = (await this.backupObjects(databaseId))
+      .filter((b) => archiveGenerationOf(b.metadata) === generation)
+      .map(toBackup);
     // When a backup FINISHED, not when it started. A base backup is only
     // consistent at its end — that is the earliest instant WAL can replay
     // forward from — so a target between a backup's start and stop is inside a
@@ -1276,10 +1329,19 @@ export class Provisioner {
     // The source database need not still exist — restoring from a database
     // somebody deleted is a legitimate thing to want, and its backups outlive
     // it in the bucket. What must exist is the backup, when one was named.
+    // Which archive prefix holds the thing being restored.
+    //
+    // Not simply the Cluster name any more. A database that has been restored
+    // over archives under a later generation, and a Backup taken before that
+    // still lives under the earlier one — so the prefix comes from the Backup
+    // when one is named, and from the database's current generation otherwise.
     if (!from.backupId) {
-      if (from.targetTime) await this.assertRecoverableTo(from.databaseId, from.targetTime);
+      const generation = archiveGenerationOf((await this.clusterFor(from.databaseId))?.metadata);
+      if (from.targetTime) {
+        await this.assertRecoverableTo(from.databaseId, from.targetTime, generation);
+      }
       return {
-        sourceCluster: clusterName(from.databaseId),
+        sourceCluster: archiveServerName(from.databaseId, generation),
         ...(from.targetTime ? { targetTime: from.targetTime } : {}),
       };
     }
@@ -1313,7 +1375,117 @@ export class Provisioner {
         `backup ${from.backupId} has not completed, so there is nothing to restore from yet`,
       );
     }
-    return { sourceCluster: clusterName(from.databaseId), barmanBackupId: barmanId };
+    // The generation the BACKUP was taken in, which is not necessarily the one
+    // the database is on now.
+    return {
+      sourceCluster: archiveServerName(
+        from.databaseId,
+        archiveGenerationOf((backup as { metadata?: { labels?: Record<string, string> } }).metadata),
+      ),
+      barmanBackupId: barmanId,
+    };
+  }
+
+  // Put a database back to an earlier state, keeping its id and its URI.
+  //
+  // See docs/restore-in-place.md for the shape and what it deliberately does not
+  // do. The short version: a Cluster bootstraps once, so this replaces the
+  // Cluster and keeps everything a consumer holds — which works only because
+  // drigodb sets no ownerReferences on the Service, the Secret or the
+  // NetworkPolicy. CloudNativePG owns the PVCs and takes them with the Cluster.
+  //
+  // Destructive and not undoable. No safety backup is taken: a caller who wants
+  // one calls POST /backups first, and drigodb does not decide that for them
+  // (decision 0008).
+  async restoreInPlace(
+    id: string,
+    target: { backupId?: string; targetTime?: string },
+  ): Promise<Database> {
+    const ns = config.databaseNamespace;
+    const cluster = await this.clusterFor(id);
+    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
+
+    const externalId = cluster.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "";
+    const tier = tierOf(cluster.metadata?.labels);
+    const highAvailability = (cluster.spec?.instances ?? 1) > 1;
+
+    // The restored database archives to the NEXT generation.
+    //
+    // It cannot reuse the prefix it is restoring from. barman refuses — "WAL
+    // archive check failed for server db-<id>: Expected empty archive" — and is
+    // right to, because two timelines under one serverName would corrupt the
+    // archive for both. Found the hard way: the first version of this kept the
+    // prefix and the recovery Job failed five times over before giving up.
+    //
+    // The old prefix is left in the bucket. That is not litter: it holds this
+    // database's history from before the restore, and the Backup objects taken
+    // then still carry the generation that names it.
+    const nextGeneration = archiveGenerationOf(cluster.metadata) + 1;
+
+    // EVERYTHING checkable happens before the Cluster is touched. After the next
+    // block there is no database to put back, so a target that does not exist has
+    // to fail here or not at all.
+    const restore = await this.resolveRestore({ databaseId: id, ...target });
+
+    // The point of no return.
+    //
+    // Deleting the Cluster takes its PVCs with it — CloudNativePG owns them — and
+    // with them everything written since the target. The Secret, the Service and
+    // the NetworkPolicy are nobody's children and stay, which is what keeps the
+    // consumer's URI valid.
+    await this.ignoreMissing(() =>
+      this.objects.deleteNamespacedCustomObject({
+        group: CNPG_GROUP,
+        version: "v1",
+        namespace: ns,
+        plural: CLUSTERS_PLURAL,
+        name: clusterName(id),
+      }),
+    );
+
+    // Wait for the volumes to actually go before recreating.
+    //
+    // Not politeness. A new Cluster finding a PVC under the name it wants would
+    // adopt a volume holding the state being restored away from — the same
+    // hazard create() refuses with DeletionInFlightError, reached here by a
+    // different road.
+    let cleared = false;
+    for (let i = 0; i < 120; i++) {
+      const pvcs = await this.core.listNamespacedPersistentVolumeClaim({
+        namespace: ns,
+        labelSelector: `${DB_ID_LABEL}=${id}`,
+      });
+      if ((pvcs.items ?? []).length === 0) {
+        cleared = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    if (!cleared) {
+      throw new Error(
+        `the volumes for ${id} did not go away, so the restore cannot safely recreate it. ` +
+          "The database is down and its Cluster is deleted; retry the restore.",
+      );
+    }
+
+    // Same name, same Secret, same tier, same instance count. Only the bootstrap
+    // differs from what create() would build.
+    await this.ensure(() =>
+      this.objects.createNamespacedCustomObject({
+        group: CNPG_GROUP,
+        version: "v1",
+        namespace: ns,
+        plural: CLUSTERS_PLURAL,
+        body: buildCluster(id, externalId, tier, restore, highAvailability, nextGeneration),
+      }),
+    );
+
+    // The policy too, for the same reason wake() does it: a database created by
+    // an older drigodb keeps the rules it was born with, and this is a fresh
+    // Cluster under an old database's name.
+    await this.ensureNetworkPolicy(id, externalId);
+
+    return await this.get(id);
   }
 
   async createBackup(id: string): Promise<DatabaseBackup> {
@@ -1330,7 +1502,9 @@ export class Provisioner {
       version: "v1",
       namespace: config.databaseNamespace,
       plural: BACKUPS_PLURAL,
-      body: buildBackup(id, externalId),
+      // Stamped with the generation it is being taken in, so a restore years
+      // later still knows which prefix holds it.
+      body: buildBackup(id, externalId, new Date(), archiveGenerationOf(cluster.metadata)),
     })) as CnpgBackup;
     return toBackup(created);
   }
