@@ -48,11 +48,30 @@ explain_stuck_database() {
 
 PIDS=()
 cleanup() {
-  for p in "${PIDS[@]:-}"; do kill "$p" >/dev/null 2>&1 || true; done
+  for p in "${PIDS[@]:-}"; do
+    [ -z "${p:-}" ] && continue
+    # Children first, then the process itself. `$!` is not always the thing
+    # holding the port: a backgrounded shell FUNCTION forks a subshell, and
+    # killing the subshell can leave its kubectl orphaned — which is exactly how
+    # a dead run went on holding the port and the next one reported the API as
+    # unreachable. start_pf now invokes kubectl directly so this is belt rather
+    # than the whole mechanism.
+    pkill -P "$p" >/dev/null 2>&1 || true
+    kill "$p" >/dev/null 2>&1 || true
+  done
+  # A moment for the listener to actually go, then SIGKILL anything that has not.
+  # Without this, a retry in the same shell can still find the port held.
+  for p in "${PIDS[@]:-}"; do
+    [ -z "${p:-}" ] && continue
+    kill -0 "$p" >/dev/null 2>&1 && { sleep 1; kill -9 "$p" >/dev/null 2>&1 || true; }
+  done
   [ -n "${SMOKE_CA_CONFIGMAP:-}" ] && k delete configmap "$SMOKE_CA_CONFIGMAP" -n drigodb-databases >/dev/null 2>&1
   return 0
 }
-trap cleanup EXIT
+# INT and TERM as well as EXIT. A run stopped with Ctrl-C is exactly when the
+# tunnel is most likely to be left behind, because that is when somebody is
+# already debugging something else.
+trap cleanup EXIT INT TERM
 
 jqf() { python3 -c "import json,sys; d=json.load(sys.stdin); print(d$1)"; }
 
@@ -182,8 +201,31 @@ print(json.dumps({"spec": {
   printf '%s' "$out"
 }
 
+# Is something already listening on a local port?
+#
+# bash's /dev/tcp rather than lsof, which is not installed everywhere this runs.
+port_held() { # port
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") >/dev/null 2>&1 && { exec 3<&- 2>/dev/null; return 0; }
+  return 1
+}
+
 start_pf() { # resource local remote logfile
-  k port-forward -n "$3" "$1" "$2:$4" >"$5" 2>&1 &
+  # Say so BEFORE trying, because kubectl's own message for this is
+  # "Listeners failed to create ... bind: address already in use" buried under a
+  # generic failure, and it reads as a broken deployment rather than as a
+  # leftover process from the previous attempt. That cost real debugging time
+  # more than once.
+  if port_held "$2"; then
+    fail "local port $2 is already in use — almost certainly a port-forward from an earlier run"
+    fail "  find it:  lsof -ti :$2      or   pgrep -af 'port-forward.*$1'"
+    fail "  or run with a different port:  API_PORT=<free port> bash scripts/smoke.sh"
+    return 1
+  fi
+  # kubectl directly, NOT through k(). Backgrounding a shell function forks a
+  # subshell, so `$!` would be the subshell and the kubectl holding the port
+  # could outlive a kill of it. This is the reason a dead run used to block the
+  # next one.
+  kubectl --context "$CTX" port-forward -n "$3" "$1" "$2:$4" >"$5" 2>&1 &
   PIDS+=($!)
   for _ in $(seq 1 30); do grep -q "Forwarding from" "$5" 2>/dev/null && return 0; sleep 1; done
   fail "port-forward $1 never started"; cat "$5"; return 1
