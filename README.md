@@ -77,6 +77,7 @@ POST   /v1/databases/{id}/wake       → 202
 POST   /v1/databases/{id}/hibernate  → 202
 POST   /v1/databases/{id}/credentials  → 200 + a new connection_uri
 POST   /v1/databases/{id}/resize      { tier }  → 202, or 409 if the volume cannot grow
+POST   /v1/databases/{id}/restore     { confirm, backup_id? | target_time? }  → 202, destructive
 GET    /v1/databases/{id}/backups      what can be restored
 GET    /v1/ca                         the CA consumers verify against
 DELETE /v1/databases/{id}       destroys the data
@@ -289,12 +290,42 @@ GET  /v1/databases/{id}/backups   → what can be restored
 
 POST /v1/databases  { external_id, restore_from: { database_id, backup_id? } }
 POST /v1/databases  { external_id, restore_from: { database_id, target_time } }
+
+POST /v1/databases/{id}/restore  { confirm: "{id}", backup_id? | target_time? }
 ```
 
 **A restored database is a new database** — its own id, its own volume, its own
 credentials — and the one it came from is untouched. That is what makes it a
 safe undo: the thing being undone cannot be damaged by undoing it. Omit
 `backup_id` for the latest backup.
+
+**`POST /{id}/restore` puts a database back *in place*,** keeping its id and its
+connection URI so consumers need not be repointed. It is the destructive twin of
+the above: it **discards everything written since the target and cannot be
+undone**.
+
+```
+POST /v1/databases/a1b2c3d4e5f6/restore
+{ "confirm": "a1b2c3d4e5f6", "target_time": "2026-09-13T09:30:00Z" }
+```
+
+`confirm` must be the database's own id. Not a boolean — `{"force": true}` is
+something a script sets once and forgets, and an id is something a caller has to
+have looked up and cannot copy between databases by accident.
+
+**drigodb takes no safety backup first.** If you want a way back, call
+`POST /{id}/backups` before this; deciding that is yours, not drigodb's
+(`docs/decisions/0008`). And if recovery fails, the database does not come back —
+the old volume is gone by then.
+
+The database is **down** from the request until the recovered instance is ready.
+Minutes, not the seconds a wake takes, because a restore replays WAL rather than
+promoting a standby that already holds it.
+
+[docs/restore-in-place.md](docs/restore-in-place.md) draws the sequence and says
+what survives: drigodb sets no `ownerReferences`, so the Service, Secret and
+NetworkPolicy outlive the Cluster being replaced — which is the entire reason the
+stored URI keeps working.
 
 **`target_time` recovers to an instant, not to a backup.** WAL is archived for
 every database, so the recoverable moments are not only the ones a backup landed

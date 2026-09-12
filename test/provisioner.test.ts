@@ -20,6 +20,7 @@ import {
   ValidationError,
   validateHighAvailability,
   validateRestoreFrom,
+  validateRestoreInPlace,
   validateTier,
 } from "../src/k8s/provisioner.js";
 
@@ -923,5 +924,214 @@ describe("resize refuses what the storage cannot do", () => {
     const { provisioner, patches } = provisionerOn({});
     await provisioner.resize(ID, "medium");
     expect(patches.length).toBeGreaterThan(0);
+  });
+});
+
+describe("restoring over a database", () => {
+  const NOW = new Date("2026-09-13T12:00:00.000Z");
+
+  it("refuses without a confirmation naming this database", () => {
+    for (const body of [
+      {},
+      { backup_id: "bk-a1b2c3d4e5f6-20260907" },
+      { confirm: true, backup_id: "bk-a1b2c3d4e5f6-20260907" },
+      { confirm: "yes", backup_id: "bk-a1b2c3d4e5f6-20260907" },
+      // The id of a DIFFERENT database, which a copied script would carry.
+      { confirm: "0123456789ab", backup_id: "bk-a1b2c3d4e5f6-20260907" },
+    ]) {
+      expect(() => validateRestoreInPlace(ID, body, NOW)).toThrow(ValidationError);
+    }
+  });
+
+  it("accepts a confirmation that is the database's own id", () => {
+    expect(
+      validateRestoreInPlace(ID, { confirm: ID, backup_id: "bk-a1b2c3d4e5f6-20260907" }, NOW),
+    ).toEqual({ backupId: "bk-a1b2c3d4e5f6-20260907" });
+  });
+
+  it("takes a target time, with the same handling as restore_from", () => {
+    // Not a second, subtly different implementation: #19's validation is reused,
+    // including the PostgreSQL timestamp format CloudNativePG needs.
+    expect(
+      validateRestoreInPlace(ID, { confirm: ID, target_time: "2026-09-13T09:30:00Z" }, NOW),
+    ).toEqual({ targetTime: "2026-09-13 09:30:00.000000+00:00" });
+  });
+
+  it("refuses a target that names nothing", () => {
+    expect(() => validateRestoreInPlace(ID, { confirm: ID }, NOW)).toThrow(ValidationError);
+  });
+
+  it("refuses a backup_id and a target_time together, like restore_from", () => {
+    expect(() =>
+      validateRestoreInPlace(
+        ID,
+        { confirm: ID, backup_id: "bk-a1b2c3d4e5f6-20260907", target_time: "2026-09-13T09:30:00Z" },
+        NOW,
+      ),
+    ).toThrow(ValidationError);
+  });
+
+  it("refuses a target time with no offset, like restore_from", () => {
+    expect(() =>
+      validateRestoreInPlace(ID, { confirm: ID, target_time: "2026-09-13T09:30:00" }, NOW),
+    ).toThrow(ValidationError);
+  });
+});
+
+// The ordering property this operation turns on: nothing is destroyed until the
+// target has been validated. After the Cluster is deleted there is no database
+// to put back, so a bad target has to fail before that or not at all.
+describe("restore in place destroys nothing before it validates", () => {
+  async function withBackups(backups: Array<{ name: string; phase: string; stopped?: string }>) {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_BACKUP_OBJECT_STORE", "drigodb-api-backups");
+    const { Provisioner: P, ValidationError: VE, NotFoundError: NFE } =
+      await import("../src/k8s/provisioner.js");
+    const notFound = () => Object.assign(new Error("not found"), { code: 404 });
+    const acted: string[] = [];
+    const created: Array<{
+      metadata: { name: string; annotations?: Record<string, string> };
+      spec?: { plugins?: Array<{ parameters?: Record<string, string> }> };
+    }> = [];
+    const clusters = new Map<string, unknown>([
+      [
+        `db-${ID}`,
+        {
+          metadata: {
+            name: `db-${ID}`,
+            labels: {
+              "drigodb.io/database-id": ID,
+              "drigodb.io/external-id": EXT,
+              "drigodb.io/tier": "small",
+            },
+          },
+          spec: { instances: 1 },
+          status: { readyInstances: 1 },
+        },
+      ],
+    ]);
+    const objectsApi = {
+      getNamespacedCustomObject: async (req: { name: string; plural: string }) => {
+        if (req.plural === "backups") {
+          const b = backups.find((x) => x.name === req.name);
+          if (!b) throw notFound();
+          return {
+            metadata: { name: b.name, labels: { "drigodb.io/database-id": ID } },
+            status: { phase: b.phase, backupId: "20260907T071816", stoppedAt: b.stopped },
+          };
+        }
+        const c = clusters.get(req.name);
+        if (!c) throw notFound();
+        return c;
+      },
+      listNamespacedCustomObject: async () => ({
+        items: backups.map((b) => ({
+          metadata: { name: b.name, labels: { "drigodb.io/database-id": ID } },
+          status: { phase: b.phase, backupId: "20260907T071816", stoppedAt: b.stopped },
+        })),
+      }),
+      deleteNamespacedCustomObject: async (req: { name: string }) => {
+        acted.push(`delete:${req.name}`);
+        clusters.delete(req.name);
+        return {};
+      },
+      createNamespacedCustomObject: async (req: {
+        body: {
+          metadata: { name: string; annotations?: Record<string, string> };
+          spec?: { plugins?: Array<{ parameters?: Record<string, string> }> };
+        };
+      }) => {
+        acted.push(`create:${req.body.metadata.name}`);
+        created.push(req.body);
+        clusters.set(req.body.metadata.name, req.body);
+        return req.body;
+      },
+    };
+    const core = {
+      listNamespacedPod: async () => ({
+        items: [{ status: { conditions: [{ type: "Ready", status: "True" }] } }],
+      }),
+      // Empty, so the wait for volumes to clear returns immediately.
+      listNamespacedPersistentVolumeClaim: async () => ({ items: [] }),
+    };
+    const net = {
+      createNamespacedNetworkPolicy: async () => ({}),
+      replaceNamespacedNetworkPolicy: async () => ({}),
+    };
+    const batch = { readNamespacedJob: async () => { throw notFound(); } };
+    return {
+      acted,
+      created,
+      ValidationError: VE,
+      NotFoundError: NFE,
+      provisioner: new P(
+        {} as never, core as never, net as never, batch as never, objectsApi as never,
+      ),
+    };
+  }
+
+  it("does not delete the Cluster when the backup does not exist", async () => {
+    const { provisioner, acted, NotFoundError: NFE } = await withBackups([]);
+    await expect(
+      provisioner.restoreInPlace(ID, { backupId: "bk-nope" }),
+    ).rejects.toThrow(NFE);
+    expect(acted).toEqual([]);
+  });
+
+  it("does not delete the Cluster when the target predates every backup", async () => {
+    const { provisioner, acted, ValidationError: VE } = await withBackups([
+      { name: "bk-1", phase: "completed", stopped: "2026-09-13T10:00:00Z" },
+    ]);
+    await expect(
+      provisioner.restoreInPlace(ID, { targetTime: "2026-09-13 09:00:00.000000+00:00" }),
+    ).rejects.toThrow(VE);
+    expect(acted).toEqual([]);
+  });
+
+  it("deletes then recreates under the SAME name when the target is good", async () => {
+    // The same name is the whole feature: the Service selector and the Secret are
+    // untouched, so the consumer's stored URI keeps working.
+    const { provisioner, acted } = await withBackups([
+      { name: "bk-1", phase: "completed", stopped: "2026-09-13T10:00:00Z" },
+    ]);
+    await provisioner.restoreInPlace(ID, { targetTime: "2026-09-13 11:00:00.000000+00:00" });
+    expect(acted).toEqual([`delete:db-${ID}`, `create:db-${ID}`]);
+  });
+
+  it("archives the restored database to the NEXT generation", async () => {
+    // The bug that took five failed recovery Jobs on a real cluster to find.
+    // Keeping the prefix makes barman refuse outright — "WAL archive check failed
+    // for server db-<id>: Expected empty archive" — because two timelines under
+    // one serverName would corrupt the archive for both.
+    const { provisioner, created } = await withBackups([
+      { name: "bk-1", phase: "completed", stopped: "2026-09-13T10:00:00Z" },
+    ]);
+    await provisioner.restoreInPlace(ID, { backupId: "bk-1" });
+    const c = created.at(-1);
+    expect(c?.metadata.name).toBe(`db-${ID}`);
+    expect(c?.metadata.annotations?.["drigodb.io/archive-generation"]).toBe("1");
+    expect(c?.spec?.plugins?.[0]?.parameters?.serverName).toBe(`db-${ID}-r1`);
+  });
+
+  it("recovers FROM the prefix the backup was taken in, not the new one", async () => {
+    // Restoring reads the source archive and writes the destination archive, and
+    // after this change they are deliberately different prefixes.
+    const { provisioner, created } = await withBackups([
+      { name: "bk-1", phase: "completed", stopped: "2026-09-13T10:00:00Z" },
+    ]);
+    await provisioner.restoreInPlace(ID, { backupId: "bk-1" });
+    const c = created.at(-1) as unknown as {
+      spec: { externalClusters?: Array<{ plugin: { parameters: Record<string, string> } }> };
+    };
+    expect(c.spec.externalClusters?.[0]?.plugin.parameters.serverName).toBe(`db-${ID}`);
+  });
+
+  it("is a 404 for a database that does not exist, having done nothing", async () => {
+    const { provisioner, acted, NotFoundError: NFE } = await withBackups([]);
+    await expect(
+      provisioner.restoreInPlace("ffffffffffff", { backupId: "bk-1" }),
+    ).rejects.toThrow(NFE);
+    expect(acted).toEqual([]);
   });
 });

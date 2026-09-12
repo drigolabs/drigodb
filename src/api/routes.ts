@@ -10,6 +10,7 @@ import {
   NotConfiguredError,
   validateHighAvailability,
   validateRestoreFrom,
+  validateRestoreInPlace,
   ValidationError,
   validateExternalId,
   validateTier,
@@ -114,6 +115,28 @@ export function buildRoutes(provisioner: Provisioner): Hono {
 
   // Take a backup now. 202, because the operator does the work — this returns
   // once the request exists, which is the only thing that has actually happened.
+  // Restoring OVER a database, keeping its id and its URI.
+  //
+  // The destructive twin of `restore_from` on create, which makes a new database
+  // and leaves the source alone. This one discards everything written since the
+  // target and cannot be undone — see docs/restore-in-place.md, and note that
+  // drigodb takes no safety backup: a caller who wants one calls POST /backups
+  // first (decision 0008).
+  app.post("/v1/databases/:id/restore", async (c) => {
+    const id = c.req.param("id");
+    let target: { backupId?: string; targetTime?: string };
+    try {
+      const body = await c.req.json().catch(() => null);
+      target = validateRestoreInPlace(id, body);
+    } catch (err) {
+      if (err instanceof ValidationError) return c.json({ error: err.message }, 400);
+      throw err;
+    }
+    // 202: the database is down for as long as the recovery takes, which is
+    // minutes rather than the seconds a wake takes. A caller polls status.
+    return c.json(await provisioner.restoreInPlace(id, target), 202);
+  });
+
   app.post("/v1/databases/:id/backups", async (c) =>
     c.json(await provisioner.createBackup(c.req.param("id")), 202),
   );
