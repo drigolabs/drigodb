@@ -84,6 +84,27 @@ never an ancestor of `main` even when it landed. That is also why the branch
 looks stale and deletable afterwards — both branches holding
 `docs/decisions/0008` were on the delete list while it existed nowhere else.
 
+## Pins
+
+Every upstream version lives in `scripts/versions.env`, and the chart's
+`appVersion` is the API image a default install pulls. **Renovate proposes the
+bumps; a person merges them.** `renovate.json` names a datasource per pin, one
+pull request each — a batched bump is a batched revert, and these fail in
+unrelated ways.
+
+Nothing automated writes to `main`. Renovate runs as an app and opens a pull
+request, which is the whole reason it was chosen over Flux's image automation:
+that commits tags back to the repository.
+
+A release cannot pin itself — the commit being released cannot name the image the
+release is about to build (`docs/decisions/0002`) — so publishing and promoting
+are two merges, and the second one is a Renovate pull request.
+
+Two pins have bitten already, which is why this exists: MinIO was referenced with
+no tag at all and its repositories vanished from Docker Hub, breaking every
+branch; and `appVersion` sat four releases behind its own chart, so a documented
+install could never become ready.
+
 ## Comments
 
 The repo is heavily commented and the comments explain *why* — the failure that
