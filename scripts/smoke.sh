@@ -79,6 +79,37 @@ PSQL_RUN=0
 # for it to schedule, pull, run and terminate, then deletes it — six seconds or
 # so. In a poll loop that is the entire runtime: the WAL-archive wait below
 # spent four minutes in CI observing something that had already happened.
+# Connect and read, retrying ONLY while the failure is the endpoint not being
+# programmed yet.
+#
+# `status: ready` and "the ClusterIP accepts connections" are not the same
+# instant. drigodb reports ready when the primary pod is Ready, which is the most
+# it can honestly mean; Kubernetes then programs the EndpointSlice and
+# kube-proxy's rules, and a connection is REFUSED until it has. Usually
+# imperceptible, occasionally seconds — and a restored database hits it hardest,
+# because the pod appears only after recovery has replayed.
+#
+# #108 fixed the systematic half of this, where a ready STANDBY counted as the
+# database being ready and the endpoint pointed at nothing. What is left is
+# ordinary eventual consistency.
+#
+# Retried on TRANSPORT failure only, never on a result. Once a query returns
+# rows, that answer is the answer — a loop that retried until it liked the data
+# would be a test that cannot fail.
+psql_when_reachable() { # uri sql
+  local out=""
+  for _ in $(seq 1 20); do
+    out="$(psql_in_cluster "$1" "$2")"
+    case "$out" in
+      *"Connection refused"*|*"could not connect"*|*"server closed the connection"*|*"could not translate host name"*)
+        sleep 3 ;;
+      *)
+        printf '%s' "$out"; return 0 ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 psql_on_primary() { # sql
   local pod
   # instanceRole=primary, not podRole=instance. With a standby (#81) the latter
@@ -629,7 +660,7 @@ else
   # backup, not the state now. A restore that quietly handed back the live
   # database would look identical without this.
   SAVED_DB_ID="$DB_ID"; DB_ID="$R_ID"
-  R_ROWS="$(psql_in_cluster "$R_URI" "SELECT string_agg(note, ',' ORDER BY id) FROM bk")"
+  R_ROWS="$(psql_when_reachable "$R_URI" "SELECT string_agg(note, ',' ORDER BY id) FROM bk")"
   DB_ID="$SAVED_DB_ID"
   case "$R_ROWS" in
     *before-backup*after-backup*) fail "the restore contains data written AFTER the backup"; exit 1 ;;
@@ -715,7 +746,7 @@ else
   fi
 
   SAVED_DB_ID="$DB_ID"; DB_ID="$P_ID"
-  P_ROWS="$(psql_in_cluster "$P_URI" "SELECT string_agg(note, ',' ORDER BY id) FROM bk")"
+  P_ROWS="$(psql_when_reachable "$P_URI" "SELECT string_agg(note, ',' ORDER BY id) FROM bk")"
   DB_ID="$SAVED_DB_ID"
   case "$P_ROWS" in
     *after-target*) fail "recovered PAST the target time: ${P_ROWS}"; exit 1 ;;
@@ -902,6 +933,70 @@ fi
 
 DB_ID="$SAVED_DB_ID"
 api -XDELETE "localhost:${API_PORT}/v1/databases/${HA_ID}" >/dev/null 2>&1 || true
+
+step "Deleting a database actually deletes it"
+# The path that destroys a customer's data, and until now nothing asserted it.
+# Every other DELETE in this file is cleanup — `>/dev/null 2>&1 || true` — so the
+# response was never read and nothing checked the data had gone.
+#
+# It is also the path whose comments were wrong: they justified deleting PVCs by
+# hand with a `persistentVolumeClaimRetentionPolicy` that does not exist here.
+# What is true is that CloudNativePG owns the PVCs through a controller reference
+# and Kubernetes collects them anyway — which means this assertion holds whether
+# or not drigodb does the deleting, and that is the point. It pins the OUTCOME.
+DEL_EXT="${EXTERNAL_ID}-delete"
+DEL="$(api -XPOST "localhost:${API_PORT}/v1/databases" -d "{\"external_id\":\"${DEL_EXT}\"}")"
+DEL_ID="$(echo "$DEL" | jqf '["id"]')"
+[ -n "$DEL_ID" ] || { fail "could not create a database to delete: ${DEL}"; exit 1; }
+for _ in $(seq 1 90); do
+  [ "$(api "localhost:${API_PORT}/v1/databases/${DEL_ID}" | jqf '["status"]')" = "ready" ] && break
+  sleep 3
+done
+DEL_PVCS="$(k get pvc -n drigodb-databases -l "drigodb.io/database-id=${DEL_ID}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$DEL_PVCS" -ge 1 ]; then
+  ok "${DEL_ID} is up, holding ${DEL_PVCS} volume(s)"
+else
+  fail "no volume for ${DEL_ID}; nothing to prove is deleted"
+  exit 1
+fi
+
+api -XDELETE "localhost:${API_PORT}/v1/databases/${DEL_ID}" >/dev/null
+
+# The Cluster, then the volumes. Both are given time: deletion is asynchronous
+# either way, and a volume can sit in Terminating while the kubelet detaches it.
+for _ in $(seq 1 40); do
+  k get cluster "db-${DEL_ID}" -n drigodb-databases >/dev/null 2>&1 || break
+  sleep 3
+done
+if k get cluster "db-${DEL_ID}" -n drigodb-databases >/dev/null 2>&1; then
+  fail "the Cluster for ${DEL_ID} still exists after DELETE"
+  exit 1
+fi
+ok "the Cluster is gone"
+
+for _ in $(seq 1 40); do
+  LEFT="$(k get pvc -n drigodb-databases -l "drigodb.io/database-id=${DEL_ID}" --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+  [ "$LEFT" = "0" ] && break
+  sleep 3
+done
+if [ "$LEFT" = "0" ]; then
+  ok "the volumes are gone — the data actually went"
+else
+  fail "${LEFT} volume(s) for ${DEL_ID} survived DELETE; a deleted database is still on disk"
+  k get pvc -n drigodb-databases -l "drigodb.io/database-id=${DEL_ID}"
+  exit 1
+fi
+
+# And the API agrees it is gone, rather than reporting a database whose objects
+# have been removed underneath it.
+GONE_CODE="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" \
+  "localhost:${API_PORT}/v1/databases/${DEL_ID}")"
+if [ "$GONE_CODE" = "404" ]; then
+  ok "the API reports it as gone (404)"
+else
+  fail "GET on a deleted database returned ${GONE_CODE}, not 404"
+  exit 1
+fi
 
 echo
 printf "${GREEN}${BOLD}drigodb works end to end.${RESET}\n"
