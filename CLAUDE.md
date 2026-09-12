@@ -38,6 +38,7 @@ bash scripts/kind-up.sh           a real cluster on a laptop, via scripts/deploy
 bash scripts/kind-down.sh         tear it down — do this, kind clusters are not free RAM
 bash scripts/smoke.sh             end-to-end against a running installation
 bash scripts/chart-determinism-test.sh    renders the chart twice, asserts identical
+bash scripts/diagram-render-test.sh       every mermaid block in docs/ actually renders
 ```
 
 ## Pull requests
@@ -107,9 +108,17 @@ matched nothing once left `create()` ignoring the configured default tier.
 - The CI job names `typecheck and test`, `drigodb works end to end` and
   `api image builds` — branch protection on `main` requires them by those exact
   strings, and renaming one blocks every PR on a check that never reports.
+  `diagrams render` is not required yet and its name is already permanent for the
+  same reason.
 - The chart must render identically every time: no `lookup`, no `randAlphaNum`,
   no clock. One `lookup` rotated every consumer's bearer token on every Argo sync
   while reporting Synced. `scripts/chart-determinism-test.sh` enforces it.
+- A mermaid diagram must render. `;` is a statement separator inside a sequence
+  diagram, so a semicolon in note text — or an HTML entity like `&lt;`, which
+  contains one — truncates the statement and the rest is parsed as a diagram
+  instruction. The error names a comma several words away, not the cause.
+  `scripts/diagram-render-test.sh` catches it and says which line to look at.
+
 - `DELETE` removes a database's `Backup` records and never the bucket contents.
   Barman's retention policy owns the data, which is the split that keeps drigodb
   from destroying a customer's backups by deleting a Kubernetes object.
