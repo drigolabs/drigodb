@@ -36,7 +36,21 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run typecheck
-      - run: npm test
+      # With coverage, and reported rather than gated. A threshold is a policy
+      # decision about which numbers are acceptable, and nobody has made one — a
+      # number in the summary is what makes the question askable.
+      - run: npm run test:coverage
+      - name: Coverage
+        if: always()
+        run: |
+          {
+            echo "### Coverage"
+            echo ""
+            echo '```'
+            sed -n '/Coverage summary/,/^====/p' coverage-summary.txt 2>/dev/null \
+              || npx vitest run --coverage 2>&1 | sed -n '/Coverage summary/,/^====/p'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       # No cluster, a second to run, and it is what stops a template reaching for
       # a cluster or a clock again. The last one rotated every consumer's bearer
       # token on every Argo sync while reporting Synced.

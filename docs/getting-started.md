@@ -599,3 +599,86 @@ an issued URI.
 
 `bash scripts/smoke.sh` is the fastest way to find out which of these it is —
 it checks the operator, the RBAC, and then the whole lifecycle in order.
+
+## Turning backups on
+
+Moved here from the README. Backups are off until a bucket is configured, so this is setup
+rather than reference.
+
+Off by default. Set a bucket and an endpoint and every database archives WAL
+continuously and can be backed up on demand.
+
+```bash
+kubectl create secret generic drigodb-backup-credentials -n drigodb-databases \
+  --from-literal=access_key=... --from-literal=secret_key=...
+
+# then, on the control plane
+DRIGODB_BACKUP_BUCKET=my-bucket
+DRIGODB_BACKUP_ENDPOINT=https://fra1.digitaloceanspaces.com
+```
+
+```
+POST /v1/databases/{id}/backups   → 202, take one now
+GET  /v1/databases/{id}/backups   → what can be restored
+
+POST /v1/databases  { external_id, restore_from: { database_id, backup_id? } }
+POST /v1/databases  { external_id, restore_from: { database_id, target_time } }
+
+POST /v1/databases/{id}/restore  { confirm: "{id}", backup_id? | target_time? }
+```
+
+**A restored database is a new database** — its own id, its own volume, its own
+credentials — and the one it came from is untouched. That is what makes it a
+safe undo: the thing being undone cannot be damaged by undoing it. Omit
+`backup_id` for the latest backup.
+
+**`POST /{id}/restore` puts a database back *in place*,** keeping its id and its
+connection URI so consumers need not be repointed. It is the destructive twin of
+the above: it **discards everything written since the target and cannot be
+undone**.
+
+```
+POST /v1/databases/a1b2c3d4e5f6/restore
+{ "confirm": "a1b2c3d4e5f6", "target_time": "2026-09-13T09:30:00Z" }
+```
+
+`confirm` must be the database's own id. Not a boolean — `{"force": true}` is
+something a script sets once and forgets, and an id is something a caller has to
+have looked up and cannot copy between databases by accident.
+
+**drigodb takes no safety backup first.** If you want a way back, call
+`POST /{id}/backups` before this; deciding that is yours, not drigodb's
+(`docs/decisions/0008`). And if recovery fails, the database does not come back —
+the old volume is gone by then.
+
+The database is **down** from the request until the recovered instance is ready.
+Minutes, not the seconds a wake takes, because a restore replays WAL rather than
+promoting a standby that already holds it.
+
+[docs/restore-in-place.md](restore-in-place.md) draws the sequence and says
+what survives: drigodb sets no `ownerReferences`, so the Service, Secret and
+NetworkPolicy outlive the Cluster being replaced — which is the entire reason the
+stored URI keeps working.
+
+**`target_time` recovers to an instant, not to a backup.** WAL is archived for
+every database, so the recoverable moments are not only the ones a backup landed
+on: the difference between restoring yesterday's database and restoring it to
+the second before the statement that emptied a table. RFC3339, and it must carry
+an offset — `2026-09-09T09:30:00Z` — because a timestamp without one resolves
+against whichever timezone the control plane happens to run in. Either spelling
+of UTC is accepted; drigodb converts what it sends onward, for a reason recorded
+in `validateRestoreFrom`.
+
+`backup_id` and `target_time` are alternatives; sending both is a 400 rather
+than a precedence rule. A `target_time` before the earliest backup finished is
+also a 400, at the moment of the request, rather than a database that fails to
+bootstrap several minutes later. The recoverable window for a *running* database
+is bounded by the `ObjectStore` retention policy, 30 days by default — and that
+policy bounds less than it sounds like it does. See
+[docs/backup-retention.md](backup-retention.md): it is enforced by the
+running primary, so a deleted database's archive is never pruned at all. Removing
+one is the purge below.
+
+A backup belongs to the database it was taken from, and drigodb refuses a
+`restore_from` that names someone else's — otherwise any backup in the
+installation could be read by guessing its id.
