@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# What drigodb does when the cluster underneath it is wrong.
+# What drigodb does when the cluster underneath it, or its own configuration, is
+# wrong — and in one case, deliberately unusual rather than wrong.
 #
 # Every failure here is SILENT without the readiness gate, which is the whole
 # reason src/k8s/preflight.ts exists and the whole reason this script does:
@@ -35,6 +36,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CLUSTER="${DRIGODB_KIND_CLUSTER:-drigodb-install-test}"
 CTX="kind-${CLUSTER}"
 NS=drigodb-system
+# Token Secrets live beside the per-database ones, so this script needs both.
+NS_DB=drigodb-databases
+API_TOKEN=install-test-only
 IMAGE="drigolabs/drigodb-api:install-test"
 
 if [ -t 1 ]; then GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; BOLD='\033[1m'; RESET='\033[0m'; else GREEN=''; RED=''; YELLOW=''; BLUE=''; BOLD=''; RESET=''; fi
@@ -66,7 +70,7 @@ ok "${IMAGE} loaded into the node"
 
 HELM=(--kube-context "$CTX" upgrade --install drigodb "${ROOT}/charts/drigodb"
       --namespace "$NS" --create-namespace
-      --set "api.token=install-test-only"
+      --set "api.token=${API_TOKEN}"
       --set "image.repository=${IMAGE%:*}" --set "image.tag=${IMAGE##*:}"
       --set "image.pullPolicy=Never")
 
@@ -160,6 +164,23 @@ readyz() {
   k -n "$NS" exec "$p" -- node -e \
     "fetch('http://127.0.0.1:8080/readyz').then(r=>r.text()).then(t=>console.log(t)).catch(()=>console.log('{}'))" \
     2>/dev/null || echo '{}'
+}
+
+# An authenticated request, made from inside the pod for the same reasons readyz()
+# is: no port to leak and no background process to race. Prints the status code.
+#
+# node's fetch rather than curl, because the API image is node:22-alpine and has no
+# curl — and adding one to the image to make a test easier would be the test changing
+# the thing it tests.
+api_code() { # token, path, [method], [body]
+  local p; p="$(pod)"
+  [ -n "$p" ] || { echo "000"; return 0; }
+  k -n "$NS" exec "$p" -- node -e "
+const opts = { method: process.argv[2] || 'GET', headers: { authorization: 'Bearer ' + process.argv[1] } };
+if (process.argv[3]) { opts.body = process.argv[3]; opts.headers['content-type'] = 'application/json'; }
+fetch('http://127.0.0.1:8080' + process.argv[4], opts)
+  .then(r => console.log(r.status)).catch(() => console.log('000'));
+" -- "$1" "${3:-GET}" "${4:-}" "$2" 2>/dev/null || echo "000"
 }
 
 # One answer, read once, parsed as many times as an assertion needs. Asking twice
@@ -369,6 +390,105 @@ else
   bad "it left the version alone without saying why; the next person will not know it was deliberate"
 fi
 k -n cnpg-system set image deploy/cnpg-controller-manager manager="$BEFORE_IMAGE" >/dev/null
+
+# ---------------------------------------------------------------------------
+step "An installation can lose its bootstrap token and keep working"
+# The one case here that is not a broken cluster: it is a deliberate and supported
+# end state. DRIGODB_API_TOKEN is the pre-existing trust that mints the first real
+# token (#62), and an installation that has issued its own should be able to take
+# it away. That path cannot be reached from smoke.sh, whose every other assertion
+# authenticates with exactly this token.
+#
+# The failure mode if it is wrong is an installation that looks bricked: 401 to
+# everything, with nothing in the logs saying why.
+ISSUE_BODY='{"name":"survives bootstrap removal","tier":"admin"}'
+ISSUED="$(k -n "$NS" exec "$(pod)" -- node -e "
+fetch('http://127.0.0.1:8080/v1/tokens', {
+  method: 'POST',
+  headers: { authorization: 'Bearer ' + process.argv[1], 'content-type': 'application/json' },
+  body: process.argv[2],
+}).then(r => r.text()).then(t => console.log(t)).catch(() => console.log('{}'));
+" -- "$API_TOKEN" "$ISSUE_BODY" 2>/dev/null || echo '{}')"
+SURVIVOR="$(printf '%s' "$ISSUED" | python3 -c "import json,sys
+try: print(json.load(sys.stdin).get('token',''))
+except Exception: print('')")"
+if [ -n "$SURVIVOR" ]; then
+  ok "issued an admin token with the bootstrap token"
+else
+  bad "could not issue a token to survive with: ${ISSUED}"
+fi
+
+# Removed the way an operator removes it. `set env ... NAME-` drops the variable
+# whatever its source, which here is a secretKeyRef.
+k -n "$NS" set env deploy/drigodb-api DRIGODB_API_TOKEN- >/dev/null
+settle
+if [ "$(await_ready true 45)" = "true" ]; then
+  ok "it comes back up and stays ready with no bootstrap token"
+else
+  bad "the pod did not become ready after the bootstrap token was removed"
+fi
+# `pod()`, not `-l app.kubernetes.io/name=drigodb`. That selector matches both
+# ReplicaSets during a rollout, and kubectl read the OLD pod's log — which says the
+# opposite, because the old pod still had the token. THIRD time this file has been
+# bitten by selecting pods without pinning the revision; the helper exists, use it.
+if k -n "$NS" logs "$(pod)" --tail=40 2>/dev/null | grep -q "NO bootstrap token"; then
+  ok "and says so in the log, rather than leaving 401s unexplained"
+else
+  bad "nothing in the log mentions the missing bootstrap token; a locked installation would look broken"
+fi
+
+if [ -n "$SURVIVOR" ]; then
+  SURV_CODE="$(api_code "$SURVIVOR" /v1/databases)"
+  OLD_CODE="$(api_code "$API_TOKEN" /v1/databases)"
+  if [ "$SURV_CODE" = "200" ] && [ "$OLD_CODE" = "401" ]; then
+    ok "the issued token still works and the removed one no longer does"
+  else
+    bad "issued token got ${SURV_CODE} (want 200) and the removed bootstrap token got ${OLD_CODE} (want 401)"
+  fi
+  # The property that makes removal safe rather than a one-way door.
+  MINT="$(api_code "$SURVIVOR" /v1/tokens POST '{"name":"minted after removal"}')"
+  if [ "$MINT" = "201" ]; then
+    ok "and can still mint more — the installation is self-sustaining"
+  else
+    bad "the surviving admin token got ${MINT} from POST /v1/tokens, not 201; removing the bootstrap token is a one-way door"
+  fi
+fi
+
+step "And an installation with no tokens at all is locked, not broken"
+# Every credential gone. It must answer 401 and stay READY: a pod that went unready
+# here would be restarted by nothing and fixed by nobody, and the recovery below
+# needs the process running.
+k -n "$NS_DB" delete secret -l drigodb.io/token-id >/dev/null 2>&1 || true
+settle
+LOCKED="$(api_code "${SURVIVOR:-nothing}" /v1/databases)"
+if [ "$LOCKED" = "401" ]; then
+  ok "every token is refused"
+else
+  bad "with no tokens at all, a request returned ${LOCKED} rather than 401"
+fi
+if [ "$(await_ready true 20)" = "true" ]; then
+  ok "and the pod is still ready, so there is something left to recover"
+else
+  bad "the pod went unready with no tokens; an operator would be debugging the wrong thing"
+fi
+
+# Recovery from cluster access alone, which is the only trust left. This is the
+# bootstrap #62 documents, and it had never been executed.
+RECOVERED_TOKEN="recovered-$(date +%s)-$$"
+RECOVERED_HASH="$(printf %s "$RECOVERED_TOKEN" | shasum -a 256 | cut -d' ' -f1)"
+k -n "$NS_DB" create secret generic token-recovered --from-literal=hash="$RECOVERED_HASH" >/dev/null
+k -n "$NS_DB" label secret token-recovered \
+  drigodb.io/token-id=recovered drigodb.io/token-tier=admin >/dev/null
+k -n "$NS_DB" annotate secret token-recovered \
+  drigodb.io/token-name="recovered with kubectl" >/dev/null
+settle
+REC="$(api_code "$RECOVERED_TOKEN" /v1/databases)"
+REC_MINT="$(api_code "$RECOVERED_TOKEN" /v1/tokens POST '{"name":"back in business"}')"
+if [ "$REC" = "200" ] && [ "$REC_MINT" = "201" ]; then
+  ok "a Secret made with kubectl is a working admin token — the documented bootstrap works"
+else
+  bad "the hand-made token got ${REC} on /v1/databases and ${REC_MINT} on POST /v1/tokens; an installation could not be recovered from cluster access alone"
+fi
 
 echo
 if [ "$status" = 0 ]; then

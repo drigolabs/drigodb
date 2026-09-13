@@ -132,6 +132,12 @@ old configuration, the new one starting, one terminating. `{.items[0]}` picked t
 old one and an assertion about a broken configuration read the working one's
 answer.
 
+This applies to **`kubectl logs -l …` too**, which is where it recurred a third time:
+grepping the API's log for a message that only the NEW configuration prints, with a
+selector that also matched the terminating pod, read the old pod's log and asserted
+the opposite of the truth. Any `kubectl` call in a test that names pods by app label
+alone is this bug waiting to happen.
+
 Select the ReplicaSet by the Deployment's `deployment.kubernetes.io/revision`
 annotation, which is what `kubectl rollout` matches on. **Not the newest
 `creationTimestamp`**: reverting a value to empty makes the pod template byte

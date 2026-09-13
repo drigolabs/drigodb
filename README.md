@@ -378,6 +378,28 @@ A revoked or expired token stops working within **five seconds** — the authent
 cache's TTL, chosen so that authenticating does not require an API round trip per
 request. Written down rather than papered over.
 
+#### If you lock yourself out
+
+An installation with no bootstrap token and no issued tokens answers 401 to
+everything. It is **locked, not broken**: the pod stays ready and `/healthz` answers
+200, which is deliberate, because the recovery below needs the process running.
+
+The only trust left is the one drigodb never had a say in — cluster access. A token is
+a Secret, so an administrator can make one:
+
+```bash
+TOKEN="$(openssl rand -hex 32)"
+kubectl -n drigodb-databases create secret generic token-recovered \
+  --from-literal=hash="$(printf %s "$TOKEN" | shasum -a 256 | cut -d' ' -f1)"
+kubectl -n drigodb-databases label secret token-recovered \
+  drigodb.io/token-id=recovered drigodb.io/token-tier=admin
+echo "$TOKEN"
+```
+
+It works within five seconds and can issue tokens normally.
+`scripts/install-failure-test.sh` runs exactly this, so it is a procedure that is
+executed on every pull request rather than one written down and hoped for.
+
 Databases are not yet scoped to the token that created them; every valid token still
 sees every database. That is [#72](https://github.com/drigolabs/drigodb/issues/72),
 and it is what makes this a fourth isolation layer rather than a third and a half.
