@@ -2,7 +2,7 @@
   "name": "drigodb",
   "version": "0.0.1",
   "private": true,
-  "description": "PostgreSQL databases, provisioned through an API on Kubernetes — hibernating when idle, waking in seconds.",
+  "description": "PostgreSQL databases, provisioned through an API on Kubernetes \u2014 hibernating when idle, waking in seconds.",
   "type": "module",
   "engines": {
     "node": ">=22"
@@ -13,7 +13,7 @@
     "start": "node dist/src/server.js",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage --coverage.reporter=text --coverage.reporter=json-summary"
   },
   "dependencies": {
     "@hono/node-server": "^1.14.0",
