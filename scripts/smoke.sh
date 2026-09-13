@@ -1380,6 +1380,30 @@ else
     exit 1
   fi
 
+  # And the listing agrees with the purge, which is the only place the two halves of
+  # #23 meet. A classifier that disagrees with what the purge actually removes is
+  # worse than no classifier: it would offer a live database's archive for deletion,
+  # or hide an orphan that is being paid for.
+  ARCHIVES="$(api "localhost:${API_PORT}/v1/archives")"
+  LIVE_STATE="$(echo "$ARCHIVES" | python3 -c "
+import json,sys
+a = {x['prefix']: x for x in json.load(sys.stdin)['archives']}
+print(a.get('db-${DB_ID}/', {}).get('state', 'missing'))
+")"
+  if [ "$LIVE_STATE" = "live" ]; then
+    ok "the running database's own archive is reported live, not offered for deletion"
+  else
+    fail "db-${DB_ID}/ is reported '${LIVE_STATE}' while the database is running — a policy layer acting on this would purge a live database's backups"
+    exit 1
+  fi
+  # Generation 0 is falsy, so this is the case a truthiness bug reports as orphaned.
+  RECLAIM="$(echo "$ARCHIVES" | jqf '["reclaimable_bytes"]')"
+  ORPHANS="$(echo "$ARCHIVES" | python3 -c "
+import json,sys
+print(sum(1 for x in json.load(sys.stdin)['archives'] if x['state'] == 'orphaned'))
+")"
+  ok "the listing sees ${ORPHANS} orphaned archive(s), ${RECLAIM} reclaimable byte(s)"
+
   # The assertion no mock can make: the objects are actually gone from the bucket.
   EMPTY="$(api -XPOST "localhost:${API_PORT}/v1/archives/${IP_ID}/purge" \
     -d "{\"confirm\":\"${IP_ID}\",\"dry_run\":true}" | jqf '["objects"]')"
@@ -1387,6 +1411,20 @@ else
     ok "the archive is empty, and purging an already-purged archive is a 200 with nothing to do"
   else
     fail "${EMPTY} object(s) survived the purge of ${IP_ID}"
+    exit 1
+  fi
+
+  # The listing must agree that it is gone. Two views of one bucket that disagree is
+  # the failure this endpoint exists to prevent, and a purge is the moment they are
+  # most likely to.
+  STILL="$(api "localhost:${API_PORT}/v1/archives" | python3 -c "
+import json,sys
+print(sum(1 for x in json.load(sys.stdin)['archives'] if x['prefix'].startswith('db-${IP_ID}')))
+")"
+  if [ "$STILL" = "0" ]; then
+    ok "the listing no longer reports any prefix for ${IP_ID}"
+  else
+    fail "GET /v1/archives still reports ${STILL} prefix(es) for ${IP_ID} after purging it"
     exit 1
   fi
 

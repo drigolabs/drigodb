@@ -937,6 +937,7 @@ export interface ArchiveStore {
 // ours, set in the pod template, and cannot be taken away.
 export const OPERATION_LABEL = "drigodb.io/operation";
 export const PURGE_OPERATION = "purge-archive";
+export const LIST_OPERATION = "list-archives";
 
 // Derived from the id, not random.
 //
@@ -947,66 +948,111 @@ export function purgeJobName(id: string): string {
   return `purge-${clusterName(id)}`;
 }
 
+export function listJobName(): string {
+  // One name for the installation, not one per caller. A listing is a read of the
+  // whole bucket, so two at once would be the same answer computed twice — and a
+  // fixed name means a second caller finds the first attempt and clears it rather
+  // than leaking a Job per request.
+  return "list-archives";
+}
+
+// Read the bucket and report what is in it. No id, no delete, nothing taken from a
+// caller — the only inputs are the installation's own ObjectStore and a ceiling on
+// how many prefixes come back.
+export function buildArchiveListJob(store: ArchiveStore): V1Job {
+  return archiveJob({
+    name: listJobName(),
+    operation: LIST_OPERATION,
+    script: "list-archives.py",
+    store,
+    labels: {},
+    env: [{ name: "DRIGODB_ARCHIVE_LIST_LIMIT", value: String(config.backup.archiveListLimit) }],
+  });
+}
+
 export function buildPurgeJob(
   id: string,
   store: ArchiveStore,
   opts: { dryRun: boolean },
 ): V1Job {
+  return archiveJob({
+    name: purgeJobName(id),
+    operation: PURGE_OPERATION,
+    script: "purge-archive.py",
+    store,
+    labels: { [DB_ID_LABEL]: id },
+    env: [
+      { name: "DRIGODB_SERVER_NAME", value: clusterName(id) },
+      { name: "DRIGODB_DRY_RUN", value: opts.dryRun ? "1" : "" },
+      { name: "DRIGODB_MAX_GENERATIONS", value: String(config.backup.purgeMaxGenerations) },
+    ],
+  });
+}
+
+// The pod every bucket-touching operation runs in. One shape, because the two verbs
+// must not drift apart on the things that are not about either of them: the
+// credential arriving by reference, no service account token, exactly one pod so
+// there is exactly one log to answer from, and a deadline.
+function archiveJob(spec: {
+  name: string;
+  operation: string;
+  script: string;
+  store: ArchiveStore;
+  labels: Record<string, string>;
+  env: Array<{ name: string; value: string }>;
+}): V1Job {
   const labels = {
-    [DB_ID_LABEL]: id,
+    ...spec.labels,
     [MANAGED_BY_LABEL]: MANAGED_BY_VALUE,
-    [OPERATION_LABEL]: PURGE_OPERATION,
+    [OPERATION_LABEL]: spec.operation,
   };
   const secretEnv = (name: string, ref: { name: string; key: string }) => ({
     name,
     valueFrom: { secretKeyRef: { name: ref.name, key: ref.key } },
   });
+  const store = spec.store;
   return {
     apiVersion: "batch/v1",
     kind: "Job",
-    metadata: { name: purgeJobName(id), namespace: config.databaseNamespace, labels },
+    metadata: { name: spec.name, namespace: config.databaseNamespace, labels },
     spec: {
-      // Zero, deliberately. A purge that failed must reach the caller, not retry
-      // itself quietly behind a pod that has already been replaced — with
+      // Zero, deliberately. An operation that failed must reach the caller, not
+      // retry itself behind a pod that has already been replaced — with
       // backoffLimit above zero there are several pods and no single log that is
-      // the answer. Retrying is a caller POSTing again, which is safe: emptying a
-      // prefix that is already partly empty is the same operation.
+      // the answer. Retrying is a caller asking again, which is safe for both
+      // verbs: listing is a read, and emptying a prefix that is already partly
+      // empty is the same operation.
       backoffLimit: 0,
-      // Bounded so a purge against an unreachable endpoint fails instead of
+      // Bounded so an operation against an unreachable endpoint fails instead of
       // sitting in the namespace forever holding the only name a retry can use.
-      // The same ceiling the endpoint waits for, deliberately: a request that
-      // gave up while the Job ran on would report a failure that was not one.
+      // The same ceiling the endpoint waits for, deliberately: a request that gave
+      // up while the Job ran on would report a failure that was not one.
       activeDeadlineSeconds: 300,
       // Long enough that the log survives the request that started it, short
-      // enough that a fleet's worth of purges does not accumulate. The endpoint
-      // reads the log before returning; this is for the operator who wants to
-      // look again afterwards.
+      // enough that a fleet's worth of these does not accumulate. The endpoint
+      // reads the log before returning; this is for the operator who wants to look
+      // again afterwards.
       ttlSecondsAfterFinished: 3600,
       template: {
         metadata: { labels },
         spec: {
           restartPolicy: "Never",
-          // The Job talks to object storage and to nothing in the cluster. No
-          // token, no Kubernetes API, no database.
+          // These talk to object storage and to nothing in the cluster. No token,
+          // no Kubernetes API, no database.
           automountServiceAccountToken: false,
           containers: [
             {
-              name: "purge",
+              name: spec.operation,
               image: config.backup.purgeImage,
               // The sidecar image is distroless — there is no /bin/sh in it, so
               // this cannot be a shell one-liner even if it wanted to be. It is
               // the interpreter and the mounted script, which is the better shape
               // anyway: the program is a file in the repository.
-              command: ["/venv/bin/python", "/opt/drigodb/purge-archive.py"],
+              command: ["/venv/bin/python", `/opt/drigodb/${spec.script}`],
               env: [
-                { name: "DRIGODB_SERVER_NAME", value: clusterName(id) },
                 { name: "DRIGODB_DESTINATION_PATH", value: store.destinationPath },
                 { name: "DRIGODB_ENDPOINT_URL", value: store.endpointUrl ?? "" },
-                { name: "DRIGODB_DRY_RUN", value: opts.dryRun ? "1" : "" },
-                {
-                  name: "DRIGODB_MAX_GENERATIONS",
-                  value: String(config.backup.purgeMaxGenerations),
-                },
+                ...spec.env,
                 secretEnv("AWS_ACCESS_KEY_ID", store.accessKeyId),
                 secretEnv("AWS_SECRET_ACCESS_KEY", store.secretAccessKey),
                 // Both names: boto3 reads AWS_DEFAULT_REGION, and its newer
@@ -1027,7 +1073,7 @@ export function buildPurgeJob(
             {
               name: "script",
               configMap: {
-                name: config.backup.purgeScriptConfigMap,
+                name: config.backup.archiveToolsConfigMap,
                 // 0555: the interpreter reads it, nothing writes it.
                 defaultMode: 0o555,
               },

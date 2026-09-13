@@ -1292,7 +1292,7 @@ describe("archive purge", () => {
   ) {
     vi.resetModules();
     vi.stubEnv("DRIGODB_BACKUP_OBJECT_STORE", "drigodb-api-backups");
-    vi.stubEnv("DRIGODB_ARCHIVE_PURGE_CONFIGMAP", "drigodb-api-archive-purge");
+    vi.stubEnv("DRIGODB_ARCHIVE_TOOLS_CONFIGMAP", "drigodb-api-archive-tools");
     const p = await import("../src/k8s/provisioner.js");
 
     const notFound = () => Object.assign(new Error("not found"), { code: 404 });
@@ -1522,5 +1522,214 @@ describe("archive purge validation", () => {
     expect(() => p.validateArchivePurge(ID, { confirm: ID, dry_run: "yes" })).toThrow(
       p.ValidationError,
     );
+  });
+});
+
+// Seeing what is in the bucket (#23).
+//
+// The classification is the only part of this drigodb can get wrong on its own: the
+// bucket reports prefixes and sizes, and every judgement about what they MEAN comes
+// from reading those against the live Clusters. Getting it wrong in one direction
+// offers a live database's archive up for deletion.
+describe("archive listing", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  const ID2 = "b2c3d4e5f6a1";
+
+  function summary(
+    archives: Array<{ name: string; objects: number; bytes: number }>,
+    truncated = false,
+  ) {
+    return JSON.stringify({
+      destination: "s3://drigodb-backups-fra1/",
+      root: "",
+      archives: archives.map((a) => ({ ...a, prefix: `${a.name}/` })),
+      objects: archives.reduce((n, a) => n + a.objects, 0),
+      bytes: archives.reduce((n, a) => n + a.bytes, 0),
+      truncated,
+    });
+  }
+
+  // A namespace with the Clusters named in `clusters` (id -> archive generation), and
+  // a listing Job that reports `log`.
+  async function listingCluster(opts: {
+    log: string;
+    clusters?: Record<string, number>;
+    fails?: boolean;
+  }) {
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_BACKUP_OBJECT_STORE", "drigodb-api-backups");
+    vi.stubEnv("DRIGODB_ARCHIVE_TOOLS_CONFIGMAP", "drigodb-api-archive-tools");
+    const p = await import("../src/k8s/provisioner.js");
+    const notFound = () => Object.assign(new Error("not found"), { code: 404 });
+
+    let jobExists = false;
+    const objects = {
+      getNamespacedCustomObject: async (req: { plural: string }) => {
+        if (req.plural === "objectstores") {
+          return {
+            spec: {
+              configuration: {
+                destinationPath: "s3://drigodb-backups-fra1/",
+                endpointURL: "https://fra1.digitaloceanspaces.com",
+                s3Credentials: {
+                  accessKeyId: { name: "drigodb-backup-credentials", key: "access_key" },
+                  secretAccessKey: { name: "drigodb-backup-credentials", key: "secret_key" },
+                },
+              },
+            },
+          };
+        }
+        throw notFound();
+      },
+      listNamespacedCustomObject: async () => ({
+        items: Object.entries(opts.clusters ?? {}).map(([id, generation]) => ({
+          metadata: {
+            name: `db-${id}`,
+            labels: { "drigodb.io/database-id": id },
+            // Generation 0 is the absence of the annotation, exactly as buildCluster
+            // writes it — so a fake that always set it would not be the shape the
+            // classifier actually reads.
+            ...(generation > 0
+              ? { annotations: { "drigodb.io/archive-generation": String(generation) } }
+              : {}),
+          },
+        })),
+      }),
+    };
+    const batch = {
+      createNamespacedJob: async (req: { body: { metadata: { name: string } } }) => {
+        jobExists = true;
+        return req.body;
+      },
+      readNamespacedJob: async (req: { name: string }) => {
+        if (!jobExists) throw notFound();
+        return {
+          metadata: { name: req.name },
+          status: opts.fails ? { failed: 1 } : { succeeded: 1 },
+        };
+      },
+      deleteNamespacedJob: async () => {
+        if (!jobExists) throw notFound();
+        jobExists = false;
+        return {};
+      },
+    };
+    const core = {
+      listNamespacedPod: async () => ({
+        items: jobExists ? [{ metadata: { name: "list-archives-xyz" } }] : [],
+      }),
+      readNamespacedPodLog: async () => opts.log,
+    };
+    return {
+      p,
+      provisioner: new p.Provisioner(
+        {} as never, core as never, {} as never, batch as never, objects as never,
+      ),
+    };
+  }
+
+  it("calls a live database's current archive live, at generation 0", async () => {
+    // Generation 0 is the common case AND it is falsy, so a truthiness check on the
+    // generation would report every un-restored live database as orphaned — and offer
+    // its backups for deletion. That is the direction this must not be wrong in.
+    const { provisioner } = await listingCluster({
+      log: summary([{ name: `db-${ID}`, objects: 41, bytes: 700 }]),
+      clusters: { [ID]: 0 },
+    });
+    const result = await provisioner.listArchives();
+    expect(result.archives[0]!.state).toBe("live");
+    expect(result.archives[0]!.database_id).toBe(ID);
+    expect(result.archives[0]!.generation).toBe(0);
+    expect(result.reclaimable_bytes).toBe(0);
+  });
+
+  it("separates a live database's current generation from the one it left behind", async () => {
+    // After an in-place restore the Cluster archives to -r1 and db-<id>/ is the
+    // history from before it. Not garbage, and not purgeable — the purge refuses any
+    // id with a Cluster — so calling it orphaned would be an invitation to destroy a
+    // live database's only pre-restore backups.
+    const { provisioner } = await listingCluster({
+      log: summary([
+        { name: `db-${ID}`, objects: 41, bytes: 700 },
+        { name: `db-${ID}-r1`, objects: 9, bytes: 150 },
+      ]),
+      clusters: { [ID]: 1 },
+    });
+    const result = await provisioner.listArchives();
+    const byPrefix = Object.fromEntries(result.archives.map((a) => [a.prefix, a]));
+    expect(byPrefix[`db-${ID}/`]!.state).toBe("superseded");
+    expect(byPrefix[`db-${ID}-r1/`]!.state).toBe("live");
+    expect(byPrefix[`db-${ID}-r1/`]!.generation).toBe(1);
+    // Neither is reclaimable: the database is alive.
+    expect(result.reclaimable_bytes).toBe(0);
+  });
+
+  it("calls an archive with no Cluster orphaned, and only that reclaimable", async () => {
+    const { provisioner } = await listingCluster({
+      log: summary([
+        { name: `db-${ID}`, objects: 41, bytes: 700 },
+        { name: `db-${ID2}`, objects: 12, bytes: 300 },
+        { name: `db-${ID2}-r1`, objects: 3, bytes: 50 },
+      ]),
+      clusters: { [ID]: 0 },
+    });
+    const result = await provisioner.listArchives();
+    const states = Object.fromEntries(result.archives.map((a) => [a.prefix, a.state]));
+    expect(states[`db-${ID}/`]).toBe("live");
+    expect(states[`db-${ID2}/`]).toBe("orphaned");
+    expect(states[`db-${ID2}-r1/`]).toBe("orphaned");
+    // Every generation of the deleted database, and none of the live one's.
+    expect(result.reclaimable_bytes).toBe(350);
+    expect(result.bytes).toBe(1050);
+  });
+
+  it("calls anything not shaped like a drigodb archive foreign, with no id", async () => {
+    // Real buckets have these. `probe-server/` from a connectivity check is in one
+    // right now. drigodb did not write it and has no business calling it expendable,
+    // so it must not land in reclaimable_bytes and must carry no database_id for a
+    // caller to feed to the purge.
+    const { provisioner } = await listingCluster({
+      log: summary([
+        { name: "probe-server", objects: 1, bytes: 31 },
+        { name: "db-NOTHEX000000", objects: 1, bytes: 10 },
+        { name: `db-${ID}-r0`, objects: 1, bytes: 10 },
+      ]),
+      clusters: {},
+    });
+    const result = await provisioner.listArchives();
+    for (const a of result.archives) {
+      expect(a.state).toBe("foreign");
+      expect(a.database_id).toBeUndefined();
+    }
+    expect(result.reclaimable_bytes).toBe(0);
+  });
+
+  it("passes the bucket's own truncation flag through", async () => {
+    // A listing that hit the ceiling and reported a clean total would tell a caller
+    // it had seen the whole bucket.
+    const { provisioner } = await listingCluster({
+      log: summary([{ name: `db-${ID}`, objects: 1, bytes: 1 }], true),
+      clusters: {},
+    });
+    expect((await provisioner.listArchives()).truncated).toBe(true);
+  });
+
+  it("refuses when the installation has no archive tooling configured", async () => {
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_BACKUP_OBJECT_STORE", "drigodb-api-backups");
+    const p = await import("../src/k8s/provisioner.js");
+    const provisioner = new p.Provisioner(
+      {} as never, {} as never, {} as never, {} as never, {} as never,
+    );
+    await expect(provisioner.listArchives()).rejects.toThrow(p.NotConfiguredError);
+  });
+
+  it("reports a success with no summary rather than an empty bucket", async () => {
+    const { provisioner } = await listingCluster({ log: "Traceback: something odd" });
+    await expect(provisioner.listArchives()).rejects.toThrow(/printed no summary/);
   });
 });

@@ -1,9 +1,10 @@
 ---
 date: 2026-09-13
 topic: archive-purge
-status: current — describes POST /v1/archives/{id}/purge
+status: current — describes GET /v1/archives and POST /v1/archives/{id}/purge
 related:
   - docs/backup-retention.md
+  - charts/drigodb/files/list-archives.py
   - docs/restore-in-place.md
   - docs/decisions/0008-mechanism-in-the-core-policy-outside.md
   - charts/drigodb/files/purge-archive.py
@@ -174,11 +175,54 @@ irreversible operation, and it is also the only way a caller can learn what is i
 prefix: drigodb does not list buckets, and after the database is deleted there are no
 `Backup` objects left to read either.
 
+## Finding what to purge
+
+`GET /v1/archives` is the other half, and it exists because this one takes an id and
+nothing could tell a caller which ids to give it. A policy component that deletes
+databases knows the ids it deleted; nothing could find an archive whose database was
+deleted before that component existed — and that was not hypothetical, at 14 prefixes
+and 155 MiB in one real bucket.
+
+```
+GET /v1/archives
+
+200
+{"archives":[
+   {"prefix":"db-a1b2c3d4e5f6/","database_id":"a1b2c3d4e5f6","generation":0,
+    "state":"live","objects":41,"bytes":703594496},
+   {"prefix":"db-b2c3d4e5f6a1/","database_id":"b2c3d4e5f6a1","generation":0,
+    "state":"orphaned","objects":12,"bytes":150994944},
+   {"prefix":"probe-server/","state":"foreign","objects":1,"bytes":31}],
+ "objects":54,"bytes":854589471,"reclaimable_bytes":150994944,"truncated":false}
+```
+
+Four states, and the distinction between them is the whole value — neither side can
+compute it alone. The bucket knows `db-a1b2c3d4e5f6-r1/` exists; only Kubernetes knows
+whether that id still has a database and which generation it archives to now.
+
+| state | meaning | purgeable |
+|---|---|---|
+| `live` | the working archive of a database that exists | no |
+| `superseded` | a live database's history from before an in-place restore | no — see above |
+| `orphaned` | no `Cluster` for that id | **yes** |
+| `foreign` | not shaped like a drigodb archive at all | no, and no `database_id` is reported |
+
+`reclaimable_bytes` counts `orphaned` only. A total over the whole bucket includes
+every live database's working archive and answers no question anyone has.
+
+`foreign` matters more than it looks. drigodb did not write those objects and has no
+business calling them expendable, so they are reported for completeness and carry no
+id a caller could feed to the purge. One real bucket has `probe-server/` in it from a
+connectivity check.
+
+The listing runs as its own Job, for the same reason the purge does, and reads the
+whole bucket — so it is seconds, and a caller wanting it often should cache it rather
+than asking drigodb to. `backup.archiveListLimit` caps the answer at 500 prefixes and
+reports `truncated: true` rather than silently returning part of a bucket.
+
 ## What this does not do
 
-- **Discover orphans.** A policy component that deletes databases knows their ids,
-  which is enough to drive this. Finding archives nobody has a record of — the 14
-  already in the bucket — needs either bucket listing or control-plane state, and it
-  is not on the critical path for the mechanism.
-- **Remove an old generation of a live database.** See above.
+- **Remove an old generation of a live database.** See above. The listing names them
+  `superseded` so they are at least visible; acting on them is a decision nobody has
+  asked for yet.
 - **Decide when.** No sweeper, no schedule.

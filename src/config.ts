@@ -92,9 +92,9 @@ export const config = {
       "ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.15.0",
     ),
 
-    // Holds purge-archive.py, mounted into that Job. Release-named, so the chart
-    // has to say which one rather than the code guessing.
-    purgeScriptConfigMap: envOr("DRIGODB_ARCHIVE_PURGE_CONFIGMAP", ""),
+    // Holds purge-archive.py and list-archives.py, mounted into those Jobs.
+    // Release-named, so the chart has to say which one rather than the code guessing.
+    archiveToolsConfigMap: envOr("DRIGODB_ARCHIVE_TOOLS_CONFIGMAP", ""),
 
     // How many archive generations a purge probes. An in-place restore adds one
     // (db-<id>, db-<id>-r1, …) and nothing else does, so 20 is a database
@@ -106,6 +106,12 @@ export const config = {
     // operator's env would otherwise reach the Job as the string "NaN" and fail
     // every purge on a Python traceback about an integer.
     purgeMaxGenerations: positiveOr("DRIGODB_ARCHIVE_PURGE_MAX_GENERATIONS", 20),
+
+    // How many archive prefixes one listing returns. A ceiling on the ANSWER, not
+    // on the work: a bucket with more than this reports what it found and says it
+    // was truncated, rather than building a response nothing can read out of a pod
+    // log nothing can hold.
+    archiveListLimit: positiveOr("DRIGODB_ARCHIVE_LIST_LIMIT", 500),
   },
 
   tls: {

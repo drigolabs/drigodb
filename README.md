@@ -351,6 +351,21 @@ A backup belongs to the database it was taken from, and drigodb refuses a
 `restore_from` that names someone else's — otherwise any backup in the
 installation could be read by guessing its id.
 
+### Seeing what is in the backup bucket
+
+```
+GET /v1/archives
+```
+
+Every archive prefix, how big it is, and whether a database still owns it —
+`live`, `superseded` (a live database's pre-restore history), `orphaned`, or
+`foreign` (not written by drigodb). `reclaimable_bytes` counts the orphaned ones only.
+
+This is the half that makes the purge below usable: an archive whose database was
+deleted has no `Cluster` and no `Backup` objects, so nothing else drigodb serves can
+see it. The classification needs both the bucket and the Clusters, which is why it is
+an endpoint rather than something you can get from `mc`.
+
 ### Purging the archive of a deleted database
 
 ```
@@ -367,8 +382,9 @@ all — drigodb does not list buckets, and a deleted database has no `Backup` ob
 left either. `confirm` must be the id itself.
 
 Deciding *when* to call it is policy and ships elsewhere (decision 0008); drigodb
-offers the verb. [docs/archive-purge.md](docs/archive-purge.md) has the design,
-including why it is not `barman-cloud-backup-delete`.
+offers the verb, and `GET /v1/archives` above is how a caller finds the ids to give it.
+[docs/archive-purge.md](docs/archive-purge.md) has the design, including why it is not
+`barman-cloud-backup-delete`.
 
 ### High availability
 

@@ -495,7 +495,7 @@ describe("the archive purge Job", () => {
   async function withPurge() {
     vi.resetModules();
     vi.stubEnv("DRIGODB_BACKUP_OBJECT_STORE", "drigodb-api-backups");
-    vi.stubEnv("DRIGODB_ARCHIVE_PURGE_CONFIGMAP", "drigodb-api-archive-purge");
+    vi.stubEnv("DRIGODB_ARCHIVE_TOOLS_CONFIGMAP", "drigodb-api-archive-tools");
     vi.stubEnv("DRIGODB_BACKUP_PURGE_IMAGE", "ghcr.io/example/sidecar:v9");
     return await import("../src/k8s/manifests.js");
   }
@@ -541,7 +541,7 @@ describe("the archive purge Job", () => {
     expect(container.image).toBe("ghcr.io/example/sidecar:v9");
     expect(container.command).toEqual(["/venv/bin/python", "/opt/drigodb/purge-archive.py"]);
     expect(container.volumeMounts[0]!.mountPath).toBe("/opt/drigodb");
-    expect(job.spec.template.spec.volumes[0]!.configMap.name).toBe("drigodb-api-archive-purge");
+    expect(job.spec.template.spec.volumes[0]!.configMap.name).toBe("drigodb-api-archive-tools");
   });
 
   it("passes the credential by reference and never by value", async () => {

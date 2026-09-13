@@ -72,10 +72,12 @@ spec:
             # control plane passes references it cannot itself resolve.
             - name: DRIGODB_BACKUP_PURGE_IMAGE
               value: {{ .Values.backup.purgeImage | quote }}
-            - name: DRIGODB_ARCHIVE_PURGE_CONFIGMAP
-              value: {{ include "drigodb.fullname" . }}-archive-purge
+            - name: DRIGODB_ARCHIVE_TOOLS_CONFIGMAP
+              value: {{ include "drigodb.fullname" . }}-archive-tools
             - name: DRIGODB_ARCHIVE_PURGE_MAX_GENERATIONS
               value: {{ .Values.backup.purgeMaxGenerations | quote }}
+            - name: DRIGODB_ARCHIVE_LIST_LIMIT
+              value: {{ .Values.backup.archiveListLimit | quote }}
             {{- end }}
             - name: DRIGODB_TLS_CA_SECRET
               value: {{ include "drigodb.caSecret" . | quote }}

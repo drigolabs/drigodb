@@ -181,6 +181,23 @@ export function buildRoutes(provisioner: Provisioner): Hono {
     return c.body(null, 204);
   });
 
+  // What is in the bucket, and which of it belongs to a database that still exists.
+  //
+  // The other half of the purge (#23). The purge takes an id; nothing could tell a
+  // caller which ids to give it, because an archive whose database was deleted has no
+  // Cluster and no Backup objects — so neither `GET /v1/databases` nor
+  // `GET /v1/databases/{id}/backups` can see it. Measured at 14 prefixes and 155 MiB
+  // in a real bucket, invisible to every other endpoint drigodb has.
+  //
+  // `reclaimable_bytes` counts ORPHANED prefixes only. A total over the whole bucket
+  // includes every live database's working archive and answers no question anybody
+  // has; this one is the answer to "what am I paying for that nothing is using".
+  //
+  // Slow on purpose — it reads the bucket through a Job, because the control plane has
+  // no S3 client. Seconds, and a caller that wants it often should cache it rather
+  // than asking drigodb to.
+  app.get("/v1/archives", async (c) => c.json(await provisioner.listArchives()));
+
   // Not /v1/databases/{id}/…, and the path is the argument.
   //
   // An archive whose database is gone is not a sub-resource of that database:
