@@ -24,6 +24,25 @@ import { backupsEnabled, config, serverAuthEnabled } from "../config.js";
 export const DB_ID_LABEL = "drigodb.io/database-id";
 export const EXTERNAL_ID_LABEL = "drigodb.io/external-id";
 export const MANAGED_BY_LABEL = "app.kubernetes.io/managed-by";
+
+// Whose database this is (#72). The token's owner, not the token id — see Caller in
+// src/auth.ts for why those differ.
+//
+// A LABEL because `GET /v1/databases` for a tenant must be a selector rather than a
+// listing everything and filtering: a filter is a place to forget a check, and it
+// makes the API server hand drigodb every tenant's databases in order to answer one
+// tenant's question.
+//
+// Absent on every database created before this existed, and that means "the
+// installation's own", which is true — they were all created by the static token.
+// Only an admin sees them, which needs no migration and no guessing.
+//
+// ON THE CLUSTER ONLY, deliberately not via labelsFor(). That helper also labels the
+// password Secret, the Service and the NetworkPolicy — and a token Secret carries
+// this same label key, so a database Secret wearing it would be matched by the
+// selector that asks "does any token still carry this owner". Two kinds of object,
+// one label key, and a listing of one silently including the other.
+export const OWNER_LABEL = "drigodb.io/owner";
 export const MANAGED_BY_VALUE = "drigodb";
 
 // A consumer pod carrying this label may reach the named database. It works
@@ -482,8 +501,13 @@ export function buildCluster(
   restore?: RestoreSource,
   highAvailability = false,
   archiveGeneration = 0,
+  owner?: string,
 ): CnpgClusterManifest {
-  const labels = { ...labelsFor(id, externalId), [TIER_LABEL]: tier };
+  const labels = {
+    ...labelsFor(id, externalId),
+    [TIER_LABEL]: tier,
+    ...(owner ? { [OWNER_LABEL]: owner } : {}),
+  };
   return {
     apiVersion: `${CNPG_GROUP}/v1`,
     kind: "Cluster",

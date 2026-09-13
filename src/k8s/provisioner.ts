@@ -20,6 +20,7 @@ import type { V1Job } from "@kubernetes/client-node";
 import type { Tier } from "./manifests.js";
 
 import { backupsEnabled, config, serverAuthEnabled } from "../config.js";
+import type { Caller } from "../auth.js";
 import {
   TIERS,
   TIER_LABEL,
@@ -50,6 +51,7 @@ import {
   HIBERNATED_LABEL,
   MANAGED_BY_LABEL,
   MANAGED_BY_VALUE,
+  OWNER_LABEL,
   POSTGRES_PORT,
   buildNetworkPolicy,
   buildCertificate,
@@ -438,8 +440,30 @@ export function validateHighAvailability(value: unknown): boolean {
   return value;
 }
 
-function idFor(externalId: string): string {
-  return createHash("sha256").update(externalId).digest("hex").slice(0, 12);
+// The database id, derived per OWNER as well as per external_id (#72).
+//
+// It has to be per-owner, and the reason is the worst bug in the backlog: the derived
+// id IS the lock. `create` relies on Kubernetes refusing a second Cluster with the
+// same name, and that refusal is the whole of drigodb's idempotency (#76). So two
+// tenants both calling their database `main` derived the same id, hit the idempotent
+// path, and the second one was handed the first one's database AND its connection
+// URI. Not an error — one tenant reading another's data, quietly.
+//
+// ADMIN CALLERS KEEP THE UNSALTED SPACE, and that is not a convenience. Every database
+// that existed before this carries an id derived from external_id alone, and every one
+// of them was created by the installation's static token — which is now the bootstrap
+// admin. A Cluster's name cannot be rewritten, so salting admins too would leave every
+// existing database unreachable by the only name its consumer knows, and the next
+// POST would build a duplicate beside it. The unsalted space is the historical record,
+// not an exception to the rule.
+//
+// The consequence, accepted deliberately: all admin tokens share one id space. Two
+// admins creating `main` get the same database, which is consistent with admins seeing
+// every database anyway — they operate the installation rather than living in it.
+function idFor(caller: Caller, externalId: string): string {
+  const material =
+    caller.tier === "admin" ? externalId : `${caller.owner}\u0000${externalId}`;
+  return createHash("sha256").update(material).digest("hex").slice(0, 12);
 }
 
 function newPassword(): string {
@@ -766,6 +790,34 @@ export class Provisioner {
   // backup, and absent until the condition exists. Reporting healthy for
   // something nobody is doing would be a lie of exactly the kind this field was
   // added to stop.
+  // May this caller see this database at all?
+  //
+  // 404 rather than 403, everywhere. A 403 confirms the database exists, and ids are
+  // derivable from an external_id — so a 403 would let one tenant test whether another
+  // has a database called `main`. There is no reason to leak the id space.
+  //
+  // An admin sees everything, including the databases that carry no owner label
+  // because they predate #72. A tenant sees only what names its owner: a database with
+  // no owner label matches no tenant, which is how the migration is "there isn't one".
+  private mayReach(caller: Caller, cluster: CnpgCluster): boolean {
+    if (caller.tier === "admin") return true;
+    return cluster.metadata?.labels?.[OWNER_LABEL] === caller.owner;
+  }
+
+  // The Cluster, or NotFoundError — for a database that does not exist and for one
+  // this caller may not reach, with the same error either way.
+  //
+  // Every operation that names an id goes through this. It is a method rather than a
+  // check each handler remembers, because the version where each handler remembers is
+  // the version where one of them does not.
+  private async ownedClusterFor(caller: Caller, id: string): Promise<CnpgCluster> {
+    const cluster = await this.clusterFor(id);
+    if (!cluster || !this.mayReach(caller, cluster)) {
+      throw new NotFoundError(`no database with id ${id}`);
+    }
+    return cluster;
+  }
+
   private archivingOf(cluster: CnpgCluster): "healthy" | "failing" | undefined {
     if (!backupsEnabled()) return undefined;
     const c = (cluster.status?.conditions ?? []).find(
@@ -1008,25 +1060,50 @@ export class Provisioner {
     return list.items ?? [];
   }
 
-  async findByExternalId(externalId: string): Promise<Database | undefined> {
+  // Per owner, for the same reason the id is. Two tenants may both have a database
+  // called `main`, so an external_id identifies a database only together with who is
+  // asking — and this is a lookup a caller drives, so answering with somebody else's
+  // would be the same leak by a different route.
+  async findByExternalId(caller: Caller, externalId: string): Promise<Database | undefined> {
+    const scope =
+      caller.tier === "admin" ? "" : `,${OWNER_LABEL}=${caller.owner}`;
     const found = (
       await this.listClusters(
-        `${EXTERNAL_ID_LABEL}=${externalId},${MANAGED_BY_LABEL}=${MANAGED_BY_VALUE}`,
+        `${EXTERNAL_ID_LABEL}=${externalId},${MANAGED_BY_LABEL}=${MANAGED_BY_VALUE}${scope}`,
       )
     )[0];
     return found ? await this.toDatabase(found) : undefined;
   }
 
-  async get(id: string): Promise<Database> {
-    const cluster = await this.clusterFor(id);
-    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
-    return this.toDatabase(cluster);
+  // The database ids carrying one owner. For revocation, which has to say what it
+  // orphaned before the token it is revoking is gone.
+  async idsOwnedBy(owner: string): Promise<string[]> {
+    const clusters = await this.listClusters(
+      `${MANAGED_BY_LABEL}=${MANAGED_BY_VALUE},${OWNER_LABEL}=${owner}`,
+    );
+    return clusters.flatMap((c) => {
+      const id = c.metadata?.labels?.[DB_ID_LABEL];
+      return id ? [id] : [];
+    });
   }
 
-  async list(): Promise<Database[]> {
-    const clusters = await this.listClusters(
-      `${MANAGED_BY_LABEL}=${MANAGED_BY_VALUE}`,
-    );
+  async get(caller: Caller, id: string): Promise<Database> {
+    return this.toDatabase(await this.ownedClusterFor(caller, id));
+  }
+
+  async list(caller: Caller): Promise<Database[]> {
+    // A SELECTOR for a tenant, not a listing plus a filter. Two reasons, and the
+    // second is the one that matters: a filter is a place to forget a check, and a
+    // listing makes the API server hand drigodb every tenant's databases in order to
+    // answer one tenant's question.
+    //
+    // An admin gets the unfiltered list, which includes the databases carrying no
+    // owner label because they predate #72.
+    const selector =
+      caller.tier === "admin"
+        ? `${MANAGED_BY_LABEL}=${MANAGED_BY_VALUE}`
+        : `${MANAGED_BY_LABEL}=${MANAGED_BY_VALUE},${OWNER_LABEL}=${caller.owner}`;
+    const clusters = await this.listClusters(selector);
     return Promise.all(clusters.map((c) => this.toDatabase(c)));
   }
 
@@ -1034,11 +1111,12 @@ export class Provisioner {
   // on rotation only — never from a plain GET — so a leaked read token does not
   // leak database credentials.
   async create(
+    caller: Caller,
     externalId: string,
     restoreFrom?: { databaseId: string; backupId?: string; targetTime?: string },
     highAvailability = false,
   ): Promise<{ database: Database; uri: string; created: boolean }> {
-    const id = idFor(externalId);
+    const id = idFor(caller, externalId);
     const password = newPassword();
     const ns = config.databaseNamespace;
 
@@ -1065,7 +1143,7 @@ export class Provisioner {
     // Resolved BEFORE anything is created, so a restore naming a database or a
     // backup that does not exist fails without leaving a half-made database
     // behind for someone to find.
-    const restore = restoreFrom ? await this.resolveRestore(restoreFrom) : undefined;
+    const restore = restoreFrom ? await this.resolveRestore(caller, restoreFrom) : undefined;
 
     // The Secret BEFORE the Cluster, which is the one ordering CloudNativePG
     // forces and the old data plane did not. bootstrap.initdb.secret is read
@@ -1106,22 +1184,32 @@ export class Provisioner {
         version: "v1",
         namespace: ns,
         plural: CLUSTERS_PLURAL,
-        body: buildCluster(id, externalId, defaultTier(), restore, highAvailability),
+        body: buildCluster(id, externalId, defaultTier(), restore, highAvailability, 0, caller.owner),
       });
     } catch (err) {
       if (!isAlreadyExists(err)) throw err;
-      const owner = (await this.clusterFor(id))?.metadata?.labels?.[
+      // Named `owner` until #72, where that word started meaning something else in
+      // this file. It is the external_id of whatever is already at this id.
+      const existingExternalId = (await this.clusterFor(id))?.metadata?.labels?.[
         EXTERNAL_ID_LABEL
       ];
       // Twelve hex characters is 48 bits, so a collision needs millions of
       // external_ids — but handing one caller another's database, credentials
       // and all, is not a failure to discover in production.
-      if (owner !== undefined && owner !== externalId) {
+      //
+      // The SECOND of three barriers now. The salt makes an accidental collision
+      // between two owners astronomically unlikely; this rejects a derived-id match
+      // whose external_id differs, which is the shape a brute-forced collision takes;
+      // and the get() below refuses on ownership even if both are somehow passed. An
+      // attacker can search external_ids of their own until one derives a victim id —
+      // 48 bits is not cryptographically out of reach offline — but cannot make their
+      // own OWNER collide, which is what the last barrier checks.
+      if (existingExternalId !== undefined && existingExternalId !== externalId) {
         throw new ValidationError(
           `external_id ${externalId} collides with an existing database; choose another`,
         );
       }
-      return { database: await this.get(id), uri: "", created: false };
+      return { database: await this.get(caller, id), uri: "", created: false };
     }
 
     // Tolerating AlreadyExists on each: a create that failed partway leaves some
@@ -1145,7 +1233,7 @@ export class Provisioner {
     );
 
     return {
-      database: await this.get(id),
+      database: await this.get(caller, id),
       uri: connectionUri(id, password),
       created: true,
     };
@@ -1160,11 +1248,10 @@ export class Provisioner {
   // fix: the fsGroupChangePolicy that stopped PostgreSQL waking landed for new
   // databases and never for existing ones. It is also how the plain-PostgreSQL
   // data plane reaches a database created before the migration.
-  async wake(id: string): Promise<Database> {
-    const cluster = await this.clusterFor(id);
-    // Read first, so waking something that does not exist is a 404 rather than
-    // whatever the patch below would have said.
-    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
+  async wake(caller: Caller, id: string): Promise<Database> {
+    const cluster = await this.ownedClusterFor(caller, id);
+    // Read first, so waking something that does not exist — or that belongs to
+    // somebody else — is a 404 rather than whatever the patch below would have said.
 
     // Bring the NetworkPolicy up to what this build renders, on the way up.
     //
@@ -1180,8 +1267,8 @@ export class Provisioner {
     // that never sleeps never wakes, and so never gains a new rule.
     await this.ensureNetworkPolicy(id, cluster.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "");
 
-    await this.scale(id, 1);
-    return this.get(id);
+    await this.scale(caller, id, 1);
+    return this.get(caller, id);
   }
 
   // Issue a new password and return the URI that carries it.
@@ -1199,10 +1286,10 @@ export class Provisioner {
   // plane holds and can use — it already holds every credential; the point is
   // that it cannot use one from where it runs. See issue #29.
   async rotateCredentials(
+    caller: Caller,
     id: string,
   ): Promise<{ database: Database; uri: string }> {
-    const cluster = await this.clusterFor(id);
-    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
+    const cluster = await this.ownedClusterFor(caller, id);
 
     const externalId = cluster.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "";
     const password = newPassword();
@@ -1235,7 +1322,7 @@ export class Provisioner {
     // data plane read the Secret only at start. Dropping it removes the one
     // operation that took a database offline to change a credential.
 
-    return { database: await this.get(id), uri: connectionUri(id, password) };
+    return { database: await this.get(caller, id), uri: connectionUri(id, password) };
   }
 
   // Scaling to zero is accepted long before the pod is gone — status reports
@@ -1257,7 +1344,12 @@ export class Provisioner {
   // not the pod is back. The caller is told the truth through `status`.
   private async waitForReady(id: string, attempts = 90): Promise<void> {
     for (let i = 0; i < attempts; i++) {
-      const db = await this.get(id);
+      // clusterFor, not get(): this is drigodb waiting on its own work, and an
+      // ownership check here would be asking permission of itself. The caller was
+      // already checked by whichever operation is doing the waiting.
+      const cluster = await this.clusterFor(id);
+      if (!cluster) return;
+      const db = await this.toDatabase(cluster);
       if (db.status === "ready" || db.status === "failed") return;
       await new Promise((r) => setTimeout(r, 1000));
     }
@@ -1269,7 +1361,7 @@ export class Provisioner {
   // on conflict because the controller rewrites status continuously and the
   // resourceVersion was routinely stale. None of that survives: there is no
   // read, so there is no conflict to retry.
-  async scale(id: string, replicas: number): Promise<Database> {
+  async scale(caller: Caller, id: string, replicas: number): Promise<Database> {
     const want = replicas === 0 ? "true" : "false";
 
     // One patch, both fields, so the label recording the intent and the
@@ -1304,7 +1396,7 @@ export class Provisioner {
       setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
     );
 
-    return await this.get(id);
+    return await this.get(caller, id);
   }
 
   // Grow a database onto a bigger tier.
@@ -1317,9 +1409,8 @@ export class Provisioner {
   // max_wal_size rises only after. Raising the WAL ceiling on a volume that has
   // not grown is how PostgreSQL PANICs on a full disk — and a full PVC is not a
   // quick recovery.
-  async resize(id: string, target: Tier): Promise<Database> {
-    const cluster = await this.clusterFor(id);
-    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
+  async resize(caller: Caller, id: string, target: Tier): Promise<Database> {
+    const cluster = await this.ownedClusterFor(caller, id);
 
     const current = tierOf(cluster.metadata?.labels);
     const externalId = cluster.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "";
@@ -1339,7 +1430,7 @@ export class Provisioner {
         `${target} exceeds the maximum tier for this installation (${config.maxTier})`,
       );
     }
-    if (to === at) return await this.get(id);
+    if (to === at) return await this.get(caller, id);
 
     const ns = config.databaseNamespace;
 
@@ -1440,7 +1531,7 @@ export class Provisioner {
     // Measured on DigitalOcean: 1Gi to 5Gi in 42 seconds with the database
     // serving throughout and no restart.
 
-    return await this.get(id);
+    return await this.get(caller, id);
   }
 
   // Create, and treat "it is already there" as success.
@@ -1593,15 +1684,42 @@ export class Provisioner {
     }
   }
 
-  private async resolveRestore(from: {
-    databaseId: string;
-    backupId?: string;
-    targetTime?: string;
-  }): Promise<RestoreSource> {
+  private async resolveRestore(
+    caller: Caller,
+    from: {
+      databaseId: string;
+      backupId?: string;
+      targetTime?: string;
+    },
+  ): Promise<RestoreSource> {
     if (!backupsEnabled()) {
       throw new NotConfiguredError(
         "backups are not configured for this installation, so there is nothing to restore from",
       );
+    }
+
+    // WHO MAY RESTORE FROM WHOM, and this is the sharpest thing #72 closes — sharper
+    // than the endpoints in its own table, because it is a read of another tenant's
+    // DATA rather than of their metadata.
+    //
+    // `restore_from` names a database id, and a restored database is a full copy. The
+    // existing guard only checks that a named BACKUP belongs to the named SOURCE, so
+    // before this, any caller who could name a source could have its contents. And
+    // ids were guessable for exactly the databases worth taking: an admin's id is
+    // sha256(external_id) of a meaningful string, so `openvoid-app-01JQ` is a
+    // three-line script away.
+    //
+    // A live source must be reachable by the caller. A source that no longer exists
+    // has no owner label to check — deliberately, because restoring from a deleted
+    // database is a real thing to want — so that case is admin only, the same
+    // reasoning that makes archives admin only.
+    const source = await this.clusterFor(from.databaseId);
+    if (source) {
+      if (!this.mayReach(caller, source)) {
+        throw new NotFoundError(`no database with id ${from.databaseId}`);
+      }
+    } else if (caller.tier !== "admin") {
+      throw new NotFoundError(`no database with id ${from.databaseId}`);
     }
     // The source database need not still exist — restoring from a database
     // somebody deleted is a legitimate thing to want, and its backups outlive
@@ -1675,14 +1793,13 @@ export class Provisioner {
   // selects instanceRole=primary and the NetworkPolicy has admitted
   // instance-to-instance traffic since it was written, both with comments saying
   // they were for this.
-  async setHighAvailability(id: string, enabled: boolean): Promise<Database> {
-    const cluster = await this.clusterFor(id);
-    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
+  async setHighAvailability(caller: Caller, id: string, enabled: boolean): Promise<Database> {
+    const cluster = await this.ownedClusterFor(caller, id);
 
     const current = (cluster.spec?.instances ?? 1) > 1;
     // Idempotent, and deliberately so: asking twice while a clone is running must
     // not start a second one. Nothing is patched when nothing would change.
-    if (current === enabled) return await this.get(id);
+    if (current === enabled) return await this.get(caller, id);
 
     const externalId = cluster.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "";
     const tier = tierOf(cluster.metadata?.labels);
@@ -1724,7 +1841,7 @@ export class Provisioner {
       setHeaderOptions("Content-Type", PatchStrategy.MergePatch),
     );
 
-    return await this.get(id);
+    return await this.get(caller, id);
   }
 
   // Put a database back to an earlier state, keeping its id and its URI.
@@ -1739,16 +1856,24 @@ export class Provisioner {
   // one calls POST /backups first, and drigodb does not decide that for them
   // (decision 0008).
   async restoreInPlace(
+    caller: Caller,
     id: string,
     target: { backupId?: string; targetTime?: string },
   ): Promise<Database> {
     const ns = config.databaseNamespace;
-    const cluster = await this.clusterFor(id);
-    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
+    const cluster = await this.ownedClusterFor(caller, id);
 
     const externalId = cluster.metadata?.labels?.[EXTERNAL_ID_LABEL] ?? "";
     const tier = tierOf(cluster.metadata?.labels);
     const highAvailability = (cluster.spec?.instances ?? 1) > 1;
+    // The EXISTING owner, not the caller's.
+    //
+    // Two bugs in one line if this is wrong. Read from the caller, an admin restoring
+    // a tenant's database would silently take ownership of it — the tenant's database
+    // would vanish from its own listing. Omitted entirely, the recreated Cluster
+    // carries no owner label at all and the database becomes admin-only, so a tenant
+    // loses its database by doing the one operation that keeps its id and its URI.
+    const owner = cluster.metadata?.labels?.[OWNER_LABEL];
 
     // The restored database archives to the NEXT generation.
     //
@@ -1766,7 +1891,7 @@ export class Provisioner {
     // EVERYTHING checkable happens before the Cluster is touched. After the next
     // block there is no database to put back, so a target that does not exist has
     // to fail here or not at all.
-    const restore = await this.resolveRestore({ databaseId: id, ...target });
+    const restore = await this.resolveRestore(caller, { databaseId: id, ...target });
 
     // The point of no return.
     //
@@ -1817,7 +1942,7 @@ export class Provisioner {
         version: "v1",
         namespace: ns,
         plural: CLUSTERS_PLURAL,
-        body: buildCluster(id, externalId, tier, restore, highAvailability, nextGeneration),
+        body: buildCluster(id, externalId, tier, restore, highAvailability, nextGeneration, owner),
       }),
     );
 
@@ -1826,12 +1951,11 @@ export class Provisioner {
     // Cluster under an old database's name.
     await this.ensureNetworkPolicy(id, externalId);
 
-    return await this.get(id);
+    return await this.get(caller, id);
   }
 
-  async createBackup(id: string): Promise<DatabaseBackup> {
-    const cluster = await this.clusterFor(id);
-    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
+  async createBackup(caller: Caller, id: string): Promise<DatabaseBackup> {
+    const cluster = await this.ownedClusterFor(caller, id);
     if (!backupsEnabled()) {
       throw new NotConfiguredError(
         "backups are not configured for this installation; set backup.bucket and backup.endpoint",
@@ -1850,11 +1974,10 @@ export class Provisioner {
     return toBackup(created);
   }
 
-  async listBackups(id: string): Promise<DatabaseBackup[]> {
+  async listBackups(caller: Caller, id: string): Promise<DatabaseBackup[]> {
     // 404 before the disabled check: a database that does not exist is not a
     // database whose backups are turned off.
-    const cluster = await this.clusterFor(id);
-    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
+    const cluster = await this.ownedClusterFor(caller, id);
     if (!backupsEnabled()) {
       throw new NotConfiguredError("backups are not configured for this installation");
     }
@@ -1879,10 +2002,9 @@ export class Provisioner {
     return list.items ?? [];
   }
 
-  async delete(id: string): Promise<void> {
+  async delete(caller: Caller, id: string): Promise<void> {
     const ns = config.databaseNamespace;
-    const cluster = await this.clusterFor(id);
-    if (!cluster) throw new NotFoundError(`no database with id ${id}`);
+    const cluster = await this.ownedClusterFor(caller, id);
 
     const ignoreMissing = async (fn: () => Promise<unknown>) => {
       try {

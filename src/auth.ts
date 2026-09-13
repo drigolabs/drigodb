@@ -31,6 +31,9 @@ import { config } from "./config.js";
 export const TOKEN_ID_LABEL = "drigodb.io/token-id";
 export const TOKEN_TIER_LABEL = "drigodb.io/token-tier";
 export const TOKEN_NAME_ANNOTATION = "drigodb.io/token-name";
+// Whose databases this token may reach (#72). Usually the token's own id, which is
+// what makes "a database belongs to the token that created it" the default.
+export const TOKEN_OWNER_LABEL = "drigodb.io/owner";
 export const TOKEN_EXPIRES_ANNOTATION = "drigodb.io/token-expires-at";
 export const HASH_SECRET_KEY = "hash";
 
@@ -57,12 +60,26 @@ export interface Caller {
   id: string;
   name: string;
   tier: Tier;
+  // The identity that OWNS databases, which is not always the token's own id.
+  //
+  // #72 says "a database belongs to the token that created it", and that is the
+  // default: a token issued with no owner owns as itself. But #72 was written before
+  // #62 gave tokens an expiry, and the two together are a trap — a consumer whose
+  // token expires gets a new token with a new id, and every database it owned becomes
+  // unreachable by the only name it knows.
+  //
+  // So an owner is a thing a token CARRIES rather than a thing a token IS, and a
+  // rotation is: issue a new token naming the retiring one's owner. One optional
+  // field, and the failure mode it removes is a consumer losing its fleet by doing
+  // the responsible thing with its credential.
+  owner: string;
 }
 
 export interface TokenRecord {
   id: string;
   name: string;
   tier: Tier;
+  owner: string;
   created_at?: string;
   expires_at?: string;
   // True for the static environment token. Reported so an operator can see that
@@ -96,6 +113,7 @@ export function buildTokenSecret(
   id: string,
   name: string,
   tier: Tier,
+  owner: string,
   hash: string,
   createdAt: Date,
   expiresAt?: Date,
@@ -109,6 +127,9 @@ export function buildTokenSecret(
       labels: {
         [TOKEN_ID_LABEL]: id,
         [TOKEN_TIER_LABEL]: tier,
+        // A LABEL, not an annotation, because revoking a token has to ask "does any
+        // other token still carry this owner" — and that is a selector.
+        [TOKEN_OWNER_LABEL]: owner,
         "app.kubernetes.io/managed-by": "drigodb",
       },
       annotations: {
@@ -135,6 +156,9 @@ function recordOf(secret: V1Secret): { record: TokenRecord; hash: string } | und
       id,
       name: secret.metadata?.annotations?.[TOKEN_NAME_ANNOTATION] ?? id,
       tier,
+      // Falls back to the token's own id, which is what a token issued before this
+      // existed means — and what a token issued without an owner means now.
+      owner: secret.metadata?.labels?.[TOKEN_OWNER_LABEL] ?? id,
       ...(secret.metadata?.creationTimestamp
         ? { created_at: new Date(secret.metadata.creationTimestamp).toISOString() }
         : {}),
@@ -179,6 +203,11 @@ export class TokenStore {
         id: BOOTSTRAP_TOKEN_ID,
         name: "installation bootstrap token",
         tier: "admin",
+        // The historical owner. Every database that existed before #72 was created by
+        // this token, under an id derived from external_id alone — so making the
+        // bootstrap owner the unsalted id space is not a special case invented for
+        // convenience, it is the record of who actually made them.
+        owner: BOOTSTRAP_TOKEN_ID,
         bootstrap: true,
       });
     }
@@ -218,7 +247,7 @@ export class TokenStore {
     const record = byHash.get(hash);
     if (!record) return undefined;
     if (record.expires_at && Date.parse(record.expires_at) <= this.now()) return undefined;
-    return { id: record.id, name: record.name, tier: record.tier };
+    return { id: record.id, name: record.name, tier: record.tier, owner: record.owner };
   }
 
   // Forget the cache. Called after issuing or revoking, so the caller's own
@@ -234,14 +263,21 @@ export class TokenStore {
     return [...byHash.values()].sort((a, b) => (a.created_at ?? "").localeCompare(b.created_at ?? ""));
   }
 
-  async issue(name: string, tier: Tier, expiresIn?: number): Promise<{ record: TokenRecord; token: string }> {
+  async issue(
+    name: string,
+    tier: Tier,
+    owner?: string,
+    expiresIn?: number,
+  ): Promise<{ record: TokenRecord; token: string }> {
     const id = newTokenId();
     const token = newToken();
+    // Its own id unless told otherwise, which is #72's model as the default.
+    const ownerId = owner ?? id;
     const createdAt = new Date(this.now());
     const expiresAt = expiresIn ? new Date(this.now() + expiresIn * 1000) : undefined;
     await this.core.createNamespacedSecret({
       namespace: config.databaseNamespace,
-      body: buildTokenSecret(id, name, tier, hashToken(token), createdAt, expiresAt),
+      body: buildTokenSecret(id, name, tier, ownerId, hashToken(token), createdAt, expiresAt),
     });
     this.invalidate();
     return {
@@ -250,10 +286,33 @@ export class TokenStore {
         id,
         name,
         tier,
+        owner: ownerId,
         created_at: createdAt.toISOString(),
         ...(expiresAt ? { expires_at: expiresAt.toISOString() } : {}),
       },
     };
+  }
+
+  // Is there still a token carrying this owner, other than the one being revoked?
+  //
+  // Asked so revocation can say what it orphaned rather than leaving an operator to
+  // find out. With two tokens sharing an owner — which is how a rotation works —
+  // revoking one orphans nothing.
+  async ownerStillReachable(owner: string, excludingTokenId: string): Promise<boolean> {
+    if (this.bootstrapHash && owner === BOOTSTRAP_TOKEN_ID) return true;
+    const list = await this.core.listNamespacedSecret({
+      namespace: config.databaseNamespace,
+      // And the token-id label, so this cannot match a database's password Secret:
+      // those live in the same namespace and OWNER_LABEL is the same key on both.
+      labelSelector: `${TOKEN_OWNER_LABEL}=${owner},${TOKEN_ID_LABEL}`,
+    });
+    return (list.items ?? []).some(
+      (s) => s.metadata?.labels?.[TOKEN_ID_LABEL] !== excludingTokenId,
+    );
+  }
+
+  async recordFor(id: string): Promise<TokenRecord | undefined> {
+    return (await this.list()).find((t) => t.id === id);
   }
 
   async revoke(id: string): Promise<void> {
@@ -273,6 +332,9 @@ export class TokenStore {
 
 // What `POST /v1/tokens` is allowed to say.
 const NAME_RE = /^[A-Za-z0-9]([-A-Za-z0-9_. ]{0,61}[A-Za-z0-9])?$/;
+// A token id, or the bootstrap owner. Constrained because this value becomes a label
+// value and a salt for a derived database id, and neither is a place for free text.
+const OWNER_RE = /^([0-9a-f]{16}|bootstrap)$/;
 // A year. Not a policy about how long a token should live — a bound on a number
 // that goes into a date, so a typo'd expires_in cannot mint something that
 // outlives the installation.
@@ -281,12 +343,13 @@ const MAX_EXPIRES_IN = 366 * 24 * 60 * 60;
 export function validateTokenRequest(value: unknown): {
   name: string;
   tier: Tier;
+  owner?: string;
   expiresIn?: number;
 } {
   if (value === null || typeof value !== "object") {
     throw new TokenError('a token needs a body: {"name": "what this is for"}');
   }
-  const v = value as { name?: unknown; tier?: unknown; expires_in?: unknown };
+  const v = value as { name?: unknown; tier?: unknown; owner?: unknown; expires_in?: unknown };
   if (typeof v.name !== "string" || !NAME_RE.test(v.name)) {
     throw new TokenError(
       "name must be 1-63 characters of letters, digits, spaces, dot, dash or underscore. " +
@@ -295,6 +358,16 @@ export function validateTokenRequest(value: unknown): {
   }
   if (v.tier !== undefined && v.tier !== "admin" && v.tier !== "tenant") {
     throw new TokenError('tier must be "admin" or "tenant"');
+  }
+  // Naming an existing owner is how a token is ROTATED without the databases moving.
+  // Shaped like a token id because that is what an owner defaults to, and because a
+  // free-form string here would end up in a label value and a bucket prefix.
+  if (v.owner !== undefined && (typeof v.owner !== "string" || !OWNER_RE.test(v.owner))) {
+    throw new TokenError(
+      "owner must be a token id — 16 hex characters, or \"bootstrap\". Omit it and the " +
+        "token owns as itself, which is what a new consumer wants; name the retiring " +
+        "token's owner to rotate a credential without moving its databases",
+    );
   }
   let expiresIn: number | undefined;
   if (v.expires_in !== undefined) {
@@ -309,5 +382,10 @@ export function validateTokenRequest(value: unknown): {
   // tenant by default. A caller that does not say has not asked for the power to
   // mint more tokens, and defaulting the other way would make every consumer an
   // administrator by omission.
-  return { name: v.name, tier: (v.tier as Tier) ?? "tenant", ...(expiresIn ? { expiresIn } : {}) };
+  return {
+    name: v.name,
+    tier: (v.tier as Tier) ?? "tenant",
+    ...(v.owner ? { owner: v.owner as string } : {}),
+    ...(expiresIn ? { expiresIn } : {}),
+  };
 }
