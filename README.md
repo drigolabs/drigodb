@@ -344,7 +344,9 @@ bootstrap several minutes later. The recoverable window for a *running* database
 is bounded by the `ObjectStore` retention policy, 30 days by default — and that
 policy bounds less than it sounds like it does. See
 [docs/backup-retention.md](docs/backup-retention.md): it is enforced by the
-running primary, so a deleted database's archive is never pruned at all.
+running primary, so a deleted database's archive is never pruned at all. Removing
+one is a mechanism drigodb does not have yet (#135), not something it declines to
+do.
 
 A backup belongs to the database it was taken from, and drigodb refuses a
 `restore_from` that names someone else's — otherwise any backup in the

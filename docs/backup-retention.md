@@ -63,24 +63,50 @@ longer existed**, plus one `-r1` generation from a single in-place restore. All
 inside the 30-day window, so nothing *should* have pruned them — the point is that
 nothing ever would.
 
-## Why drigodb does not fix this itself
+## This is a missing mechanism, not a chore
 
-It cannot, and that is on purpose. The control plane holds **no object-storage
-credential** and has **no S3 client**: it names a Secret and CloudNativePG's plugin
-does all the reading and writing. Teaching it to prune means giving it a bucket
-credential and the ability to delete a customer's backups — which is the exact
-capability the current split exists to withhold.
+The procedure below is a **workaround for a gap in the core**, and it is worth being
+clear about that rather than presenting it as the way things are.
 
-Two alternatives were considered and are recorded rather than taken:
+`docs/decisions/0008` asks one question of any change: does it say *what* drigodb
+can do to a database, or *when* to do it? Removing a database's archive is **what**
+— a mechanism, and a missing one. Deciding when to sweep orphans is **when**, and
+belongs to a policy component outside this repository. **[#135](https://github.com/drigolabs/drigodb/issues/135)** is that
+mechanism: a per-database purge, and the listing a policy layer would need to
+discover what to purge.
 
-- **Deleting the prefix on `DELETE`** reverses the invariant above, and wants a
-  decision record rather than a patch.
-- **A bucket lifecycle rule** prunes by age whether or not anything is running,
-  which is right for orphans and **dangerous for live prefixes**: ageing out a base
-  backup while keeping the WAL that depends on it leaves an archive that cannot be
-  replayed. The bucket cannot tell a live prefix from an orphan.
+### What the invariant forbids, exactly
 
-## Clearing orphans by hand
+This was misread once, so it is worth quoting:
+
+> `DELETE` removes a database's `Backup` records and never the bucket contents …
+> the split that keeps drigodb from destroying a customer's backups **by deleting a
+> Kubernetes object**.
+
+That forbids destroying backups *implicitly*, as a side effect of deleting a
+database. It does not forbid an explicit, separately-authorised purge. Different
+operations, different blast radii.
+
+### And the credential does not have to move
+
+The control plane holds **no object-storage credential** and has **no S3 client**,
+deliberately — and that can stay true. drigodb already *causes* data to be written
+to the bucket without holding the credential: it names a Secret and
+CloudNativePG's plugin does the reading and writing. A purge can work the same way,
+as a Job with that Secret mounted, which is the pattern CloudNativePG's own recovery
+Job uses.
+
+The property to preserve is *the control plane holds no bucket credential* — not
+*nothing drigodb runs may touch the bucket*.
+
+### One alternative recorded as not taken
+
+**A bucket lifecycle rule** prunes by age whether or not anything is running, which
+is right for orphans and **dangerous for live prefixes**: ageing out a base backup
+while keeping the WAL that depends on it leaves an archive that cannot be replayed.
+A bucket cannot tell a live prefix from an orphan.
+
+## Clearing orphans by hand, until #135 exists
 
 The prefixes are named after the database, so they are identifiable without
 drigodb. What is live is what has a `Cluster`:

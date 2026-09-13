@@ -153,10 +153,11 @@ backup:
   #   * an archive generation left behind by a restore in place is never pruned
   #   * a hibernated database's archive is not pruned until it wakes
   #
-  # Those accumulate. drigodb cannot prune them: it holds no object-storage
-  # credential and has no S3 client, both deliberately. See
-  # docs/backup-retention.md for what that means operationally and how to clear
-  # them by hand.
+  # Those accumulate, and nothing in drigodb removes them yet — a per-database
+  # purge is a missing MECHANISM rather than a property of the design (#135), and
+  # deciding when to sweep belongs to a policy layer outside this repository.
+  # docs/backup-retention.md has the coverage table and how to clear them by hand
+  # until that exists.
   retention: 30d
 
 nameOverride: ""
