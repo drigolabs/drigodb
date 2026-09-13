@@ -33,6 +33,7 @@ is an unfinished mechanism, not a reason to move the decision inwards.
 
 ```
 npm test                          vitest, no cluster needed
+npm run test:coverage             the same, with a coverage summary
 npm run typecheck                 tsc --noEmit
 bash scripts/kind-up.sh           a real cluster on a laptop, via scripts/deploy.sh
 bash scripts/kind-down.sh         tear it down — do this, kind clusters are not free RAM

@@ -2,15 +2,18 @@
   "name": "drigodb",
   "version": "0.0.1",
   "private": true,
-  "description": "MongoDB-compatible databases on PostgreSQL, provisioned through an API",
+  "description": "PostgreSQL databases, provisioned through an API on Kubernetes \u2014 hibernating when idle, waking in seconds.",
   "type": "module",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/server.js",
+    "start": "node dist/src/server.js",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:coverage": "vitest run --coverage --coverage.reporter=text --coverage.reporter=json-summary"
   },
   "dependencies": {
     "@hono/node-server": "^1.14.0",
@@ -19,8 +22,10 @@
   },
   "devDependencies": {
     "@types/node": "^22.13.0",
+    "@vitest/coverage-v8": "^4.1.11",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.0"
-  }
+  },
+  "license": "MIT"
 }
