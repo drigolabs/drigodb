@@ -39,6 +39,7 @@ bash scripts/kind-down.sh         tear it down — do this, kind clusters are no
 bash scripts/smoke.sh             end-to-end against a running installation
 bash scripts/chart-determinism-test.sh    renders the chart twice, asserts identical
 bash scripts/diagram-render-test.sh       every mermaid block in docs/ actually renders
+bash scripts/install-failure-test.sh      its own kind cluster, deliberately broken
 ```
 
 ## Pull requests
@@ -124,13 +125,35 @@ you find out whether it is true. Anything touching the Kubernetes API gets both.
 Assert that a new test fails without the fix. A `str.replace` that silently
 matched nothing once left `create()` ignoring the configured default tier.
 
+A cluster test that reads the wrong pod is the same hazard in a new place, and it
+passes. Every `helm upgrade` that changes an environment variable rolls a new
+ReplicaSet, so mid-rollout there are three pods — the old one still Ready with the
+old configuration, the new one starting, one terminating. `{.items[0]}` picked the
+old one and an assertion about a broken configuration read the working one's
+answer.
+
+Select the ReplicaSet by the Deployment's `deployment.kubernetes.io/revision`
+annotation, which is what `kubectl rollout` matches on. **Not the newest
+`creationTimestamp`**: reverting a value to empty makes the pod template byte
+identical to an earlier one, because Kubernetes drops an env var whose value is
+`""` — so no new ReplicaSet is created, the FIRST one is scaled back up and its
+revision bumped, and the newest by timestamp is a stale one scaled to zero with no
+pods in it at all.
+
+And do not reach a pod through `kubectl port-forward` in a test. A forward that
+outlives its caller keeps the local port, the next one cannot bind it, and reads go
+to whichever pod the stale forward points at — silently, and it has already turned
+one assertion green while the thing it asserted was untrue. `kubectl exec` into the
+pod instead: the API image is node:22-alpine, so `node -e "fetch(...)"` needs no
+port, no background process and no curl.
+
 ## Do not change silently
 
 - The CI job names `typecheck and test`, `drigodb works end to end` and
   `api image builds` — branch protection on `main` requires them by those exact
   strings, and renaming one blocks every PR on a check that never reports.
-  `diagrams render` is not required yet and its name is already permanent for the
-  same reason.
+  `diagrams render` and `a broken cluster is a loud failure` are not required yet
+  and their names are already permanent for the same reason.
 - The chart must render identically every time: no `lookup`, no `randAlphaNum`,
   no clock. One `lookup` rotated every consumer's bearer token on every Argo sync
   while reporting Synced. `scripts/chart-determinism-test.sh` enforces it.
