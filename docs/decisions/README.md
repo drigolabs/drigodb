@@ -47,6 +47,12 @@ other consumer does, and the day one exists it will be its own deployable.
 | [0002 — GitOps for the control plane](0002-gitops-for-the-control-plane.md) | Pull-based reconciliation for the control plane, manual pin promotion, nothing writing to `main`; the data plane stays API-provisioned |
 | [0003 — Argo CD](0003-argo-cd.md) | Argo CD reconciles drigodb's own cluster, chosen on familiarity; the chart stays renderer-agnostic and requires nothing of anyone else |
 
+### Who may do what
+
+| Record | Decision |
+|---|---|
+| [0009 — One tenant cannot reach another](0009-one-tenant-cannot-reach-another.md) | A token is a Secret holding a hash, a database belongs to an owner a token carries, and an id is derived from that owner — so two tenants may both call a database `main` and neither can see, reach or restore from the other's |
+
 ### The principle
 
 | Record | Decision |
@@ -59,6 +65,10 @@ merged pull request link to it by path. Worth consolidating the next time someth
 [high-availability.md](../diagrams/high-availability.md) draws what 0004's opt-in standby actually does
 — the commit path, the failover, and the degraded window where the durability guarantee is relaxed
 rather than blocking writes.
+
+[who-can-reach-what.md](../diagrams/who-can-reach-what.md) draws 0009 — a token becoming a credential,
+two tenants both calling their database `main` and getting two databases, and the `restore_from` check
+that stands in front of a bucket read rather than beside it.
 
 [deploy-flow.md](../diagrams/deploy-flow.md) draws where the second of those decisions leads — how a merge
 should reach a cluster, and which credential each step holds. It is a target, and it names the issues

@@ -58,6 +58,34 @@ code comments and the commit message, where someone doing archaeology will be.
 
 Never write `@` before a number in GitHub prose. `@20k` pinged a real user.
 
+## Decision records
+
+**A feature whose shape was a choice gets an ADR in `docs/decisions/`, in the same pull
+request.** Not after, and not only for the big ones — the record is cheapest to write
+while the alternatives are still in mind, and worthless once the reasoning has to be
+reconstructed from the diff.
+
+What makes a record worth having is the part that is hardest to recover later:
+
+- **The alternatives, each with why not.** A table. A record that states only what was
+  decided is a changelog entry; the value is in the options that were live at the time,
+  because those are exactly what the next person will propose.
+- **The trade, named.** Every decision here costs something — `0009` shares one id space
+  between admin tokens, `0007` puts a hop in the connection path. A record that lists no
+  cost has not finished thinking.
+- **What prompted it**, concretely, with the measurement if there was one. `0008` exists
+  because automatic hibernation had a 67% chance of hibernating a database in use.
+- **What it does NOT protect or promise.** `0009` does not change the network layer, and
+  saying so stops it being read as more than it is.
+
+One record per decision, not per feature: `0009` covers two issues because identity and
+ownership are one choice, and neither is coherent alone. Two features that made no real
+choice need no record between them.
+
+Index it in `docs/decisions/README.md` under the right grouping, and draw it if the
+sequence is where the subtlety lives — `docs/diagrams/` is part of the record, not
+decoration.
+
 ## Commits
 
 Conventional Commits, and they are load-bearing: `scripts/next-version.sh` reads

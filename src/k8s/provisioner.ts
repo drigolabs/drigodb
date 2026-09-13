@@ -1188,13 +1188,23 @@ export class Provisioner {
       });
     } catch (err) {
       if (!isAlreadyExists(err)) throw err;
-      const owner = (await this.clusterFor(id))?.metadata?.labels?.[
+      // Named `owner` until #72, where that word started meaning something else in
+      // this file. It is the external_id of whatever is already at this id.
+      const existingExternalId = (await this.clusterFor(id))?.metadata?.labels?.[
         EXTERNAL_ID_LABEL
       ];
       // Twelve hex characters is 48 bits, so a collision needs millions of
       // external_ids — but handing one caller another's database, credentials
       // and all, is not a failure to discover in production.
-      if (owner !== undefined && owner !== externalId) {
+      //
+      // The SECOND of three barriers now. The salt makes an accidental collision
+      // between two owners astronomically unlikely; this rejects a derived-id match
+      // whose external_id differs, which is the shape a brute-forced collision takes;
+      // and the get() below refuses on ownership even if both are somehow passed. An
+      // attacker can search external_ids of their own until one derives a victim id —
+      // 48 bits is not cryptographically out of reach offline — but cannot make their
+      // own OWNER collide, which is what the last barrier checks.
+      if (existingExternalId !== undefined && existingExternalId !== externalId) {
         throw new ValidationError(
           `external_id ${externalId} collides with an existing database; choose another`,
         );

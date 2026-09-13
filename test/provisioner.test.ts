@@ -1992,3 +1992,69 @@ describe("ownership", () => {
     expect(svc.metadata.labels).not.toHaveProperty(m.OWNER_LABEL);
   });
 });
+
+
+// Could a tenant reach another's database by brute-forcing a colliding id?
+//
+// Three barriers stand in the way, and this exercises the LAST one — the first two can
+// be reasoned about and the third is what has to hold when the reasoning is wrong.
+// 48 bits is not cryptographically out of reach offline: an attacker can search
+// external_ids of their own until one derives a victim's id.
+//
+// Simulated rather than brute-forced. A Cluster is planted exactly where the attacker's
+// derivation lands, owned by somebody else and carrying the SAME external_id so the
+// collision guard cannot fire. That is the worst case the earlier barriers leave.
+describe("a collided id is still not somebody else's database", () => {
+  it("answers 404 rather than handing over the database at a colliding id", async () => {
+    const { createHash } = await import("node:crypto");
+    const attacker = {
+      id: "dddd000000000004",
+      name: "d",
+      tier: "tenant" as const,
+      owner: "dddd000000000004",
+    };
+    // The same material idFor builds for a tenant.
+    const collided = createHash("sha256")
+      .update(`${attacker.owner}\u0000main`)
+      .digest("hex")
+      .slice(0, 12);
+
+    const notFound = () => Object.assign(new Error("not found"), { code: 404 });
+    const conflict = () => Object.assign(new Error("already exists"), { code: 409 });
+    const victim = {
+      metadata: {
+        name: `db-${collided}`,
+        labels: {
+          "drigodb.io/database-id": collided,
+          "drigodb.io/external-id": "main",
+          "drigodb.io/owner": "victim0000000001",
+          "app.kubernetes.io/managed-by": "drigodb",
+        },
+      },
+      status: { readyInstances: 1 },
+    };
+    const objects = {
+      createNamespacedCustomObject: async () => {
+        throw conflict();
+      },
+      getNamespacedCustomObject: async (req: { name: string }) => {
+        if (req.name === `db-${collided}`) return victim;
+        throw notFound();
+      },
+      listNamespacedCustomObject: async () => ({ items: [] }),
+    };
+    const core = {
+      createNamespacedSecret: async () => ({}),
+      createNamespacedService: async () => ({}),
+      listNamespacedPod: async () => ({ items: [] }),
+      listNamespacedPersistentVolumeClaim: async () => ({ items: [] }),
+    };
+    const net = { createNamespacedNetworkPolicy: async () => ({}) };
+    const p = new Provisioner(
+      {} as never, core as never, net as never, {} as never, objects as never,
+    );
+
+    // Not the database, and not a 403 either — the same 404 an absent database gives.
+    await expect(p.create(attacker, "main")).rejects.toThrow(NotFoundError);
+  });
+});
