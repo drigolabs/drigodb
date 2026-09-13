@@ -141,7 +141,23 @@ backup:
   # reads it: it names the Secret and the operator does the reading, which is
   # why the control plane holds no object-storage credential at all.
   credentialsSecret: drigodb-backup-credentials
-  # How long backups and WAL are kept. `XXu` where u is d, w or m.
+  # How long backups and WAL are kept FOR A DATABASE THAT IS RUNNING. `XXu` where
+  # u is d, w or m.
+  #
+  # Read the qualifier. The barman-cloud plugin enforces this from the instance
+  # sidecar, only on the current primary, and only for that Cluster's current
+  # archive prefix. So it does not bound storage:
+  #
+  #   * a DELETED database's archive is never pruned — no pod, no sidecar,
+  #     nothing to apply the policy
+  #   * an archive generation left behind by a restore in place is never pruned
+  #   * a hibernated database's archive is not pruned until it wakes
+  #
+  # Those accumulate, and nothing in drigodb removes them yet — a per-database
+  # purge is a missing MECHANISM rather than a property of the design (#135), and
+  # deciding when to sweep belongs to a policy layer outside this repository.
+  # docs/backup-retention.md has the coverage table and how to clear them by hand
+  # until that exists.
   retention: 30d
 
 nameOverride: ""
