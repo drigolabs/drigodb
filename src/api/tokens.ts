@@ -14,7 +14,28 @@ import type { Caller } from "../auth.js";
 type Env = { Variables: { caller: Caller } };
 
 export function buildTokenRoutes(store: TokenStore): Hono<Env> {
-  const app = new Hono<Env>();
+  // basePath, and the admin gate below is the reason.
+  //
+  // Written first as `new Hono()` with `app.use("*", adminOnly)` and mounted at "/",
+  // where `*` matches every path in the whole application — so a tenant token got
+  // 403 from `GET /v1/databases`. Caught by smoke.sh on a cluster, which is the only
+  // place it was visible: every unit test passed, because nothing assembled the two
+  // routers together.
+  //
+  // Two other spellings, measured rather than assumed, because I guessed wrong about
+  // one of them and wrote the guess down:
+  //
+  //   use("/v1/tokens/*")  gates /v1/tokens AND /v1/tokens/{id}, and nothing else.
+  //                        Safe — Hono matches the bare path too, which is not what
+  //                        the trailing /* suggests.
+  //   use("/v1/tokens")    gates the collection ONLY. DELETE /v1/tokens/{id} is wide
+  //                        open, so any tenant token can revoke any token including
+  //                        every admin one. This is the spelling to fear.
+  //
+  // A basePath is preferred over the safe one of those because the wildcard cannot
+  // reach outside the subtree by construction rather than by a routing detail, and
+  // because there is no path pattern to keep in step with the handlers below.
+  const app = new Hono<Env>().basePath("/v1/tokens");
 
   // 403, not 404, and this is the one place that is right.
   //
@@ -33,7 +54,7 @@ export function buildTokenRoutes(store: TokenStore): Hono<Env> {
   // The token is in this response and nowhere else, ever again. Same contract as
   // `connection_uri`, for the same reason — drigodb stores a hash, so it could not
   // show it to you a second time even if it wanted to.
-  app.post("/v1/tokens", async (c) => {
+  app.post("/", async (c) => {
     let req: { name: string; tier: "admin" | "tenant"; expiresIn?: number };
     try {
       req = validateTokenRequest(await c.req.json().catch(() => null));
@@ -47,9 +68,9 @@ export function buildTokenRoutes(store: TokenStore): Hono<Env> {
 
   // Metadata only. There is no endpoint that returns a token value, including
   // this one, including for the caller's own token.
-  app.get("/v1/tokens", async (c) => c.json({ tokens: await store.list() }));
+  app.get("/", async (c) => c.json({ tokens: await store.list() }));
 
-  app.delete("/v1/tokens/:id", async (c) => {
+  app.delete("/:id", async (c) => {
     const id = c.req.param("id");
     // Revoking the credential you are presenting is allowed. It is a legitimate
     // thing to want — it is how a leaked token is dealt with by whoever leaked it

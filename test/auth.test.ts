@@ -255,3 +255,81 @@ describe("token request validation", () => {
     expect(() => a.validateTokenRequest({ name: "ci", tier: "root" })).toThrow(a.TokenError);
   });
 });
+
+// The two routers assembled together, which is the only place the admin gate's
+// SCOPE is visible.
+//
+// This exists because the gate was written as `use("*")` on a router mounted at "/",
+// so it applied to every path in the application and a tenant token got 403 from
+// `GET /v1/databases`. Every unit test passed — nothing put the two routers side by
+// side — and a cluster caught it. So now something puts them side by side.
+describe("the admin gate's scope", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  // The same assembly src/server.ts performs: an authentication middleware that sets
+  // a caller, then the token routes, then everything else.
+  async function appWith(tier: "admin" | "tenant") {
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_DATABASE_NAMESPACE", NS);
+    const { Hono } = await import("hono");
+    const { buildTokenRoutes } = await import("../src/api/tokens.js");
+    const a = await import("../src/auth.js");
+    const { core } = fakeCore();
+    const store = new a.TokenStore(core as never, undefined);
+
+    const app = new Hono<{ Variables: { caller: { id: string; name: string; tier: string } } }>();
+    app.use("/v1/*", async (c, next) => {
+      c.set("caller", { id: "caller", name: "caller", tier });
+      await next();
+    });
+    app.route("/", buildTokenRoutes(store) as never);
+    // Stands in for buildRoutes. Anything mounted after the token router, which is
+    // exactly where the leak was.
+    app.get("/v1/databases", (c) => c.json({ databases: [] }));
+    app.post("/v1/databases", (c) => c.json({ id: "x" }, 202));
+    app.get("/v1/archives", (c) => c.json({ archives: [] }));
+    return app;
+  }
+
+  it("lets a tenant token through to everything that is not a token endpoint", async () => {
+    const app = await appWith("tenant");
+    for (const [method, path] of [
+      ["GET", "/v1/databases"],
+      ["POST", "/v1/databases"],
+      ["GET", "/v1/archives"],
+    ] as const) {
+      const res = await app.request(path, { method });
+      expect([200, 202]).toContain(res.status);
+    }
+  });
+
+  it("refuses a tenant token on every token endpoint, including the collection", async () => {
+    // The collection and the item, separately, because a gate can cover one and not
+    // the other. Measured: `use("/v1/tokens")` gates the collection only and leaves
+    // DELETE /v1/tokens/{id} open to any tenant token — which would let one revoke
+    // every admin token in the installation.
+    const app = await appWith("tenant");
+    for (const [method, path] of [
+      ["GET", "/v1/tokens"],
+      ["POST", "/v1/tokens"],
+      ["DELETE", "/v1/tokens/abcd"],
+    ] as const) {
+      const res = await app.request(path, {
+        method,
+        ...(method === "POST"
+          ? { body: JSON.stringify({ name: "x" }), headers: { "content-type": "application/json" } }
+          : {}),
+      });
+      expect(res.status).toBe(403);
+    }
+  });
+
+  it("lets an admin token reach both", async () => {
+    const app = await appWith("admin");
+    expect((await app.request("/v1/tokens")).status).toBe(200);
+    expect((await app.request("/v1/databases")).status).toBe(200);
+  });
+});
