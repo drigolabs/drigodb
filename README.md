@@ -340,8 +340,11 @@ in `validateRestoreFrom`.
 `backup_id` and `target_time` are alternatives; sending both is a 400 rather
 than a precedence rule. A `target_time` before the earliest backup finished is
 also a 400, at the moment of the request, rather than a database that fails to
-bootstrap several minutes later. The window is bounded by the `ObjectStore`
-retention policy, 30 days by default.
+bootstrap several minutes later. The recoverable window for a *running* database
+is bounded by the `ObjectStore` retention policy, 30 days by default — and that
+policy bounds less than it sounds like it does. See
+[docs/backup-retention.md](docs/backup-retention.md): it is enforced by the
+running primary, so a deleted database's archive is never pruned at all.
 
 A backup belongs to the database it was taken from, and drigodb refuses a
 `restore_from` that names someone else's — otherwise any backup in the
