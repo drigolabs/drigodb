@@ -122,6 +122,13 @@ export function archiveGenerationOf(
 // further. Point-in-time recovery (#19) is the archive, not the backup.
 export const BARMAN_PLUGIN = "barman-cloud.cloudnative-pg.io";
 
+// The plugin's own API group, which is NOT the operator's. `spec.backup.
+// barmanObjectStore` on a Cluster does the same job on CloudNativePG 1.27 and is
+// removed in 1.28, so the bucket is declared here instead — and a purge reads it
+// from here rather than from a second copy in the API's environment.
+export const BARMAN_GROUP = "barmancloud.cnpg.io";
+export const OBJECT_STORES_PLURAL = "objectstores";
+
 // The name a restoring Cluster gives the thing it is restoring FROM. Internal
 // to one manifest — nothing outside it ever sees this string.
 export const RESTORE_SOURCE_NAME = "origin";
@@ -890,6 +897,144 @@ export function buildNetworkPolicy(
           ports: [{ protocol: "TCP", port: POSTGRES_PORT }],
         },
       ],
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Purging the archive of a database that no longer exists.
+//
+// Everything else in this file builds an object for a LIVE database. This builds
+// the one operation that exists only after a database is gone: a Job that empties
+// the prefixes its backups and WAL were written to (#135, docs/archive-purge.md).
+//
+// It is a Job and not a call from the API process for one reason. drigodb's
+// control plane holds no object-storage credential and has no S3 client, and that
+// is a property worth more than the convenience of deleting objects inline. So the
+// deletion happens in a pod, with the Secret mounted into it, and the control
+// plane passes a reference it cannot itself resolve — the same shape CloudNativePG
+// uses for its own recovery Jobs.
+// ---------------------------------------------------------------------------
+
+// What a purge needs out of the installation's ObjectStore. Read from the cluster
+// rather than configured twice: the ObjectStore is where the bucket is declared,
+// and a second declaration in the API's environment is a copy that can disagree
+// with it.
+export interface ArchiveStore {
+  destinationPath: string;
+  endpointUrl?: string;
+  accessKeyId: { name: string; key: string };
+  secretAccessKey: { name: string; key: string };
+  region?: { name: string; key: string };
+}
+
+// Marks the pods of a drigodb-run Job, so the endpoint can find the one whose log
+// holds the answer.
+//
+// Not Kubernetes' own `job-name`: that label has been deprecated since 1.27 in
+// favour of `batch.kubernetes.io/job-name`, both are currently applied, and a
+// selector on either is a bet on which one a future release keeps. This one is
+// ours, set in the pod template, and cannot be taken away.
+export const OPERATION_LABEL = "drigodb.io/operation";
+export const PURGE_OPERATION = "purge-archive";
+
+// Derived from the id, not random.
+//
+// A random name would leak a Job per attempt and leave the endpoint guessing
+// which pod's log holds the answer. A derived one means a retry finds the previous
+// attempt, clears it, and reads exactly one log.
+export function purgeJobName(id: string): string {
+  return `purge-${clusterName(id)}`;
+}
+
+export function buildPurgeJob(
+  id: string,
+  store: ArchiveStore,
+  opts: { dryRun: boolean },
+): V1Job {
+  const labels = {
+    [DB_ID_LABEL]: id,
+    [MANAGED_BY_LABEL]: MANAGED_BY_VALUE,
+    [OPERATION_LABEL]: PURGE_OPERATION,
+  };
+  const secretEnv = (name: string, ref: { name: string; key: string }) => ({
+    name,
+    valueFrom: { secretKeyRef: { name: ref.name, key: ref.key } },
+  });
+  return {
+    apiVersion: "batch/v1",
+    kind: "Job",
+    metadata: { name: purgeJobName(id), namespace: config.databaseNamespace, labels },
+    spec: {
+      // Zero, deliberately. A purge that failed must reach the caller, not retry
+      // itself quietly behind a pod that has already been replaced — with
+      // backoffLimit above zero there are several pods and no single log that is
+      // the answer. Retrying is a caller POSTing again, which is safe: emptying a
+      // prefix that is already partly empty is the same operation.
+      backoffLimit: 0,
+      // Bounded so a purge against an unreachable endpoint fails instead of
+      // sitting in the namespace forever holding the only name a retry can use.
+      // The same ceiling the endpoint waits for, deliberately: a request that
+      // gave up while the Job ran on would report a failure that was not one.
+      activeDeadlineSeconds: 300,
+      // Long enough that the log survives the request that started it, short
+      // enough that a fleet's worth of purges does not accumulate. The endpoint
+      // reads the log before returning; this is for the operator who wants to
+      // look again afterwards.
+      ttlSecondsAfterFinished: 3600,
+      template: {
+        metadata: { labels },
+        spec: {
+          restartPolicy: "Never",
+          // The Job talks to object storage and to nothing in the cluster. No
+          // token, no Kubernetes API, no database.
+          automountServiceAccountToken: false,
+          containers: [
+            {
+              name: "purge",
+              image: config.backup.purgeImage,
+              // The sidecar image is distroless — there is no /bin/sh in it, so
+              // this cannot be a shell one-liner even if it wanted to be. It is
+              // the interpreter and the mounted script, which is the better shape
+              // anyway: the program is a file in the repository.
+              command: ["/venv/bin/python", "/opt/drigodb/purge-archive.py"],
+              env: [
+                { name: "DRIGODB_SERVER_NAME", value: clusterName(id) },
+                { name: "DRIGODB_DESTINATION_PATH", value: store.destinationPath },
+                { name: "DRIGODB_ENDPOINT_URL", value: store.endpointUrl ?? "" },
+                { name: "DRIGODB_DRY_RUN", value: opts.dryRun ? "1" : "" },
+                {
+                  name: "DRIGODB_MAX_GENERATIONS",
+                  value: String(config.backup.purgeMaxGenerations),
+                },
+                secretEnv("AWS_ACCESS_KEY_ID", store.accessKeyId),
+                secretEnv("AWS_SECRET_ACCESS_KEY", store.secretAccessKey),
+                // Both names: boto3 reads AWS_DEFAULT_REGION, and its newer
+                // releases read AWS_REGION. Setting one and being wrong about
+                // which shows up as a signature mismatch against a store that
+                // cares, which is not an obvious symptom of a missing region.
+                ...(store.region
+                  ? [
+                      secretEnv("AWS_REGION", store.region),
+                      secretEnv("AWS_DEFAULT_REGION", store.region),
+                    ]
+                  : []),
+              ],
+              volumeMounts: [{ name: "script", mountPath: "/opt/drigodb", readOnly: true }],
+            },
+          ],
+          volumes: [
+            {
+              name: "script",
+              configMap: {
+                name: config.backup.purgeScriptConfigMap,
+                // 0555: the interpreter reads it, nothing writes it.
+                defaultMode: 0o555,
+              },
+            },
+          ],
+        },
+      },
     },
   };
 }

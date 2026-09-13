@@ -6,6 +6,15 @@ function envOr(name: string, fallback: string): string {
   return v && v.length > 0 ? v : fallback;
 }
 
+// A positive integer from the environment, or the fallback. Nonsense falls back
+// rather than propagating: a bad value here is an operator's typo, and every
+// consumer of it is a bound whose only safe direction to be wrong in is the
+// configured default.
+function positiveOr(name: string, fallback: number): number {
+  const n = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 function required(name: string): string {
   const v = process.env[name];
   if (!v || v.length === 0) {
@@ -64,6 +73,39 @@ export const config = {
   // the sidecar era managed with its own signing code.
   backup: {
     objectStore: envOr("DRIGODB_BACKUP_OBJECT_STORE", ""),
+
+    // Purging an orphaned archive is the one operation that cannot go through
+    // the operator, because there is no Cluster left for the operator to act on
+    // (#135). It runs as a Job on the barman-cloud sidecar image with the
+    // credential Secret mounted into the pod — so the control plane still holds
+    // no credential and still has no S3 client, and the two things above are
+    // names, not secrets.
+    //
+    // The image cannot be discovered: the plugin injects it into database pods,
+    // and a purge happens when there is no pod. So it is configuration, pinned
+    // by the chart to the plugin version in scripts/versions.env and bumped by
+    // the Renovate manager that watches both. A pin nothing reads is how this
+    // repository has been bitten before; this one is read on every purge, and
+    // the script fails loudly naming this setting if the image is too old.
+    purgeImage: envOr(
+      "DRIGODB_BACKUP_PURGE_IMAGE",
+      "ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.15.0",
+    ),
+
+    // Holds purge-archive.py, mounted into that Job. Release-named, so the chart
+    // has to say which one rather than the code guessing.
+    purgeScriptConfigMap: envOr("DRIGODB_ARCHIVE_PURGE_CONFIGMAP", ""),
+
+    // How many archive generations a purge probes. An in-place restore adds one
+    // (db-<id>, db-<id>-r1, …) and nothing else does, so 20 is a database
+    // restored twenty times. The bound exists because the alternative is an
+    // unbounded loop against object storage; a purge that hits it says so in its
+    // result rather than reporting a clean sweep.
+    //
+    // Falls back rather than throwing, the same way defaultTier does. A typo in an
+    // operator's env would otherwise reach the Job as the string "NaN" and fail
+    // every purge on a Python traceback about an integer.
+    purgeMaxGenerations: positiveOr("DRIGODB_ARCHIVE_PURGE_MAX_GENERATIONS", 20),
   },
 
   tls: {

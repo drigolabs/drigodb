@@ -142,4 +142,11 @@ matched nothing once left `create()` ignoring the configured default tier.
 
 - `DELETE` removes a database's `Backup` records and never the bucket contents.
   Barman's retention policy owns the data, which is the split that keeps drigodb
-  from destroying a customer's backups by deleting a Kubernetes object.
+  from destroying a customer's backups by deleting a Kubernetes object. Read that
+  last clause: it forbids destroying backups *implicitly*. The explicit,
+  separately-confirmed `POST /v1/archives/{id}/purge` is the mechanism that does it
+  on purpose, and it refuses any id that still has a `Cluster`.
+- The control plane holds no object-storage credential and no S3 client. Anything
+  that must touch the bucket runs as a Job with the Secret mounted into the pod,
+  which is how drigodb already causes writes it cannot perform
+  (`docs/archive-purge.md`).

@@ -3,6 +3,7 @@ date: 2026-09-13
 topic: backup-retention
 status: current — describes what the retention policy does and does not cover
 related:
+  - docs/archive-purge.md
   - docs/restore-in-place.md
   - charts/drigodb/values.yaml
   - src/k8s/provisioner.ts
@@ -39,8 +40,8 @@ only for **that Cluster's current `serverName`**.
 |---|---|---|
 | a running database's current prefix | **yes** | the primary is there to enforce it |
 | a hibernated database's prefix | not while it sleeps | no pod, so no sidecar. Resumes on wake |
-| a **deleted** database's prefix | **never** | there is no Cluster and no pod. Nothing will ever apply the policy |
-| an archive generation left by a restore in place | **never** | the Cluster archives to the new prefix, and retention runs only on that one |
+| a **deleted** database's prefix | **never** | there is no Cluster and no pod. Nothing will ever apply the policy — purge it (`docs/archive-purge.md`) |
+| an archive generation left by a restore in place | **never** | the Cluster archives to the new prefix, and retention runs only on that one. Purged with the rest when the database is deleted |
 
 ## Why a deleted database's archive survives at all
 
@@ -63,17 +64,20 @@ longer existed**, plus one `-r1` generation from a single in-place restore. All
 inside the 30-day window, so nothing *should* have pruned them — the point is that
 nothing ever would.
 
-## This is a missing mechanism, not a chore
+## This was a missing mechanism, not a chore
 
-The procedure below is a **workaround for a gap in the core**, and it is worth being
-clear about that rather than presenting it as the way things are.
+That distinction is what got it built rather than written up as an operator
+procedure.
 
 `docs/decisions/0008` asks one question of any change: does it say *what* drigodb
 can do to a database, or *when* to do it? Removing a database's archive is **what**
-— a mechanism, and a missing one. Deciding when to sweep orphans is **when**, and
-belongs to a policy component outside this repository. **[#135](https://github.com/drigolabs/drigodb/issues/135)** is that
-mechanism: a per-database purge, and the listing a policy layer would need to
-discover what to purge.
+— a mechanism, and it was a missing one. Deciding when to sweep orphans is **when**,
+and belongs to a policy component outside this repository.
+
+The mechanism is now `POST /v1/archives/{id}/purge`, which clears every generation
+an id left behind and reports what it removed. `docs/archive-purge.md` is the record
+of how it works and what it deliberately does not do — starting with discovery,
+which is still the caller's problem.
 
 ### What the invariant forbids, exactly
 
@@ -106,7 +110,11 @@ is right for orphans and **dangerous for live prefixes**: ageing out a base back
 while keeping the WAL that depends on it leaves an archive that cannot be replayed.
 A bucket cannot tell a live prefix from an orphan.
 
-## Clearing orphans by hand, until #135 exists
+## Finding orphans
+
+The purge takes an id. It does not discover which ids are orphaned, and a policy
+component that deletes databases already knows — so the gap is only for archives
+nobody has a record of, like the 14 measured above.
 
 The prefixes are named after the database, so they are identifiable without
 drigodb. What is live is what has a `Cluster`:
@@ -127,6 +135,13 @@ what makes a pre-restore backup restorable at all (`docs/restore-in-place.md`).
 Deleting it is a decision about whether that history is still wanted, not
 housekeeping.
 
-Removing one is `mc rm --recursive --force s3/<bucket>/db-<id>/`, and it is
-irreversible. Check the `Cluster` list twice: an id is twelve hex characters and
-two of them differ by one character more often than is comfortable.
+Then purge it through the API rather than with `mc`:
+
+```
+curl -XPOST -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  "$DRIGODB/v1/archives/<id>/purge" -d '{"confirm":"<id>","dry_run":true}'
+```
+
+The dry run first, always. It is irreversible, and an id is twelve hex characters —
+two of them differ by one character more often than is comfortable. The endpoint
+refuses an id that still has a `Cluster`, which is the guard `mc rm` does not have.

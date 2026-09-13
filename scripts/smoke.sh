@@ -13,6 +13,12 @@
 set -euo pipefail
 
 CTX="${KUBE_CONTEXT:-$(kubectl config current-context)}"
+# The one pinned version this script needs: the archive purge assertion counts the
+# objects in MinIO, and an unpinned :latest would be the only unpinned image in the
+# repository. Sourced rather than hardcoded so Renovate's manager keeps reaching it.
+# shellcheck source=scripts/versions.env
+[ -f "${BASH_SOURCE%/*}/versions.env" ] && . "${BASH_SOURCE%/*}/versions.env"
+SMOKE_MC_IMAGE="quay.io/minio/mc:${MINIO_MC_VERSION:-RELEASE.2025-08-13T08-35-41Z}"
 EXTERNAL_ID="${1:-smoke-$(date +%s)}"
 API_PORT="${API_PORT:-18080}"
 DB_PORT="${DB_PORT:-15432}"
@@ -1166,6 +1172,151 @@ else
   fi
 
   api -XDELETE "localhost:${API_PORT}/v1/databases/${IP_ID}" >/dev/null 2>&1 || true
+fi
+
+step "Purging the archive of a deleted database"
+# The one thing a unit test structurally cannot check about this feature: that the
+# prefix the Job computes is the prefix the objects are actually under.
+#
+# A mocked client agrees with any prefix. A leading slash, a missing trailing
+# slash, a destinationPath with a sub-path in it — every one of those resolves to
+# a prefix that matches nothing on S3, and the failure is SILENT: the purge exits
+# 0, reports an empty archive, and the storage it was supposed to reclaim is still
+# being paid for. Only a real bucket can tell those apart from success.
+#
+# It reuses the in-place-restored database above, which is the interesting case:
+# that database has TWO archive generations, so one call has to clear both.
+if [ "$BACKUPS_STATE" != "enabled" ] || [ -z "${IP_ID:-}" ]; then
+  note "backups are ${BACKUPS_STATE}; skipping the archive purge"
+else
+  # Refused while the database is alive. Asserted first, because it is the whole
+  # safety model and the rest of this step is irreversible.
+  LIVE_CODE="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" \
+    -H 'content-type: application/json' \
+    -XPOST "localhost:${API_PORT}/v1/archives/${DB_ID}/purge" \
+    -d "{\"confirm\":\"${DB_ID}\"}")"
+  if [ "$LIVE_CODE" = "409" ]; then
+    ok "a live database's archive cannot be purged (409)"
+  else
+    fail "purging a live database's archive returned ${LIVE_CODE}, not 409 — this is the only thing between a policy loop and a running database's backups"
+    exit 1
+  fi
+
+  # And a confirmation naming a different database, for the same reason the
+  # in-place restore checks it: a copied script must not reach the wrong archive.
+  WRONG_PURGE="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" \
+    -H 'content-type: application/json' \
+    -XPOST "localhost:${API_PORT}/v1/archives/${IP_ID}/purge" \
+    -d "{\"confirm\":\"${DB_ID}\"}")"
+  if [ "$WRONG_PURGE" = "400" ]; then
+    ok "a confirmation naming another database is refused (400)"
+  else
+    fail "a wrong confirmation returned ${WRONG_PURGE}, not 400"
+    exit 1
+  fi
+
+  # The database was deleted at the end of the previous step. Its Cluster has to
+  # be gone before a purge is allowed, which is the precondition rather than an
+  # inconvenience.
+  for _ in $(seq 1 40); do
+    k get cluster "db-${IP_ID}" -n drigodb-databases >/dev/null 2>&1 || break
+    sleep 3
+  done
+  if k get cluster "db-${IP_ID}" -n drigodb-databases >/dev/null 2>&1; then
+    fail "the Cluster for ${IP_ID} is still there, so the purge below would be refused for the right reason and prove nothing"
+    exit 1
+  fi
+
+  # Only in kind, where the object store is MinIO with known local-only
+  # credentials. Against DOKS the smoke script has no bucket credential — which is
+  # the same reason the control plane does not — so the count below is skipped and
+  # the API's own numbers carry the step.
+  BUCKET_COUNT=""
+  count_bucket() {
+    k -n drigodb-databases delete pod drigodb-smoke-count --ignore-not-found >/dev/null 2>&1
+    k -n drigodb-databases run drigodb-smoke-count --restart=Never --quiet --image="${SMOKE_MC_IMAGE}" \
+      --command -- sh -c "mc alias set m http://minio:9000 drigodb drigodb-local-only >/dev/null && mc ls -r m/drigodb | wc -l" >/dev/null 2>&1
+    k -n drigodb-databases wait --for=jsonpath='{.status.phase}'=Succeeded pod/drigodb-smoke-count --timeout=120s >/dev/null 2>&1
+    k -n drigodb-databases logs drigodb-smoke-count 2>/dev/null | tr -d ' \n'
+    k -n drigodb-databases delete pod drigodb-smoke-count --wait=false >/dev/null 2>&1
+  }
+  if k -n drigodb-databases get service minio >/dev/null 2>&1; then
+    BUCKET_COUNT="$(count_bucket)"
+    [ -n "$BUCKET_COUNT" ] && ok "the bucket holds ${BUCKET_COUNT} object(s) before the purge"
+  else
+    note "no MinIO in this installation; the bucket itself is not counted"
+  fi
+
+  # A dry run first, twice. Twice because "it removed nothing" is the claim, and a
+  # single run cannot make it: the second call has to see the same archive.
+  DRY="$(api -XPOST "localhost:${API_PORT}/v1/archives/${IP_ID}/purge" \
+    -d "{\"confirm\":\"${IP_ID}\",\"dry_run\":true}")"
+  DRY_OBJECTS="$(echo "$DRY" | jqf '["objects"]')"
+  DRY_GENERATIONS="$(echo "$DRY" | python3 -c "import json,sys;print(len(json.load(sys.stdin)['generations']))")"
+  if [ "${DRY_OBJECTS:-0}" -gt 0 ]; then
+    ok "the dry run found ${DRY_OBJECTS} object(s) across ${DRY_GENERATIONS} generation(s)"
+  else
+    fail "the dry run found nothing in the archive of ${IP_ID}, which had a completed backup — the prefix is wrong, and a real purge would report success having deleted nothing: ${DRY}"
+    exit 1
+  fi
+  # Two generations, because that database was restored in place. One call clearing
+  # only the current prefix is exactly the leak this endpoint exists to stop.
+  if [ "${DRY_GENERATIONS:-0}" -ge 2 ]; then
+    ok "both archive generations are in scope, so the pre-restore history is not stranded"
+  else
+    fail "only ${DRY_GENERATIONS} generation(s) found for a database that was restored in place; the older prefix would be left in the bucket forever"
+    exit 1
+  fi
+  DRY_AGAIN="$(api -XPOST "localhost:${API_PORT}/v1/archives/${IP_ID}/purge" \
+    -d "{\"confirm\":\"${IP_ID}\",\"dry_run\":true}" | jqf '["objects"]')"
+  if [ "$DRY_AGAIN" = "$DRY_OBJECTS" ]; then
+    ok "a dry run removes nothing — the archive is still ${DRY_AGAIN} object(s)"
+  else
+    fail "the archive went from ${DRY_OBJECTS} to ${DRY_AGAIN} object(s) across two DRY runs; dry_run deleted something"
+    exit 1
+  fi
+
+  PURGED="$(api -XPOST "localhost:${API_PORT}/v1/archives/${IP_ID}/purge" \
+    -d "{\"confirm\":\"${IP_ID}\"}")"
+  PURGED_OBJECTS="$(echo "$PURGED" | jqf '["objects"]')"
+  PURGED_BYTES="$(echo "$PURGED" | jqf '["bytes"]')"
+  if [ "$PURGED_OBJECTS" = "$DRY_OBJECTS" ]; then
+    ok "purged ${PURGED_OBJECTS} object(s), ${PURGED_BYTES} bytes — exactly what the dry run promised"
+  else
+    fail "the dry run said ${DRY_OBJECTS} object(s) and the purge removed ${PURGED_OBJECTS}; the preview does not describe the operation"
+    exit 1
+  fi
+
+  # The assertion no mock can make: the objects are actually gone from the bucket.
+  EMPTY="$(api -XPOST "localhost:${API_PORT}/v1/archives/${IP_ID}/purge" \
+    -d "{\"confirm\":\"${IP_ID}\",\"dry_run\":true}" | jqf '["objects"]')"
+  if [ "$EMPTY" = "0" ]; then
+    ok "the archive is empty, and purging an already-purged archive is a 200 with nothing to do"
+  else
+    fail "${EMPTY} object(s) survived the purge of ${IP_ID}"
+    exit 1
+  fi
+
+  # And nothing else went with it. The live database's archive is in the same
+  # bucket, one prefix away, and a purge that took a prefix too many would leave
+  # this count short rather than say anything.
+  #
+  # A FLOOR, not an equality. The live database is still archiving WAL into the same
+  # bucket while this runs, so a segment landing in the gap would make an equality
+  # assertion fail for a reason that is not a bug. Below the floor is the bug — the
+  # purge removed objects it did not report — and that is what is checked.
+  if [ -n "$BUCKET_COUNT" ]; then
+    AFTER_COUNT="$(count_bucket)"
+    EXPECTED=$((BUCKET_COUNT - PURGED_OBJECTS))
+    if [ -z "$AFTER_COUNT" ]; then
+      note "could not count the bucket again; the API's own numbers carry this step"
+    elif [ "$AFTER_COUNT" -lt "$EXPECTED" ]; then
+      fail "the bucket went from ${BUCKET_COUNT} to ${AFTER_COUNT} object(s) after a purge that reported ${PURGED_OBJECTS}; at least $((EXPECTED - AFTER_COUNT)) object(s) were removed that it did not report, so it took a prefix it was not asked for"
+      exit 1
+    else
+      ok "the bucket holds ${AFTER_COUNT} object(s), at or above the ${EXPECTED} the purge accounts for — the live database's archive survived"
+    fi
+  fi
 fi
 
 step "Deleting a database actually deletes it"

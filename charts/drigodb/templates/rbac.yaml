@@ -41,10 +41,25 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    # One log, from the purge Job's pod, because that is where the answer is.
+    # The script prints a line of JSON saying which archive generations it found
+    # and how many objects and bytes it removed, and the endpoint returns it —
+    # a purge whose caller cannot see what it reclaimed is not a mechanism
+    # anything can be run from outside (decision 0008).
+    #
+    # Read-only, and the pods in this namespace are databases and drigodb's own
+    # Jobs. PostgreSQL's log is already visible to anyone who can `kubectl logs`
+    # in the namespace; this adds no reach the Role did not have.
+    verbs: ["get"]
   - apiGroups: ["batch"]
     resources: ["jobs"]
-    # Restoring into a new database runs as a Job, which connects to the
-    # database over TCP as an ordinary consumer.
+    # Purging a deleted database's archive runs as a Job (#135), because it needs
+    # the bucket credential and the control plane deliberately cannot hold one.
+    # delete, because the Job's name is derived from the database id rather than
+    # random — so a retry has to clear the previous attempt, and can then read
+    # exactly one pod's log for the result.
     verbs: ["create", "get", "list", "delete"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["networkpolicies"]
@@ -67,13 +82,27 @@ rules:
   # A backup is an object drigodb asks for and then reads the status of. delete,
   # because a deleted database's Backup objects would otherwise outlive it,
   # pointing at a Cluster that no longer exists.
-  #
-  # No rights over objectstores: the chart creates the one, and drigodb only
-  # ever names it. The control plane cannot read the bucket credential and has
-  # no reason to.
   - apiGroups: ["postgresql.cnpg.io"]
     resources: ["backups"]
     verbs: ["create", "get", "list", "delete"]
+  # get, and only get. A purge has to build the Job's environment from the bucket
+  # the installation actually configured, and the ObjectStore is where that is
+  # written — destinationPath, endpointURL, and the NAME of the Secret holding
+  # the keys. Reading it teaches the control plane no credential: it passes the
+  # Secret reference into the pod and cannot resolve it, which is the same trade
+  # the operator already runs on.
+  #
+  # The alternative was copying bucket and endpoint into the API's own
+  # environment, giving one bucket two declarations that can disagree. This
+  # repository has already had a pin rot at 0.0.1 for seven releases because
+  # nothing read it; a second copy of the destination path is that failure with a
+  # customer's backups behind it.
+  #
+  # No create, no patch, no delete. drigodb still does not own the ObjectStore —
+  # the chart does.
+  - apiGroups: ["barmancloud.cnpg.io"]
+    resources: ["objectstores"]
+    verbs: ["get"]
 {{- if .Values.tls.certManager.enabled }}
   # One Certificate per database, in this namespace, so each serves a certificate
   # for its own Service name and its Secret lands where the pod mounts it.

@@ -345,12 +345,30 @@ is bounded by the `ObjectStore` retention policy, 30 days by default — and tha
 policy bounds less than it sounds like it does. See
 [docs/backup-retention.md](docs/backup-retention.md): it is enforced by the
 running primary, so a deleted database's archive is never pruned at all. Removing
-one is a mechanism drigodb does not have yet (#135), not something it declines to
-do.
+one is the purge below.
 
 A backup belongs to the database it was taken from, and drigodb refuses a
 `restore_from` that names someone else's — otherwise any backup in the
 installation could be read by guessing its id.
+
+### Purging the archive of a deleted database
+
+```
+POST /v1/archives/{id}/purge  { confirm: "<id>", dry_run: true }
+```
+
+Removes every object a **deleted** database left in the bucket, every archive
+generation of it, and reports how many objects and bytes came back. Refused with a
+409 while the database still exists: an archive belonging to a live database is its
+backups and its recovery window.
+
+`dry_run` counts without deleting, and is the only way to see what is in a prefix at
+all — drigodb does not list buckets, and a deleted database has no `Backup` objects
+left either. `confirm` must be the id itself.
+
+Deciding *when* to call it is policy and ships elsewhere (decision 0008); drigodb
+offers the verb. [docs/archive-purge.md](docs/archive-purge.md) has the design,
+including why it is not `barman-cloud-backup-delete`.
 
 ### High availability
 
