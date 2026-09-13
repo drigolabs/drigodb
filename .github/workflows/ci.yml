@@ -162,6 +162,50 @@ jobs:
           echo "| kind up, build, install | ${KIND_UP_SECONDS:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| smoke.sh | ${SMOKE_SECONDS:-n/a} |" >> "$GITHUB_STEP_SUMMARY"
 
+  # What drigodb does when the cluster underneath it is WRONG, which is a
+  # different question from whether it works when everything is right.
+  #
+  # Its own cluster and its own job, both for the same reason: the first assertion
+  # is that `helm install --wait` FAILS with no operator, which needs an
+  # installation that has not happened yet — and `drigodb works end to end` exists
+  # to have one. It cannot host these.
+  #
+  # In parallel, so it costs the critical path nothing. That answers the objection
+  # in #94 that more end-to-end coverage means a slower pull request: it does not,
+  # when the coverage is a sibling rather than more steps in the slowest job. The
+  # same argument `diagrams render` below is built on.
+  #
+  # NOT YET A REQUIRED CHECK. Branch protection on main matches checks by exact
+  # name and this is not one of them, so it reports without gating. The name below
+  # is therefore already its permanent one — renaming a job that protection matches
+  # by string blocks every pull request on a check that never reports, so there is
+  # no later moment at which this can be tidied up.
+  install-failures:
+    name: a broken cluster is a loud failure
+    runs-on: ubuntu-latest
+    # Six configurations on one cluster, two of which wait out a deliberate
+    # 90-second Helm timeout. The ceiling is here so a hang costs minutes.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install kind
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          sudo install -o root -g root -m 0755 kind /usr/local/bin/kind
+          kind version
+      - name: Install with no operator, no default StorageClass, and no ClusterRole
+        run: bash scripts/install-failure-test.sh
+
+      # The script leaves its cluster up when it fails, for exactly this.
+      - name: Why it failed
+        if: failure()
+        run: |
+          CTX=kind-drigodb-install-test
+          kubectl --context $CTX -n drigodb-system get pods,rs -o wide || true
+          kubectl --context $CTX -n drigodb-system logs -l app.kubernetes.io/name=drigodb --tail=60 || true
+          kubectl --context $CTX get sc -o yaml || true
+          kubectl --context $CTX get clusterrolebinding | grep drigodb || true
+
   # A diagram that does not parse is invisible in review: not a test failure, not
   # a type error, and not a visible difference in a diff. GitHub renders an error
   # box in place of the picture, and the people most likely to see it are the

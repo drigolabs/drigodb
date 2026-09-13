@@ -1174,6 +1174,99 @@ else
   api -XDELETE "localhost:${API_PORT}/v1/databases/${IP_ID}" >/dev/null 2>&1 || true
 fi
 
+step "Recreating a database moments after deleting it"
+# The failure this guards against is the worst one drigodb has: ids are derived
+# from external_id, so a delete-then-recreate lands on the SAME Cluster name and
+# the SAME volume name. If a create is served while the old PVC is still there,
+# PostgreSQL finds an initialised PGDATA, skips initdb, and comes up holding the
+# DELETED tenant's rows — behind a password that does not match the URI just
+# issued. One application reading another's data, with nothing anywhere reporting
+# a problem.
+#
+# Verified once by hand when the guard was written, and never since.
+#
+# The assertion is NOT "a 409 happens". That would be a race: the window is only
+# as long as the PVC takes to go, measured at nine seconds, so a test demanding
+# one would fail on a fast cluster for no reason. What is asserted is the thing
+# that actually matters — whatever the API returns, the database a caller ends up
+# with must not contain the previous life's rows. The 409s are counted and
+# reported, because seeing zero of them is worth knowing.
+RC_EXT="${EXTERNAL_ID}-recreate"
+RC="$(api -XPOST "localhost:${API_PORT}/v1/databases" -d "{\"external_id\":\"${RC_EXT}\"}")"
+RC_ID="$(echo "$RC" | jqf '["id"]')"
+RC_URI="$(echo "$RC" | jqf '["connection_uri"]')"
+[ -n "$RC_ID" ] || { fail "could not create a database to recreate: ${RC}"; exit 1; }
+for _ in $(seq 1 90); do
+  [ "$(api "localhost:${API_PORT}/v1/databases/${RC_ID}" | jqf '["status"]')" = "ready" ] && break
+  sleep 3
+done
+
+SAVED_DB_ID="$DB_ID"; DB_ID="$RC_ID"
+psql_when_reachable "$RC_URI" "CREATE TABLE tenant (id int PRIMARY KEY, note text);
+  INSERT INTO tenant VALUES (1,'first-life-secret');" >/dev/null
+ok "${RC_ID} holds a row belonging to its first life"
+
+api -XDELETE "localhost:${API_PORT}/v1/databases/${RC_ID}" >/dev/null
+
+# Straight back in, with no pause. Retried rather than waited out: the point is
+# to hit the window if it is open, and to end up with a database either way.
+REFUSED=0; RC2=""; RC2_ID=""
+for _ in $(seq 1 60); do
+  CODE="$(curl -sS -o /tmp/recreate.$$ -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" \
+    -H 'content-type: application/json' \
+    -XPOST "localhost:${API_PORT}/v1/databases" -d "{\"external_id\":\"${RC_EXT}\"}")"
+  case "$CODE" in
+    202|200) RC2="$(cat /tmp/recreate.$$)"; break ;;
+    409)     REFUSED=$((REFUSED + 1)) ;;
+    *)       fail "recreate returned ${CODE}: $(cat /tmp/recreate.$$)"; DB_ID="$SAVED_DB_ID"; exit 1 ;;
+  esac
+  sleep 1
+done
+rm -f /tmp/recreate.$$
+RC2_ID="$(echo "$RC2" | jqf '["id"]')"
+RC2_URI="$(echo "$RC2" | jqf '["connection_uri"]')"
+if [ -z "$RC2_ID" ]; then
+  fail "never got a database back for ${RC_EXT} after sixty tries"
+  DB_ID="$SAVED_DB_ID"; exit 1
+fi
+if [ "$REFUSED" -gt 0 ]; then
+  ok "refused ${REFUSED} time(s) with 409 while the old volume was still there"
+else
+  note "the volume was already gone; no 409 was needed this time"
+fi
+
+# The same id, which is the whole reason this is dangerous rather than merely
+# untidy. If it were a fresh id it would be a fresh volume and none of this would
+# matter.
+if [ "$RC2_ID" = "$RC_ID" ]; then
+  ok "the id is the same — the volume name it would reuse is the same too"
+else
+  fail "the recreated database got a different id (${RC_ID} -> ${RC2_ID}); this test is no longer testing what it thinks it is"
+  DB_ID="$SAVED_DB_ID"; exit 1
+fi
+
+DB_ID="$RC2_ID"
+for _ in $(seq 1 90); do
+  RC2_STATE="$(api "localhost:${API_PORT}/v1/databases/${RC2_ID}" | jqf '["status"]')"
+  case "$RC2_STATE" in ready|failed) break ;; esac
+  sleep 3
+done
+if [ "$RC2_STATE" != "ready" ]; then
+  fail "the recreated database never became ready (${RC2_STATE})"
+  explain_stuck_database "$RC2_ID"
+  DB_ID="$SAVED_DB_ID"; exit 1
+fi
+
+# The assertion. An empty database, reached with the NEW credential.
+LEAKED="$(psql_when_reachable "$RC2_URI" \
+  "SELECT count(*) FROM pg_tables WHERE schemaname='public' AND tablename='tenant'")"
+DB_ID="$SAVED_DB_ID"
+case "$(printf '%s' "$LEAKED" | tr -d ' ')" in
+  0) ok "the recreated database is empty — the first life's table is not there" ;;
+  *) fail "the recreated database still has the deleted tenant's table; one application can read another's data"
+     exit 1 ;;
+esac
+
 step "Purging the archive of a deleted database"
 # The one thing a unit test structurally cannot check about this feature: that the
 # prefix the Job computes is the prefix the objects are actually under.
