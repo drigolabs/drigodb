@@ -413,6 +413,149 @@ else
   exit 1
 fi
 
+step "Two tenants on one installation cannot reach each other"
+# The claim #72 makes, and the only place it can be settled: two tokens, two databases
+# both called `main`, and neither able to see the other's.
+#
+# Before this, both derived the same id from the same external_id — the derived id is
+# the lock — so the second caller hit the idempotent path and was handed the first
+# one's database AND its connection URI. Not an error. One tenant reading another's
+# data, quietly, which is why this runs before anything else interesting.
+T1="$(api -XPOST "localhost:${API_PORT}/v1/tokens" -d '{"name":"tenant one"}')"
+T1_TOKEN="$(echo "$T1" | jqf '["token"]')"
+T1_OWNER="$(echo "$T1" | jqf '["owner"]')"
+T2_TOKEN="$(api -XPOST "localhost:${API_PORT}/v1/tokens" -d '{"name":"tenant two"}' | jqf '["token"]')"
+[ -n "$T1_TOKEN" ] && [ -n "$T2_TOKEN" ] || { fail "could not issue two tenant tokens"; exit 1; }
+
+tenant() { # token, method, path, [body]
+  curl -sS -H "Authorization: Bearer $1" -H 'content-type: application/json' \
+    -X"$2" "localhost:${API_PORT}$3" ${4:+-d "$4"}
+}
+tenant_code() {
+  curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $1" \
+    -H 'content-type: application/json' -X"$2" "localhost:${API_PORT}$3" ${4:+-d "$4"}
+}
+
+D1="$(tenant "$T1_TOKEN" POST /v1/databases '{"external_id":"main"}')"
+D2="$(tenant "$T2_TOKEN" POST /v1/databases '{"external_id":"main"}')"
+D1_ID="$(echo "$D1" | jqf '["id"]')"
+D2_ID="$(echo "$D2" | jqf '["id"]')"
+if [ -n "$D1_ID" ] && [ -n "$D2_ID" ] && [ "$D1_ID" != "$D2_ID" ]; then
+  ok "both called it 'main' and got different databases (${D1_ID}, ${D2_ID})"
+else
+  fail "two tenants calling a database 'main' got '${D1_ID}' and '${D2_ID}' — one tenant has been handed the other's database"
+  exit 1
+fi
+
+# And the URIs differ, which is the part that makes the old behaviour data theft
+# rather than a confusing listing.
+if [ "$(echo "$D1" | jqf '["connection_uri"]')" != "$(echo "$D2" | jqf '["connection_uri"]')" ]; then
+  ok "and different credentials"
+else
+  fail "both tenants were issued the same connection_uri"
+  exit 1
+fi
+
+# 404, not 403. A 403 confirms existence, and an admin's id is sha256(external_id) of
+# a meaningful string — so a 403 would let one tenant test for another's databases.
+CROSS="$(tenant_code "$T2_TOKEN" GET "/v1/databases/${D1_ID}")"
+if [ "$CROSS" = "404" ]; then
+  ok "tenant two gets 404 on tenant one's database, not 403"
+else
+  fail "reading another tenant's database returned ${CROSS}; 404 is the only answer that does not leak the id space"
+  exit 1
+fi
+for OP in hibernate wake backups credentials; do
+  C="$(tenant_code "$T2_TOKEN" POST "/v1/databases/${D1_ID}/${OP}")"
+  if [ "$C" != "404" ]; then
+    fail "POST /v1/databases/{id}/${OP} on another tenant's database returned ${C}, not 404"
+    exit 1
+  fi
+done
+ok "and 404 on hibernate, wake, backups and credentials"
+DEL_CROSS="$(tenant_code "$T2_TOKEN" DELETE "/v1/databases/${D1_ID}")"
+if [ "$DEL_CROSS" = "404" ]; then
+  ok "and cannot delete it"
+else
+  fail "DELETE on another tenant's database returned ${DEL_CROSS}, not 404"
+  exit 1
+fi
+
+# The listing is scoped, and each sees exactly one.
+for PAIR in "$T1_TOKEN:$D1_ID" "$T2_TOKEN:$D2_ID"; do
+  TK="${PAIR%%:*}"; EXPECT="${PAIR##*:}"
+  SEEN="$(tenant "$TK" GET /v1/databases | python3 -c "
+import json,sys
+d = json.load(sys.stdin)['databases']
+print(len(d), d[0]['id'] if len(d) == 1 else '-')
+")"
+  if [ "$SEEN" != "1 ${EXPECT}" ]; then
+    fail "a tenant's listing was '${SEEN}', expected exactly its own ${EXPECT}"
+    exit 1
+  fi
+done
+ok "each tenant's listing contains exactly its own database"
+
+# Restoring from another tenant's database is the sharpest hole #72 closes, because it
+# reads DATA rather than metadata. Not in the issue's table.
+STEAL="$(tenant_code "$T2_TOKEN" POST /v1/databases "{\"external_id\":\"stolen\",\"restore_from\":{\"database_id\":\"${D1_ID}\"}}")"
+case "$STEAL" in
+  404) ok "and cannot restore from it — a restored database is a full copy" ;;
+  409) ok "and cannot restore from it (backups are ${BACKUPS_STATE} here)" ;;
+  *)   fail "restoring from another tenant's database returned ${STEAL}; a tenant could take a full copy of another's data"; exit 1 ;;
+esac
+
+# Archives are admin-only: an orphan's Cluster is gone, so there is no owner to check.
+ARCH="$(tenant_code "$T1_TOKEN" GET /v1/archives)"
+if [ "$ARCH" = "403" ]; then
+  ok "a tenant cannot read the archive listing (403)"
+else
+  fail "GET /v1/archives returned ${ARCH} for a tenant, not 403 — an orphaned archive has no owner to check"
+  exit 1
+fi
+
+# An admin sees both, which is what makes an installation operable.
+ADMIN_SEES="$(api "localhost:${API_PORT}/v1/databases" | python3 -c "
+import json,sys
+ids = {d['id'] for d in json.load(sys.stdin)['databases']}
+print('yes' if {'${D1_ID}', '${D2_ID}'} <= ids else 'no')
+")"
+if [ "$ADMIN_SEES" = "yes" ]; then
+  ok "an admin token sees both tenants' databases"
+else
+  fail "an admin token cannot see both tenants' databases"
+  exit 1
+fi
+
+# Revoking tenant one's token orphans its database rather than refusing, and says so.
+T1_ID="$(api "localhost:${API_PORT}/v1/tokens" | python3 -c "
+import json,sys
+print(next((t['id'] for t in json.load(sys.stdin)['tokens'] if t.get('owner') == '${T1_OWNER}'), ''))
+")"
+REVOKED="$(api -XDELETE "localhost:${API_PORT}/v1/tokens/${T1_ID}")"
+if echo "$REVOKED" | grep -q "$D1_ID"; then
+  ok "revoking a token reports the database it orphaned"
+else
+  fail "revoking ${T1_ID} did not report ${D1_ID} as orphaned: ${REVOKED}"
+  exit 1
+fi
+sleep 7
+if [ "$(tenant_code "$T1_TOKEN" GET /v1/databases)" = "401" ]; then
+  ok "and the token stops working, while its database keeps running"
+else
+  fail "a revoked tenant token still works"
+  exit 1
+fi
+
+# Clean up both tenants' databases with the admin token, which can reach them.
+for ID in "$D1_ID" "$D2_ID"; do
+  api -XDELETE "localhost:${API_PORT}/v1/databases/${ID}" >/dev/null 2>&1 || true
+done
+api -XDELETE "localhost:${API_PORT}/v1/tokens/$(api "localhost:${API_PORT}/v1/tokens" | python3 -c "
+import json,sys
+print(next((t['id'] for t in json.load(sys.stdin)['tokens'] if t['name'] == 'tenant two'), 'none'))
+")" >/dev/null 2>&1 || true
+
 step "Provisioning '${EXTERNAL_ID}'"
 RESP="$(api -XPOST "localhost:${API_PORT}/v1/databases" -d "{\"external_id\":\"${EXTERNAL_ID}\"}")"
 DB_ID="$(echo "$RESP" | jqf '["id"]')"

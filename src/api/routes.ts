@@ -19,9 +19,33 @@ import {
   validateTier,
 } from "../k8s/provisioner.js";
 import type { Tier } from "../k8s/manifests.js";
+import type { Caller } from "../auth.js";
 
-export function buildRoutes(provisioner: Provisioner): Hono {
-  const app = new Hono();
+// Set by the authentication middleware in src/server.ts. Every handler below that
+// names a database passes it through, and the Provisioner's signatures REQUIRE it —
+// so a handler that forgets does not compile. That is deliberate: #72's table is
+// twelve endpoints long, and "remember the check in each one" is a plan that works
+// until the thirteenth.
+type Env = { Variables: { caller: Caller } };
+
+// 403 here, not the 404 the database endpoints use.
+//
+// A tenant asking about archives is not probing an id space — it is asking to do
+// something only an operator does, and saying so is the useful answer. The 404s
+// elsewhere exist to stop one tenant learning another's ids; there is no id to
+// protect in "you are not an administrator".
+const adminOnly = async (
+  c: { get: (k: "caller") => Caller; json: (b: unknown, s: 403) => Response },
+  next: () => Promise<void>,
+): Promise<Response | void> => {
+  if (c.get("caller").tier !== "admin") {
+    return c.json({ error: "reading and purging archives requires an admin token" }, 403);
+  }
+  await next();
+};
+
+export function buildRoutes(provisioner: Provisioner): Hono<Env> {
+  const app = new Hono<Env>();
 
 
   // `restore_from` makes this a provision with a source rather than a separate
@@ -57,6 +81,7 @@ export function buildRoutes(provisioner: Provisioner): Hono {
     // failure modes, and it is deliberately not built (#81). A caller that gets
     // a 200 should read the field rather than assume the request took effect.
     const { database, uri, created } = await provisioner.create(
+      c.get("caller"),
       externalId,
       restoreFrom,
       highAvailability,
@@ -67,18 +92,18 @@ export function buildRoutes(provisioner: Provisioner): Hono {
     return c.json(created ? { ...database, connection_uri: uri } : database, created ? 202 : 200);
   });
 
-  app.get("/v1/databases", async (c) => c.json({ databases: await provisioner.list() }));
+  app.get("/v1/databases", async (c) => c.json({ databases: await provisioner.list(c.get("caller")) }));
 
-  app.get("/v1/databases/:id", async (c) => c.json(await provisioner.get(c.req.param("id"))));
+  app.get("/v1/databases/:id", async (c) => c.json(await provisioner.get(c.get("caller"), c.req.param("id"))));
 
   // wake(), not scale(id, 1): waking is also when a database picks up the
   // pod template this build renders, including a rebuilt data-plane image.
   app.post("/v1/databases/:id/wake", async (c) =>
-    c.json(await provisioner.wake(c.req.param("id")), 202),
+    c.json(await provisioner.wake(c.get("caller"), c.req.param("id")), 202),
   );
 
   app.post("/v1/databases/:id/hibernate", async (c) =>
-    c.json(await provisioner.scale(c.req.param("id"), 0), 202),
+    c.json(await provisioner.scale(c.get("caller"), c.req.param("id"), 0), 202),
   );
 
   // 200, not 202: the URI in this response is the point of the call, and it is
@@ -86,7 +111,7 @@ export function buildRoutes(provisioner: Provisioner): Hono {
   // already been applied by the time this returns; for a hibernated one it
   // applies on the next wake, which is the first moment the URI is usable.
   app.post("/v1/databases/:id/credentials", async (c) => {
-    const { database, uri } = await provisioner.rotateCredentials(c.req.param("id"));
+    const { database, uri } = await provisioner.rotateCredentials(c.get("caller"), c.req.param("id"));
     return c.json({ ...database, connection_uri: uri });
   });
 
@@ -102,7 +127,7 @@ export function buildRoutes(provisioner: Provisioner): Hono {
       if (err instanceof ValidationError) return c.json({ error: err.message }, 400);
       throw err;
     }
-    return c.json(await provisioner.resize(c.req.param("id"), tier), 202);
+    return c.json(await provisioner.resize(c.get("caller"), c.req.param("id"), tier), 202);
   });
 
   // The CA a consumer needs to verify a database, as PEM.
@@ -137,7 +162,7 @@ export function buildRoutes(provisioner: Provisioner): Hono {
     // long as a base backup of the database. Poll `standby` — it reads
     // `provisioning` for the duration, which is the whole reason that value
     // exists.
-    return c.json(await provisioner.setHighAvailability(c.req.param("id"), enabled), 202);
+    return c.json(await provisioner.setHighAvailability(c.get("caller"), c.req.param("id"), enabled), 202);
   });
 
   // Restoring OVER a database, keeping its id and its URI.
@@ -159,11 +184,11 @@ export function buildRoutes(provisioner: Provisioner): Hono {
     }
     // 202: the database is down for as long as the recovery takes, which is
     // minutes rather than the seconds a wake takes. A caller polls status.
-    return c.json(await provisioner.restoreInPlace(id, target), 202);
+    return c.json(await provisioner.restoreInPlace(c.get("caller"), id, target), 202);
   });
 
   app.post("/v1/databases/:id/backups", async (c) =>
-    c.json(await provisioner.createBackup(c.req.param("id")), 202),
+    c.json(await provisioner.createBackup(c.get("caller"), c.req.param("id")), 202),
   );
 
   // What can be restored. Never a credential, and an empty list for a database
@@ -173,11 +198,11 @@ export function buildRoutes(provisioner: Provisioner): Hono {
   // question gets asked, and when there is no pod to ask. drigodb reads the
   // operator's Backup objects, so it needs neither the pod nor the bucket.
   app.get("/v1/databases/:id/backups", async (c) =>
-    c.json({ backups: await provisioner.listBackups(c.req.param("id")) }),
+    c.json({ backups: await provisioner.listBackups(c.get("caller"), c.req.param("id")) }),
   );
 
   app.delete("/v1/databases/:id", async (c) => {
-    await provisioner.delete(c.req.param("id"));
+    await provisioner.delete(c.get("caller"), c.req.param("id"));
     return c.body(null, 204);
   });
 
@@ -196,6 +221,18 @@ export function buildRoutes(provisioner: Provisioner): Hono {
   // Slow on purpose — it reads the bucket through a Job, because the control plane has
   // no S3 client. Seconds, and a caller that wants it often should cache it rather
   // than asking drigodb to.
+  // ADMIN ONLY, both archive endpoints, and the reason is the same one that makes them
+  // useful: an orphaned archive's Cluster is gone, so there is no owner label to check
+  // and no way to prove who it belonged to. A prefix name carries a database id, and an
+  // id is a hash — it cannot be turned back into an owner.
+  //
+  // So a tenant cannot be shown archives it cannot be proven to own, and certainly
+  // cannot be allowed to purge one it might not. Reclaiming storage across a fleet is
+  // an operator's job, which is also the honest reading of decision 0008: the policy
+  // component that drives this is part of the installation, not one of its consumers.
+  app.use("/v1/archives", adminOnly);
+  app.use("/v1/archives/*", adminOnly);
+
   app.get("/v1/archives", async (c) => c.json(await provisioner.listArchives()));
 
   // Not /v1/databases/{id}/…, and the path is the argument.

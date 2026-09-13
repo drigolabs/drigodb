@@ -26,6 +26,12 @@ import {
 } from "../src/k8s/provisioner.js";
 
 const ID = "a1b2c3d4e5f6";
+
+// Every test in this file predates ownership and was written as the installation's
+// own operator. That is exactly what an ADMIN caller is, and it is why they keep
+// passing unchanged: an admin sees every database and derives ids the way drigodb
+// always did. Tests for the tenant case are in their own describe block below.
+const ADMIN = { id: "bootstrap", name: "bootstrap", tier: "admin" as const, owner: "bootstrap" };
 const EXT = "openvoid-app-01JQ";
 
 // A cluster made of CloudNativePG Clusters, kept honest about the two things
@@ -136,8 +142,8 @@ describe("concurrent create", () => {
   it("creates one database when two replicas race on the same external_id", async () => {
     const { provisioner, created } = racingCluster();
     const [a, b] = await Promise.all([
-      provisioner.create("same-app"),
-      provisioner.create("same-app"),
+      provisioner.create(ADMIN, "same-app"),
+      provisioner.create(ADMIN, "same-app"),
     ]);
     expect(created).toHaveLength(1);
     expect(a.database.id).toBe(b.database.id);
@@ -148,10 +154,10 @@ describe("concurrent create", () => {
 
   it("gives the same id for the same external_id, and different ids for different ones", async () => {
     const { provisioner } = racingCluster();
-    const first = await provisioner.create("app-one");
+    const first = await provisioner.create(ADMIN, "app-one");
     const { provisioner: other } = racingCluster();
-    const again = await other.create("app-one");
-    const different = await other.create("app-two");
+    const again = await other.create(ADMIN, "app-one");
+    const different = await other.create(ADMIN, "app-two");
     expect(again.database.id).toBe(first.database.id);
     expect(different.database.id).not.toBe(first.database.id);
     expect(first.database.id).toMatch(/^[0-9a-f]{12}$/);
@@ -164,22 +170,22 @@ describe("concurrent create", () => {
   // the losing caller lands in exactly that window every time.
   it("tells a losing caller the database is provisioning, not hibernated", async () => {
     const { provisioner, objects } = racingCluster();
-    const { database } = await provisioner.create("mid-create");
+    const { database } = await provisioner.create(ADMIN, "mid-create");
 
     // Back to the state the winner leaves behind: the Cluster exists and the
     // operator has not brought an instance up yet.
     objects.get(`db-${database.id}`)!.ready = 0;
 
-    expect((await provisioner.get(database.id)).status).toBe("provisioning");
+    expect((await provisioner.get(ADMIN, database.id)).status).toBe("provisioning");
   });
 
   it("reports hibernated once something asked for it", async () => {
     const { provisioner } = racingCluster();
-    const { database } = await provisioner.create("put-me-down");
+    const { database } = await provisioner.create(ADMIN, "put-me-down");
 
     expect(database.status).toBe("ready");
-    expect((await provisioner.scale(database.id, 0)).status).toBe("hibernated");
-    expect((await provisioner.wake(database.id)).status).toBe("ready");
+    expect((await provisioner.scale(ADMIN, database.id, 0)).status).toBe("hibernated");
+    expect((await provisioner.wake(ADMIN, database.id)).status).toBe("ready");
   });
 
   // The "no hibernation label" fallback that used to be tested here is gone
@@ -195,24 +201,24 @@ describe("concurrent create", () => {
   // that does not match the URI just handed out.
   it("refuses a create landing on a volume that has not finished going", async () => {
     const { provisioner, objects, pvcs } = racingCluster();
-    const { database } = await provisioner.create("delete-then-recreate");
+    const { database } = await provisioner.create(ADMIN, "delete-then-recreate");
 
     objects.delete(`db-${database.id}`);
     pvcs.push({ metadata: { name: `data-db-${database.id}-0` } });
 
-    await expect(provisioner.create("delete-then-recreate")).rejects.toThrow(DeletionInFlightError);
+    await expect(provisioner.create(ADMIN, "delete-then-recreate")).rejects.toThrow(DeletionInFlightError);
 
     // And succeeds once the volume is actually gone.
     pvcs.length = 0;
-    await expect(provisioner.create("delete-then-recreate")).resolves.toMatchObject({ created: true });
+    await expect(provisioner.create(ADMIN, "delete-then-recreate")).resolves.toMatchObject({ created: true });
   });
 
   it("does not mistake a live database's own volume for one being deleted", async () => {
     const { provisioner, pvcs } = racingCluster();
-    const { database } = await provisioner.create("still-here");
+    const { database } = await provisioner.create(ADMIN, "still-here");
     pvcs.push({ metadata: { name: `data-db-${database.id}-0` } });
 
-    const again = await provisioner.create("still-here");
+    const again = await provisioner.create(ADMIN, "still-here");
     expect(again.created).toBe(false);
     expect(again.database.id).toBe(database.id);
   });
@@ -222,11 +228,11 @@ describe("concurrent create", () => {
     // another's database with its credentials is not a failure to find in
     // production.
     const { provisioner, objects } = racingCluster();
-    const { database } = await provisioner.create("app-one");
+    const { database } = await provisioner.create(ADMIN, "app-one");
     // Simulate the collision by making the live Cluster claim a different
     // owner, which is what a genuine hash collision would look like from here.
     objects.get(`db-${database.id}`)!.labels["drigodb.io/external-id"] = "someone-else";
-    await expect(provisioner.create("app-one")).rejects.toThrow(ValidationError);
+    await expect(provisioner.create(ADMIN, "app-one")).rejects.toThrow(ValidationError);
   });
 });
 
@@ -346,10 +352,10 @@ describe("restore_from target_time", () => {
 describe("wake reconciles the NetworkPolicy", () => {
   it("rewrites the policy to what this build renders", async () => {
     const { provisioner, netCalls } = racingCluster();
-    const { database } = await provisioner.create(EXT);
+    const { database } = await provisioner.create(ADMIN, EXT);
 
     expect(netCalls).toHaveLength(0);
-    await provisioner.wake(database.id);
+    await provisioner.wake(ADMIN, database.id);
 
     expect(netCalls).toHaveLength(1);
     expect(netCalls[0]?.name).toBe(`db-${database.id}`);
@@ -427,7 +433,7 @@ describe("recovering to an instant", () => {
       { phase: "completed", started: "2026-09-08T10:00:00Z", stopped: "2026-09-08T10:05:00Z" },
     ]);
     await expect(
-      provisioner.create("app", { databaseId: SOURCE, targetTime: "2026-09-08T09:00:00Z" }),
+      provisioner.create(ADMIN, "app", { databaseId: SOURCE, targetTime: "2026-09-08T09:00:00Z" }),
     ).rejects.toThrow(VE);
   });
 
@@ -439,7 +445,7 @@ describe("recovering to an instant", () => {
       { phase: "completed", started: "2026-09-08T10:00:00Z", stopped: "2026-09-08T10:05:00Z" },
     ]);
     await expect(
-      provisioner.create("app", { databaseId: SOURCE, targetTime: "2026-09-08T10:02:00Z" }),
+      provisioner.create(ADMIN, "app", { databaseId: SOURCE, targetTime: "2026-09-08T10:02:00Z" }),
     ).rejects.toThrow(VE);
   });
 
@@ -448,7 +454,7 @@ describe("recovering to an instant", () => {
       { phase: "running", started: "2026-09-08T10:00:00Z" },
     ]);
     await expect(
-      provisioner.create("app", { databaseId: SOURCE, targetTime: "2026-09-08T11:00:00Z" }),
+      provisioner.create(ADMIN, "app", { databaseId: SOURCE, targetTime: "2026-09-08T11:00:00Z" }),
     ).rejects.toThrow(VE);
   });
 
@@ -459,7 +465,7 @@ describe("recovering to an instant", () => {
       { phase: "completed", started: "2026-09-08T10:00:00Z", stopped: "2026-09-08T10:05:00Z" },
     ]);
     await expect(
-      provisioner.create("app", { databaseId: SOURCE, targetTime: "2026-09-09T11:00:00Z" }),
+      provisioner.create(ADMIN, "app", { databaseId: SOURCE, targetTime: "2026-09-09T11:00:00Z" }),
     ).resolves.toBeDefined();
   });
 });
@@ -519,13 +525,13 @@ describe("reporting a standby", () => {
   }
 
   it("says nothing about a standby on a single-instance database", async () => {
-    const db = await clusterWith(1, 1).get(ID);
+    const db = await clusterWith(1, 1).get(ADMIN, ID);
     expect(db.high_availability).toBe(false);
     expect(db).not.toHaveProperty("standby");
   });
 
   it("reports a standby that is there", async () => {
-    const db = await clusterWith(2, 2).get(ID);
+    const db = await clusterWith(2, 2).get(ADMIN, ID);
     expect(db.high_availability).toBe(true);
     expect(db.standby).toBe("ready");
   });
@@ -534,7 +540,7 @@ describe("reporting a standby", () => {
     // The state the feature is meant to make visible: one pod ready out of two,
     // so the database serves and is no longer protected. `ready` and
     // `unavailable` together, not one or the other.
-    const db = await clusterWith(2, 1).get(ID);
+    const db = await clusterWith(2, 1).get(ADMIN, ID);
     expect(db.status).toBe("ready");
     expect(db.high_availability).toBe(true);
     expect(db.standby).toBe("unavailable");
@@ -543,7 +549,7 @@ describe("reporting a standby", () => {
   it("does not call a hibernated database's standby unhealthy", async () => {
     // Nothing is running because nothing should be. Reporting `unavailable`
     // here sends somebody looking for a fault that is not there.
-    const db = await clusterWith(2, 0, true).get(ID);
+    const db = await clusterWith(2, 0, true).get(ADMIN, ID);
     expect(db.status).toBe("hibernated");
     expect(db.high_availability).toBe(true);
     expect(db).not.toHaveProperty("standby");
@@ -598,12 +604,12 @@ describe("ready means connectable", () => {
     // One instance pod, Ready, and no primary: recovery has replayed enough to
     // pass the probe and CloudNativePG has not promoted it. Reporting `ready`
     // here is what made a restore hand back a URI that refused connections.
-    const db = await clusterWithPods({ instance: 1, primary: 0 }).get(ID);
+    const db = await clusterWithPods({ instance: 1, primary: 0 }).get(ADMIN, ID);
     expect(db.status).toBe("provisioning");
   });
 
   it("is ready once a primary exists", async () => {
-    const db = await clusterWithPods({ instance: 1, primary: 1 }).get(ID);
+    const db = await clusterWithPods({ instance: 1, primary: 1 }).get(ADMIN, ID);
     expect(db.status).toBe("ready");
   });
 
@@ -611,14 +617,14 @@ describe("ready means connectable", () => {
     // Not a race: a standby is podRole=instance forever. Counting those made a
     // database with a dead primary report ready while its endpoint pointed at
     // nothing.
-    const db = await clusterWithPods({ instance: 1, primary: 0 }, 2).get(ID);
+    const db = await clusterWithPods({ instance: 1, primary: 0 }, 2).get(ADMIN, ID);
     expect(db.status).toBe("provisioning");
   });
 
   it("still counts both instances when reporting the standby", async () => {
     // The standby's health is a different question from connectability and
     // still uses every instance pod.
-    const db = await clusterWithPods({ instance: 2, primary: 1 }, 2).get(ID);
+    const db = await clusterWithPods({ instance: 2, primary: 1 }, 2).get(ADMIN, ID);
     expect(db.status).toBe("ready");
     expect(db.standby).toBe("ready");
   });
@@ -688,7 +694,7 @@ describe("patches declare their content type", () => {
     //   error decoding patch: json: cannot unmarshal object into Go value of
     //   type []handlers.jsonPatchOp
     const { provisioner, patches } = recordingProvisioner();
-    await provisioner.resize(ID, "medium");
+    await provisioner.resize(ADMIN, ID, "medium");
     expect(patches.length).toBeGreaterThan(0);
     for (const p of patches) {
       expect(contentType(p.options)).toBe("application/merge-patch+json");
@@ -697,7 +703,7 @@ describe("patches declare their content type", () => {
 
   it("scale patches the Cluster as a merge patch", async () => {
     const { provisioner, patches } = recordingProvisioner();
-    await provisioner.scale(ID, 0);
+    await provisioner.scale(ADMIN, ID, 0);
     expect(patches.length).toBeGreaterThan(0);
     for (const p of patches) {
       expect(contentType(p.options)).toBe("application/merge-patch+json");
@@ -757,7 +763,7 @@ describe("a standby that cannot return says so", () => {
     const batch = { readNamespacedJob: async () => { throw notFound(); } };
     return new P(
       {} as never, core as never, net as never, batch as never, objectsApi as never,
-    ).get(ID);
+    ).get(ADMIN, ID);
   }
 
   it("calls a missing standby `blocked` when WAL archiving is failing", async () => {
@@ -824,7 +830,7 @@ describe("a standby that cannot return says so", () => {
     const batch = { readNamespacedJob: async () => { throw notFound(); } };
     const db = await new P(
       {} as never, core as never, net as never, batch as never, objectsApi as never,
-    ).get(ID);
+    ).get(ADMIN, ID);
     expect(db.backups).toBe("unavailable");
     expect(db).not.toHaveProperty("archiving");
   });
@@ -892,7 +898,7 @@ describe("resize refuses what the storage cannot do", () => {
 
   it("refuses when the StorageClass does not allow expansion, and patches nothing", async () => {
     const { provisioner, patches } = provisionerOn({ className: "standard", allowExpansion: false });
-    await expect(provisioner.resize(ID, "medium")).rejects.toThrow(ResizeRefusedError);
+    await expect(provisioner.resize(ADMIN, ID, "medium")).rejects.toThrow(ResizeRefusedError);
     // The database must be left exactly as it was. A refusal that already moved
     // the label would be worse than the silence it replaces.
     expect(patches).toHaveLength(0);
@@ -900,8 +906,8 @@ describe("resize refuses what the storage cannot do", () => {
 
   it("names the StorageClass, because that is the thing to change", async () => {
     const { provisioner } = provisionerOn({ className: "standard", allowExpansion: false });
-    await expect(provisioner.resize(ID, "medium")).rejects.toThrow(/standard/);
-    await expect(provisioner.resize(ID, "medium")).rejects.toThrow(/expansion/);
+    await expect(provisioner.resize(ADMIN, ID, "medium")).rejects.toThrow(/standard/);
+    await expect(provisioner.resize(ADMIN, ID, "medium")).rejects.toThrow(/expansion/);
   });
 
   it("proceeds when the StorageClass allows expansion", async () => {
@@ -909,7 +915,7 @@ describe("resize refuses what the storage cannot do", () => {
       className: "do-block-storage",
       allowExpansion: true,
     });
-    await provisioner.resize(ID, "medium");
+    await provisioner.resize(ADMIN, ID, "medium");
     expect(patches.length).toBeGreaterThan(0);
   });
 
@@ -917,13 +923,13 @@ describe("resize refuses what the storage cannot do", () => {
     // Unreadable is not the same as unable. A cluster that will not show drigodb
     // a StorageClass should not have its resizes blocked by that.
     const { provisioner, patches } = provisionerOn({ className: "opaque", readable: false });
-    await provisioner.resize(ID, "medium");
+    await provisioner.resize(ADMIN, ID, "medium");
     expect(patches.length).toBeGreaterThan(0);
   });
 
   it("proceeds when there is no PVC to check yet", async () => {
     const { provisioner, patches } = provisionerOn({});
-    await provisioner.resize(ID, "medium");
+    await provisioner.resize(ADMIN, ID, "medium");
     expect(patches.length).toBeGreaterThan(0);
   });
 });
@@ -1075,7 +1081,7 @@ describe("restore in place destroys nothing before it validates", () => {
   it("does not delete the Cluster when the backup does not exist", async () => {
     const { provisioner, acted, NotFoundError: NFE } = await withBackups([]);
     await expect(
-      provisioner.restoreInPlace(ID, { backupId: "bk-nope" }),
+      provisioner.restoreInPlace(ADMIN, ID, { backupId: "bk-nope" }),
     ).rejects.toThrow(NFE);
     expect(acted).toEqual([]);
   });
@@ -1085,7 +1091,7 @@ describe("restore in place destroys nothing before it validates", () => {
       { name: "bk-1", phase: "completed", stopped: "2026-09-13T10:00:00Z" },
     ]);
     await expect(
-      provisioner.restoreInPlace(ID, { targetTime: "2026-09-13 09:00:00.000000+00:00" }),
+      provisioner.restoreInPlace(ADMIN, ID, { targetTime: "2026-09-13 09:00:00.000000+00:00" }),
     ).rejects.toThrow(VE);
     expect(acted).toEqual([]);
   });
@@ -1096,7 +1102,7 @@ describe("restore in place destroys nothing before it validates", () => {
     const { provisioner, acted } = await withBackups([
       { name: "bk-1", phase: "completed", stopped: "2026-09-13T10:00:00Z" },
     ]);
-    await provisioner.restoreInPlace(ID, { targetTime: "2026-09-13 11:00:00.000000+00:00" });
+    await provisioner.restoreInPlace(ADMIN, ID, { targetTime: "2026-09-13 11:00:00.000000+00:00" });
     expect(acted).toEqual([`delete:db-${ID}`, `create:db-${ID}`]);
   });
 
@@ -1108,7 +1114,7 @@ describe("restore in place destroys nothing before it validates", () => {
     const { provisioner, created } = await withBackups([
       { name: "bk-1", phase: "completed", stopped: "2026-09-13T10:00:00Z" },
     ]);
-    await provisioner.restoreInPlace(ID, { backupId: "bk-1" });
+    await provisioner.restoreInPlace(ADMIN, ID, { backupId: "bk-1" });
     const c = created.at(-1);
     expect(c?.metadata.name).toBe(`db-${ID}`);
     expect(c?.metadata.annotations?.["drigodb.io/archive-generation"]).toBe("1");
@@ -1121,7 +1127,7 @@ describe("restore in place destroys nothing before it validates", () => {
     const { provisioner, created } = await withBackups([
       { name: "bk-1", phase: "completed", stopped: "2026-09-13T10:00:00Z" },
     ]);
-    await provisioner.restoreInPlace(ID, { backupId: "bk-1" });
+    await provisioner.restoreInPlace(ADMIN, ID, { backupId: "bk-1" });
     const c = created.at(-1) as unknown as {
       spec: { externalClusters?: Array<{ plugin: { parameters: Record<string, string> } }> };
     };
@@ -1131,7 +1137,7 @@ describe("restore in place destroys nothing before it validates", () => {
   it("is a 404 for a database that does not exist, having done nothing", async () => {
     const { provisioner, acted, NotFoundError: NFE } = await withBackups([]);
     await expect(
-      provisioner.restoreInPlace("ffffffffffff", { backupId: "bk-1" }),
+      provisioner.restoreInPlace(ADMIN, "ffffffffffff", { backupId: "bk-1" }),
     ).rejects.toThrow(NFE);
     expect(acted).toEqual([]);
   });
@@ -1200,7 +1206,7 @@ describe("adding a standby to a database that already exists", () => {
 
   it("patches instances and the synchronous posture when turning it on", async () => {
     const { provisioner, patched } = clusterAt(1);
-    await provisioner.setHighAvailability(ID, true);
+    await provisioner.setHighAvailability(ADMIN, ID, true);
     expect(patched).toHaveLength(1);
     const spec = (patched[0] as { spec: { instances: number; postgresql: { synchronous: unknown } } }).spec;
     expect(spec.instances).toBe(2);
@@ -1218,7 +1224,7 @@ describe("adding a standby to a database that already exists", () => {
     // is harmless under dataDurability `preferred` and a write outage the moment
     // anybody changes that to `required`.
     const { provisioner, patched } = clusterAt(2);
-    await provisioner.setHighAvailability(ID, false);
+    await provisioner.setHighAvailability(ADMIN, ID, false);
     const spec = (patched[0] as { spec: { instances: number; postgresql: { synchronous: unknown } } }).spec;
     expect(spec.instances).toBe(1);
     expect(spec.postgresql.synchronous).toBeNull();
@@ -1227,10 +1233,10 @@ describe("adding a standby to a database that already exists", () => {
   it("patches nothing when it is already in the state asked for", async () => {
     // Asking twice while a clone is running must not start a second one.
     const on = clusterAt(2);
-    await on.provisioner.setHighAvailability(ID, true);
+    await on.provisioner.setHighAvailability(ADMIN, ID, true);
     expect(on.patched).toEqual([]);
     const off = clusterAt(1);
-    await off.provisioner.setHighAvailability(ID, false);
+    await off.provisioner.setHighAvailability(ADMIN, ID, false);
     expect(off.patched).toEqual([]);
   });
 
@@ -1239,13 +1245,13 @@ describe("adding a standby to a database that already exists", () => {
     // and a clone of a real database takes minutes.
     // instances: 2 desired, one pod up, and CloudNativePG saying why.
     const { provisioner } = clusterAt(2, "Creating a new replica", 1);
-    const db = await provisioner.setHighAvailability(ID, true);
+    const db = await provisioner.setHighAvailability(ADMIN, ID, true);
     expect(db.standby).toBe("provisioning");
   });
 
   it("does not call it provisioning once the cluster is healthy again", async () => {
     const { provisioner } = clusterAt(2);
-    const db = await provisioner.setHighAvailability(ID, true);
+    const db = await provisioner.setHighAvailability(ADMIN, ID, true);
     expect(db.standby).toBe("ready");
   });
 
@@ -1254,7 +1260,7 @@ describe("adding a standby to a database that already exists", () => {
     // calling it `provisioning` would tell a caller to wait for something nobody
     // is doing.
     const { provisioner } = clusterAt(2, "Cluster in healthy state", 1);
-    const db = await provisioner.setHighAvailability(ID, true);
+    const db = await provisioner.setHighAvailability(ADMIN, ID, true);
     expect(db.standby).toBe("unavailable");
   });
 });
@@ -1731,5 +1737,258 @@ describe("archive listing", () => {
   it("reports a success with no summary rather than an empty bucket", async () => {
     const { provisioner } = await listingCluster({ log: "Traceback: something odd" });
     await expect(provisioner.listArchives()).rejects.toThrow(/printed no summary/);
+  });
+});
+
+// A database belongs to whoever made it (#72).
+//
+// The fake below IMPLEMENTS LABEL SELECTORS, which is not decoration. Scoping a
+// tenant's listing is a selector rather than a filter, so a fake that ignored the
+// selector and returned everything would let the scoping be wrong and the test pass —
+// the mocked-client hazard, aimed at the one feature whose failure hands one tenant
+// another's data.
+describe("ownership", () => {
+  const TENANT_A = { id: "aaaa000000000001", name: "a", tier: "tenant" as const, owner: "aaaa000000000001" };
+  const TENANT_B = { id: "bbbb000000000002", name: "b", tier: "tenant" as const, owner: "bbbb000000000002" };
+  // A rotation: a new token id carrying the retiring token's owner.
+  const TENANT_A2 = { id: "cccc000000000003", name: "a-rotated", tier: "tenant" as const, owner: "aaaa000000000001" };
+
+  // Equality and existence selectors, which is all drigodb uses.
+  function matches(labels: Record<string, string>, selector?: string): boolean {
+    if (!selector) return true;
+    return selector.split(",").every((term) => {
+      const [k, v] = term.split("=");
+      return v === undefined ? k! in labels : labels[k!] === v;
+    });
+  }
+
+  // The Provisioner class is a parameter so a test can supply one imported with
+  // backups configured — the restore paths refuse before they check anything else
+  // when there is nowhere to restore from.
+  function ownedCluster(Cls: typeof Provisioner = Provisioner) {
+    const objects = new Map<string, { labels: Record<string, string>; annotations: Record<string, string> }>();
+    const conflict = () => Object.assign(new Error("already exists"), { code: 409 });
+    const notFound = () => Object.assign(new Error("not found"), { code: 404 });
+    const objectsApi = {
+      createNamespacedCustomObject: async (req: {
+        body: { metadata: { name: string; labels: Record<string, string>; annotations?: Record<string, string> } };
+      }) => {
+        const { name, labels, annotations } = req.body.metadata;
+        if (objects.has(name)) throw conflict();
+        objects.set(name, { labels: { ...labels }, annotations: { ...(annotations ?? {}) } });
+        return req.body;
+      },
+      getNamespacedCustomObject: async (req: { name: string; plural: string }) => {
+        // A completed Backup for whatever a restore names. This harness is about
+        // ownership, and the backup-resolution path has its own tests above.
+        if (req.plural === "backups") {
+          return {
+            // The database id out of the backup's own name, which is how real ones
+            // are built (bk-<id>-<timestamp>) — so the pre-existing "a backup belongs
+            // to its database" guard is exercised rather than bypassed.
+            metadata: {
+              name: req.name,
+              labels: { "drigodb.io/database-id": req.name.replace(/^bk-/, "").split("-")[0]! },
+            },
+            status: { phase: "completed", backupId: "barman-id" },
+          };
+        }
+        const o = objects.get(req.name);
+        if (!o) throw notFound();
+        return {
+          metadata: { name: req.name, labels: o.labels, annotations: o.annotations },
+          status: { readyInstances: 1 },
+        };
+      },
+      listNamespacedCustomObject: async (req: { labelSelector?: string }) => ({
+        items: [...objects.entries()]
+          .filter(([, o]) => matches(o.labels, req.labelSelector))
+          .map(([name, o]) => ({
+            metadata: { name, labels: o.labels, annotations: o.annotations },
+            status: { readyInstances: 1 },
+          })),
+      }),
+      patchNamespacedCustomObject: async () => ({}),
+      deleteNamespacedCustomObject: async (req: { name: string }) => {
+        objects.delete(req.name);
+        return {};
+      },
+    };
+    const core = {
+      createNamespacedSecret: async () => ({}),
+      createNamespacedService: async () => ({}),
+      listNamespacedPod: async () => ({
+        items: [...objects.values()].map(() => ({ status: { conditions: [{ type: "Ready", status: "True" }] } })),
+      }),
+      listNamespacedPersistentVolumeClaim: async () => ({ items: [] }),
+      deleteNamespacedSecret: async () => ({}),
+      deleteNamespacedService: async () => ({}),
+    };
+    const net = { createNamespacedNetworkPolicy: async () => ({}), replaceNamespacedNetworkPolicy: async () => ({}), deleteNamespacedNetworkPolicy: async () => ({}) };
+    const batch = { readNamespacedJob: async () => { throw notFound(); } };
+    return {
+      objects,
+      provisioner: new Cls({} as never, core as never, net as never, batch as never, objectsApi as never),
+    };
+  }
+
+  it("gives two tenants with the same external_id two different databases", async () => {
+    // THE failure this exists to stop. The derived id is the lock, so before this both
+    // tenants derived one id, the second hit the idempotent path, and was handed the
+    // first one's database and its connection URI. Not an error — one tenant reading
+    // another's data.
+    const { provisioner } = ownedCluster();
+    const a = await provisioner.create(TENANT_A, "main");
+    const b = await provisioner.create(TENANT_B, "main");
+    expect(a.database.id).not.toBe(b.database.id);
+    expect(a.created).toBe(true);
+    expect(b.created).toBe(true);
+    expect(a.uri).not.toBe(b.uri);
+  });
+
+  it("keeps an admin's ids exactly where they were, so existing databases still resolve", async () => {
+    // A Cluster's name cannot be rewritten. Salting admins too would leave every
+    // database created before #72 unreachable by the only name its consumer knows, and
+    // the next POST would build a duplicate beside it.
+    const { provisioner } = ownedCluster();
+    const created = await provisioner.create(ADMIN, "openvoid-app-01JQ");
+    const { createHash } = await import("node:crypto");
+    expect(created.database.id).toBe(
+      createHash("sha256").update("openvoid-app-01JQ").digest("hex").slice(0, 12),
+    );
+  });
+
+  it("stamps the owner and hides one tenant's database from another", async () => {
+    const { provisioner } = ownedCluster();
+    const a = await provisioner.create(TENANT_A, "main");
+    await expect(provisioner.get(TENANT_B, a.database.id)).rejects.toThrow(NotFoundError);
+    // And the same error a genuinely absent database gives, so a 403 cannot be used to
+    // probe whether another tenant has a database by a guessed name.
+    await expect(provisioner.get(TENANT_B, "ffffffffffff")).rejects.toThrow(NotFoundError);
+    await expect(provisioner.get(TENANT_A, a.database.id)).resolves.toMatchObject({ id: a.database.id });
+  });
+
+  it("lists only a tenant's own, and everything for an admin", async () => {
+    const { provisioner } = ownedCluster();
+    await provisioner.create(TENANT_A, "main");
+    await provisioner.create(TENANT_B, "main");
+    expect((await provisioner.list(TENANT_A)).length).toBe(1);
+    expect((await provisioner.list(TENANT_B)).length).toBe(1);
+    expect((await provisioner.list(ADMIN)).length).toBe(2);
+  });
+
+  it("hides a database created before ownership existed from every tenant", async () => {
+    // No owner label, because nothing had one. It must match no tenant — which is the
+    // whole migration: there isn't one.
+    const { provisioner, objects } = ownedCluster();
+    objects.set("db-deadbeef0001", {
+      labels: {
+        "drigodb.io/database-id": "deadbeef0001",
+        "drigodb.io/external-id": "legacy",
+        "app.kubernetes.io/managed-by": "drigodb",
+      },
+      annotations: {},
+    });
+    expect((await provisioner.list(TENANT_A)).length).toBe(0);
+    await expect(provisioner.get(TENANT_A, "deadbeef0001")).rejects.toThrow(NotFoundError);
+    expect((await provisioner.list(ADMIN)).map((d) => d.id)).toContain("deadbeef0001");
+  });
+
+  it("lets a rotated token reach what the retired one owned", async () => {
+    // #72 says a database belongs to the TOKEN that created it, and #62 gave tokens an
+    // expiry. Taken literally together, a consumer that rotates its credential loses
+    // every database. An owner is carried rather than implied, so it does not.
+    const { provisioner } = ownedCluster();
+    const a = await provisioner.create(TENANT_A, "main");
+    expect((await provisioner.get(TENANT_A2, a.database.id)).id).toBe(a.database.id);
+    // And the derived id is stable across the rotation, so the same external_id is
+    // still idempotent rather than building a second database.
+    const again = await provisioner.create(TENANT_A2, "main");
+    expect(again.database.id).toBe(a.database.id);
+    expect(again.created).toBe(false);
+  });
+
+  it("refuses to restore from a database the caller cannot reach", async () => {
+    // The sharpest hole, and it is not in #72's table: restore_from names a database id
+    // and a restored database is a full copy. An admin's id is sha256(external_id) of a
+    // meaningful string, so it is guessable.
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_BACKUP_OBJECT_STORE", "drigodb-api-backups");
+    const mod = await import("../src/k8s/provisioner.js");
+    const { provisioner } = ownedCluster(mod.Provisioner);
+    const victim = await provisioner.create(TENANT_A, "main");
+    await expect(
+      provisioner.create(TENANT_B, "stolen", { databaseId: victim.database.id }),
+    ).rejects.toThrow(mod.NotFoundError);
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it("refuses a tenant restoring from a database that no longer exists", async () => {
+    // A deleted database has no owner label to check. Restoring from one is a real
+    // thing to want and is kept for admins; for a tenant it is an unanswerable
+    // ownership question, so it is a 404.
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_BACKUP_OBJECT_STORE", "drigodb-api-backups");
+    const mod = await import("../src/k8s/provisioner.js");
+    const { provisioner } = ownedCluster(mod.Provisioner);
+    await expect(
+      provisioner.create(TENANT_A, "from-a-ghost", { databaseId: "ffffffffffff" }),
+    ).rejects.toThrow(mod.NotFoundError);
+    // And an admin may TRY, because restoring from a deleted database is a real thing
+    // to want and an operator is the only caller whose ownership question is
+    // answerable. It resolves here and CloudNativePG is what refuses later if the
+    // archive is not actually in the bucket — which is the pre-existing contract, not
+    // something this changes.
+    await expect(
+      provisioner.create(ADMIN, "from-a-ghost", { databaseId: "ffffffffffff" }),
+    ).resolves.toMatchObject({ created: true });
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it("carries the owner through buildCluster, and omits it when there is none", async () => {
+    const m = await import("../src/k8s/manifests.js");
+    const built = m.buildCluster("a1b2c3d4e5f6", "main", "small", undefined, false, 1, "aaaa000000000001");
+    expect((built.metadata.labels as Record<string, string>)[m.OWNER_LABEL]).toBe("aaaa000000000001");
+    const unowned = m.buildCluster("a1b2c3d4e5f6", "main");
+    expect(unowned.metadata.labels).not.toHaveProperty(m.OWNER_LABEL);
+  });
+
+  it("does not let an ADMIN take a tenant's database by restoring it in place", async () => {
+    // restoreInPlace deletes the Cluster and recreates it, so the owner label has to be
+    // carried across — and carried from the EXISTING Cluster, not the caller.
+    //
+    // Written first against buildCluster alone, which tested that the parameter works
+    // and not that restoreInPlace passes the right thing. The mutation `const owner =
+    // caller.owner` passed. It does not now.
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_BACKUP_OBJECT_STORE", "drigodb-api-backups");
+    const mod = await import("../src/k8s/provisioner.js");
+    const { provisioner, objects } = ownedCluster(mod.Provisioner);
+    const owned = await provisioner.create(TENANT_A, "main");
+
+    await provisioner.restoreInPlace(ADMIN, owned.database.id, {
+      backupId: `bk-${owned.database.id}-20260913T120000`,
+    });
+
+    // The tenant still owns it. Read from the caller, this would be the admin's.
+    const m = await import("../src/k8s/manifests.js");
+    expect(objects.get(`db-${owned.database.id}`)?.labels[m.OWNER_LABEL]).toBe(TENANT_A.owner);
+    expect((await provisioner.get(TENANT_A, owned.database.id)).id).toBe(owned.database.id);
+    expect((await provisioner.list(TENANT_A)).length).toBe(1);
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  it("keeps the owner label off everything except the Cluster", async () => {
+    // Token Secrets carry drigodb.io/owner too, and they live in the same namespace. A
+    // database's password Secret wearing it would be matched by the selector that asks
+    // "does any token still carry this owner".
+    const m = await import("../src/k8s/manifests.js");
+    const secret = m.buildSecret("a1b2c3d4e5f6", "main", "pw") as { metadata: { labels: Record<string, string> } };
+    expect(secret.metadata.labels).not.toHaveProperty(m.OWNER_LABEL);
+    const svc = m.buildService("a1b2c3d4e5f6", "main") as { metadata: { labels: Record<string, string> } };
+    expect(svc.metadata.labels).not.toHaveProperty(m.OWNER_LABEL);
   });
 });

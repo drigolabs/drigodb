@@ -146,6 +146,13 @@ identical to an earlier one, because Kubernetes drops an env var whose value is
 revision bumped, and the newest by timestamp is a stale one scaled to zero with no
 pods in it at all.
 
+A test whose name claims more than its body checks is the same hazard wearing a
+better disguise. "Keeps the owner across an in-place restore" tested `buildCluster`
+directly — it proved the parameter works, not that `restoreInPlace` passes the right
+thing, and the mutation that made it pass the *caller's* owner (an admin silently
+taking a tenant's database) went undetected. If an assertion is about what a method
+does, call the method.
+
 A cluster assertion whose inputs are empty passes and means nothing. "No Secret
 carries both labels" reported success against **zero Secrets of either kind**, because
 it ran before any database was provisioned and after its own tokens were revoked. If

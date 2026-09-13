@@ -13,7 +13,12 @@ import type { Caller } from "../auth.js";
 // is the only router that reads it; #72 will make it every router's business.
 type Env = { Variables: { caller: Caller } };
 
-export function buildTokenRoutes(store: TokenStore): Hono<Env> {
+export function buildTokenRoutes(
+  store: TokenStore,
+  // Just the one question: which database ids carry this owner. A whole Provisioner
+  // would be a circular dependency for a listing.
+  provisionerOwnedIds: (owner: string) => Promise<string[]>,
+): Hono<Env> {
   // basePath, and the admin gate below is the reason.
   //
   // Written first as `new Hono()` with `app.use("*", adminOnly)` and mounted at "/",
@@ -55,14 +60,14 @@ export function buildTokenRoutes(store: TokenStore): Hono<Env> {
   // `connection_uri`, for the same reason — drigodb stores a hash, so it could not
   // show it to you a second time even if it wanted to.
   app.post("/", async (c) => {
-    let req: { name: string; tier: "admin" | "tenant"; expiresIn?: number };
+    let req: { name: string; tier: "admin" | "tenant"; owner?: string; expiresIn?: number };
     try {
       req = validateTokenRequest(await c.req.json().catch(() => null));
     } catch (err) {
       if (err instanceof TokenError) return c.json({ error: err.message }, 400);
       throw err;
     }
-    const { record, token } = await store.issue(req.name, req.tier, req.expiresIn);
+    const { record, token } = await store.issue(req.name, req.tier, req.owner, req.expiresIn);
     return c.json({ ...record, token }, 201);
   });
 
@@ -85,6 +90,24 @@ export function buildTokenRoutes(store: TokenStore): Hono<Env> {
         409,
       );
     }
+    // What this revocation orphans, worked out BEFORE the token goes — afterwards
+    // there is nothing left to ask.
+    //
+    // Revoking never refuses, and that is the deliberate half: the reason to revoke is
+    // usually a leak, and a token protected by the databases it can reach would be a
+    // token an attacker keeps. So the databases stay running and become admin-only,
+    // which needs no action at all — no tenant can match an owner label naming a token
+    // that no longer exists. What would be wrong is letting them go quietly, so the
+    // response names them.
+    const record = await store.recordFor(id);
+    let orphaned: string[] = [];
+    if (record) {
+      const shared = await store.ownerStillReachable(record.owner, id);
+      // With two tokens sharing an owner — which is how a rotation works — revoking
+      // one orphans nothing, and saying it did would send someone looking for a
+      // problem that is not there.
+      if (!shared) orphaned = await provisionerOwnedIds(record.owner);
+    }
     try {
       await store.revoke(id);
     } catch (err) {
@@ -92,7 +115,10 @@ export function buildTokenRoutes(store: TokenStore): Hono<Env> {
       // A token that is already gone is the state the caller asked for.
       if (code !== 404) throw err;
     }
-    return c.body(null, 204);
+    // 200 with a body rather than 204, because "revoked, and these four databases are
+    // now reachable only by an admin" is information the caller needs and will not get
+    // anywhere else.
+    return c.json({ revoked: id, orphaned }, 200);
   });
 
   return app;

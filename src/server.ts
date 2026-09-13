@@ -63,8 +63,9 @@ function main(): void {
     await next();
   });
 
-  app.route("/", buildTokenRoutes(tokens));
-  app.route("/", buildRoutes(Provisioner.fromCluster()));
+  const provisioner = Provisioner.fromCluster();
+  app.route("/", buildTokenRoutes(tokens, (owner) => provisioner.idsOwnedBy(owner)));
+  app.route("/", buildRoutes(provisioner));
 
   serve({ fetch: app.fetch, port: config.port }, (info) => {
     console.log(`[drigodb] listening on :${info.port}`);

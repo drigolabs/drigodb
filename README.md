@@ -400,9 +400,35 @@ It works within five seconds and can issue tokens normally.
 `scripts/install-failure-test.sh` runs exactly this, so it is a procedure that is
 executed on every pull request rather than one written down and hoped for.
 
-Databases are not yet scoped to the token that created them; every valid token still
-sees every database. That is [#72](https://github.com/drigolabs/drigodb/issues/72),
-and it is what makes this a fourth isolation layer rather than a third and a half.
+`owner` is what a token's databases belong to, and defaults to the token's own id — so
+"a database belongs to the token that created it" is the behaviour you get without
+asking. Pass an existing token's `owner` to **rotate a credential** without its
+databases moving; without that, a token expiring would strand everything it owned.
+
+### What a token can reach
+
+A database belongs to an owner, recorded as `drigodb.io/owner` on its Cluster.
+
+- **A tenant token** sees and operates on its own databases only. Everything else is
+  **404**, never 403 — a 403 confirms existence, and ids are derived from `external_id`,
+  so it would let one tenant test for another's databases.
+- **Two tenants may both call a database `main`** and get two databases. The id is
+  derived per owner, which matters because the derived id is also the lock that makes
+  concurrent creates idempotent.
+- **`restore_from` is checked too.** A restored database is a full copy, so the source
+  must be reachable by the caller. A source that no longer exists has no owner to
+  check, so restoring from a deleted database is admin-only.
+- **An admin token** sees every database, including those created before ownership
+  existed — they carry no owner label, so no tenant matches them and there is no
+  migration to run.
+- **`/v1/archives` is admin-only**, both endpoints. An orphaned archive's Cluster is
+  gone, so there is nothing left to prove who it belonged to.
+- **Admin tokens share one id space**, the historical unsalted one, so every database
+  created before this keeps resolving by its `external_id`.
+
+Revoking a token never refuses, because the reason to revoke is usually a leak and a
+token protected by the databases it reaches is a token an attacker keeps. Its databases
+keep running and become admin-only; the response names them.
 
 ### Seeing what is in the backup bucket
 

@@ -285,7 +285,7 @@ describe("the admin gate's scope", () => {
       c.set("caller", { id: "caller", name: "caller", tier });
       await next();
     });
-    app.route("/", buildTokenRoutes(store) as never);
+    app.route("/", buildTokenRoutes(store, async () => []) as never);
     // Stands in for buildRoutes. Anything mounted after the token router, which is
     // exactly where the leak was.
     app.get("/v1/databases", (c) => c.json({ databases: [] }));
