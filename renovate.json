@@ -14,7 +14,7 @@
   "commitMessagePrefix": "chore(deps):",
   "packageRules": [
     {
-      "description": "One pull request per pin. A batched bump is a batched revert, and these pins fail in unrelated ways \u2014 a CloudNativePG minor and a mermaid patch have nothing to say to each other.",
+      "description": "One pull request per pin. A batched bump is a batched revert, and these pins fail in unrelated ways — a CloudNativePG minor and a mermaid patch have nothing to say to each other.",
       "matchManagers": [
         "custom.regex",
         "helm-values",
@@ -25,7 +25,7 @@
       "groupName": null
     },
     {
-      "description": "Label the pins this repository maintains deliberately, so they stay findable. config:recommended also proposes npm and GitHub Actions majors \u2014 fifteen of them on the first run \u2014 and the versions.env pins are the ones that have actually broken things: MinIO vanishing from Docker Hub, and appVersion four releases behind its own chart.",
+      "description": "Label the pins this repository maintains deliberately, so they stay findable. config:recommended also proposes npm and GitHub Actions majors — fifteen of them on the first run — and the versions.env pins are the ones that have actually broken things: MinIO vanishing from Docker Hub, and appVersion four releases behind its own chart.",
       "matchManagers": [
         "custom.regex"
       ],
@@ -34,7 +34,7 @@
       ]
     },
     {
-      "description": "MinIO's tags are RELEASE.<timestamp>, which `loose` versioning cannot parse \u2014 it skipped both pins with skipReason invalid-value, so Renovate could never have proposed a bump for the one dependency that has already broken CI by disappearing. A regex versioning reads the date as major.minor.patch and the time as the build, which orders correctly. It also does the filtering allowedVersions used to attempt: the pattern requires a trailing Z, so the -cpuv1 and .hotfix. variants do not parse and are ignored rather than mistaken for newer.",
+      "description": "MinIO's tags are RELEASE.<timestamp>, which `loose` versioning cannot parse — it skipped both pins with skipReason invalid-value, so Renovate could never have proposed a bump for the one dependency that has already broken CI by disappearing. A regex versioning reads the date as major.minor.patch and the time as the build, which orders correctly. It also does the filtering allowedVersions used to attempt: the pattern requires a trailing Z, so the -cpuv1 and .hotfix. variants do not parse and are ignored rather than mistaken for newer.",
       "matchPackageNames": [
         "quay.io/minio/minio",
         "quay.io/minio/mc"
@@ -147,6 +147,17 @@
       ],
       "matchStrings": [
         "image:\\s*(?<depName>ghcr\\.io/cloudnative-pg/postgresql):(?<currentValue>\\S+)"
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "description": "The sidecar image an archive purge runs on (charts/drigodb/values.yaml). It must stay in step with BARMAN_PLUGIN_VERSION above: the sidecar the plugin injects and the one a purge runs are the same image, and an older one has no delete_under_prefix. Two managers, one version — a bump that lands on only one of them is visible as a diff, where a chart value nothing watched would just rot.",
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^charts/drigodb/values\\.yaml$/"
+      ],
+      "matchStrings": [
+        "purgeImage:\\s*(?<depName>ghcr\\.io/cloudnative-pg/plugin-barman-cloud-sidecar):(?<currentValue>\\S+)"
       ],
       "datasourceTemplate": "docker"
     }

@@ -153,12 +153,33 @@ backup:
   #   * an archive generation left behind by a restore in place is never pruned
   #   * a hibernated database's archive is not pruned until it wakes
   #
-  # Those accumulate, and nothing in drigodb removes them yet — a per-database
-  # purge is a missing MECHANISM rather than a property of the design (#135), and
-  # deciding when to sweep belongs to a policy layer outside this repository.
-  # docs/backup-retention.md has the coverage table and how to clear them by hand
-  # until that exists.
+  # Those accumulate, and this does not bound them. What clears them is
+  # POST /v1/archives/{id}/purge, which removes everything a DELETED database left
+  # behind — every generation of it (docs/archive-purge.md). Deciding when to call
+  # it is policy and lives outside this repository; drigodb only offers the verb.
   retention: 30d
+
+  # The image that purge runs on.
+  #
+  # barman-cloud-backup-delete cannot empty an archive — it keeps every WAL from
+  # the last backup onwards, which for a deleted database is most of it — so the
+  # purge Job runs a script of ours on this image, for barman's S3 code rather
+  # than its CLI. Every installation with backups already pulls it, so this is a
+  # pin, not a dependency.
+  #
+  # Must stay in step with BARMAN_PLUGIN_VERSION in scripts/versions.env: the
+  # sidecar the plugin injects and the one a purge runs are the same image, and an
+  # older one has no delete_under_prefix at all. Renovate bumps both.
+  purgeImage: ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.15.0
+
+  # How many archive generations one purge looks at.
+  #
+  # An in-place restore adds a generation — db-<id>, db-<id>-r1, … — and nothing
+  # else does, so this is a database restored twenty times. It exists because the
+  # alternative is an unbounded loop against object storage, and it is raisable
+  # because a purge that reaches it says so: `truncated: true` in the response,
+  # meaning there may be more above the bound and the bound is the thing to change.
+  purgeMaxGenerations: 20
 
 nameOverride: ""
 fullnameOverride: ""

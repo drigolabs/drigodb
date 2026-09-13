@@ -29,6 +29,13 @@ import {
   CLUSTERS_PLURAL,
   DB_USER,
   ARCHIVE_GENERATION_ANNOTATION,
+  BARMAN_GROUP,
+  OBJECT_STORES_PLURAL,
+  OPERATION_LABEL,
+  PURGE_OPERATION,
+  buildPurgeJob,
+  purgeJobName,
+  type ArchiveStore,
   CNPG_ARCHIVING_CONDITION,
   CNPG_CREATING_REPLICA_PHASE,
   archiveGenerationOf,
@@ -167,6 +174,14 @@ export class ResizeRefusedError extends Error {}
 // error class is read by whoever is debugging at 3am; naming it after a
 // different feature costs them the first ten minutes.
 export class NotConfiguredError extends Error {}
+
+// A purge was asked for an archive whose database is still there.
+//
+// The whole safety model of the purge endpoint, not a convenience check: a live
+// database's archive is its backups and its recovery window. Deliberately not
+// overridable — the way to remove a running database's archive is to delete the
+// database first, which is a different request with its own confirmation.
+export class ArchiveInUseError extends Error {}
 
 // A create landed on an id whose previous database is still being deleted.
 //
@@ -360,6 +375,41 @@ export function validateRestoreInPlace(
   return { ...(backupId ? { backupId } : {}), ...(targetTime ? { targetTime } : {}) };
 }
 
+// What `POST /v1/archives/{id}/purge` is allowed to say.
+//
+// The id is validated for SHAPE here, which no other endpoint has to do. Every
+// other operation finds a Cluster or returns 404, and the id never leaves the
+// control plane. This one has no Cluster to look for — that is the precondition —
+// so the id goes straight into an object-storage prefix, and a malformed one would
+// be a prefix somebody else's data is under. The script refuses it a second time
+// from inside the pod; this is the refusal that happens before a credential is
+// mounted anywhere.
+export function validateArchivePurge(id: string, value: unknown): { dryRun: boolean } {
+  if (!DB_ID_RE.test(id)) {
+    throw new ValidationError(
+      `${id} is not a drigodb database id, and an archive prefix is derived from one`,
+    );
+  }
+  if (value === null || typeof value !== "object") {
+    throw new ValidationError("a purge needs a body confirming which archive to remove");
+  }
+  const v = value as { confirm?: unknown; dry_run?: unknown };
+  // The id itself, exactly as a restore in place asks for it. Not a boolean: a
+  // script sets {"force": true} once and forgets it, whereas an id has to be
+  // looked up and cannot be copied from one database to another by accident.
+  // There is no second copy of an archive.
+  if (v.confirm !== id) {
+    throw new ValidationError(
+      "purging an archive destroys every backup and every WAL segment the deleted " +
+        `database left, and cannot be undone. Send {"confirm": "${id}"} to proceed.`,
+    );
+  }
+  if (v.dry_run !== undefined && typeof v.dry_run !== "boolean") {
+    throw new ValidationError("dry_run must be true or false");
+  }
+  return { dryRun: v.dry_run === true };
+}
+
 // What `POST /{id}/high-availability` is allowed to say.
 export function validateHighAvailabilityChange(value: unknown): boolean {
   if (value === null || typeof value !== "object") {
@@ -400,6 +450,46 @@ function isAlreadyExists(err: unknown): boolean {
   return code === 409;
 }
 
+// The purge script's summary, out of the pod's log.
+//
+// Matched on its own fields rather than on being the last line, or on being JSON
+// at all. barman and boto3 log to stderr, the container merges the streams, and
+// nothing guarantees where in the result the script's one line of stdout lands —
+// so "the last line" is not the summary and "the first line that parses" is
+// eventually a log record, which are structured JSON and would parse fine.
+function parsePurgeSummary(log: string): Omit<ArchivePurge, "id"> | undefined {
+  for (const line of log.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    const p = parsed as Partial<ArchivePurge>;
+    if (typeof p.server_name !== "string" || !Array.isArray(p.generations)) continue;
+    return {
+      server_name: p.server_name,
+      dry_run: p.dry_run === true,
+      generations: p.generations,
+      objects: p.objects ?? 0,
+      bytes: p.bytes ?? 0,
+      truncated: p.truncated === true,
+    };
+  }
+  return undefined;
+}
+
+// The end of a log, for an error message. The end rather than the start: a purge
+// that failed says why last — a Python traceback ends with the exception, and
+// botocore's retries put everything that is not the reason in front of it.
+function tail(log: string, limit = 2000): string {
+  const text = log.trim();
+  if (text === "") return "It logged nothing.";
+  return text.length <= limit ? text : `…${text.slice(-limit)}`;
+}
+
 function isNotFound(err: unknown): boolean {
   const code =
     (err as { code?: number; statusCode?: number })?.code ??
@@ -424,6 +514,45 @@ export interface DatabaseBackup {
   backup_id?: string;
   completed_at?: string;
   error?: string;
+}
+
+// What a purge did, as the script reported it.
+//
+// Per generation as well as in total, because "one prefix held all of it" and
+// "this database was restored four times" are different facts about a bucket and
+// the second is the one that explains the bill.
+export interface ArchivePurge {
+  id: string;
+  server_name: string;
+  dry_run: boolean;
+  generations: {
+    generation: number;
+    prefix: string;
+    objects: number;
+    bytes: number;
+  }[];
+  objects: number;
+  bytes: number;
+  // The purge reached the generation bound with objects still under it, so there
+  // may be more above it. Reported rather than swallowed: a caller that believes
+  // an archive is gone when it is not would stop retrying.
+  truncated: boolean;
+}
+
+// The plugin's ObjectStore, narrowed to the four things a purge needs out of it.
+// Two are paths and two are references to Secret keys this process cannot read.
+interface CnpgObjectStore {
+  spec?: {
+    configuration?: {
+      destinationPath?: string;
+      endpointURL?: string;
+      s3Credentials?: {
+        accessKeyId?: { name?: string; key?: string };
+        secretAccessKey?: { name?: string; key?: string };
+        region?: { name?: string; key?: string };
+      };
+    };
+  };
 }
 
 interface CnpgBackup {
@@ -1752,6 +1881,184 @@ export class Provisioner {
           }),
         );
       }
+    }
+  }
+
+
+  // Remove everything a DELETED database left in the bucket.
+  //
+  // Retention is enforced by a running primary's sidecar, for that primary's
+  // current archive prefix only. So a deleted database's archive is pruned by
+  // nothing, ever again, and neither is the generation an in-place restore left
+  // behind (docs/backup-retention.md). This is the mechanism that removes one;
+  // deciding when to call it is policy and lives outside this repository
+  // (decision 0008).
+  //
+  // Synchronous, which is different from restore's 202. A purge is a handful of
+  // list calls and a batch delete per thousand objects — seconds, not the minutes
+  // a recovery takes — and the answer is the point: a caller purging to reclaim
+  // storage wants to know how much came back. If that ever stops being seconds,
+  // the shape to move to is 202 plus a GET on the Job, not a longer wait.
+  async purgeArchive(id: string, opts: { dryRun: boolean }): Promise<ArchivePurge> {
+    const ns = config.databaseNamespace;
+    if (!backupsEnabled()) {
+      throw new NotConfiguredError(
+        "backups are not configured for this installation, so there is no archive to purge",
+      );
+    }
+    if (!config.backup.purgeScriptConfigMap) {
+      throw new NotConfiguredError(
+        "DRIGODB_ARCHIVE_PURGE_CONFIGMAP is not set, so there is no purge program to run; " +
+          "the chart sets it whenever backups are configured",
+      );
+    }
+
+    // The guard the whole endpoint exists behind, and it is `has a Cluster`
+    // rather than `has a running pod` on purpose: a hibernated database has no
+    // pod and its archive is not an orphan.
+    if (await this.clusterFor(id)) {
+      throw new ArchiveInUseError(
+        `${id} still exists, and its archive is its backups. Delete the database first.`,
+      );
+    }
+
+    const store = await this.archiveStore();
+    const name = purgeJobName(id);
+
+    // Clear the previous attempt before starting another.
+    //
+    // Foreground propagation, not Background: the endpoint answers by reading one
+    // pod's log, and with Background the old Job is gone from the API while its
+    // pod is still in the namespace wearing the same labels. Waiting for the Job
+    // to disappear then also means waiting for the pod.
+    await this.ignoreMissing(() =>
+      this.batch.deleteNamespacedJob({
+        name,
+        namespace: ns,
+        propagationPolicy: "Foreground",
+      }),
+    );
+    for (let i = 0; i < 60; i++) {
+      if (!(await this.jobFor(name))) break;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+
+    await this.batch.createNamespacedJob({
+      namespace: ns,
+      body: buildPurgeJob(id, store, opts),
+    });
+
+    let finished: V1Job | undefined;
+    for (let i = 0; i < 300; i++) {
+      const job = await this.jobFor(name);
+      if ((job?.status?.succeeded ?? 0) > 0 || (job?.status?.failed ?? 0) > 0) {
+        finished = job;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    const log = await this.purgeLog(id);
+    if (!finished) {
+      throw new Error(
+        `the purge of ${id} did not finish within five minutes. The Job ${name} is in ` +
+          `${ns}; nothing has been lost, and running this again is safe. ${tail(log)}`,
+      );
+    }
+    if ((finished.status?.failed ?? 0) > 0) {
+      // The log, not the Job's status. A Job says "failed"; the script says which
+      // prefix it could not read and why, and that is the difference between a
+      // wrong credential and a bucket that is not there.
+      throw new Error(`the purge of ${id} failed. ${tail(log)}`);
+    }
+
+    const summary = parsePurgeSummary(log);
+    if (!summary) {
+      // Succeeded without saying what it did. Reported rather than answered with
+      // zeroes: "nothing to purge" and "I cannot tell you what I deleted" are
+      // different, and a caller acting on the first when the second is true would
+      // believe an archive is gone.
+      throw new Error(
+        `the purge of ${id} reported success but printed no summary, so what it removed is ` +
+          `unknown. ${tail(log)}`,
+      );
+    }
+    return { id, ...summary };
+  }
+
+  // The bucket a purge writes to, read from the ObjectStore the chart created.
+  //
+  // Not from the API's own environment. One bucket declared twice is two things
+  // that can disagree, and the half that is wrong here deletes objects. What
+  // comes back is a destination, an endpoint and the NAMES of Secret keys — the
+  // control plane still cannot resolve them, and still holds no credential.
+  private async archiveStore(): Promise<ArchiveStore> {
+    let store: CnpgObjectStore;
+    try {
+      store = (await this.objects.getNamespacedCustomObject({
+        group: BARMAN_GROUP,
+        version: "v1",
+        namespace: config.databaseNamespace,
+        plural: OBJECT_STORES_PLURAL,
+        name: config.backup.objectStore,
+      })) as CnpgObjectStore;
+    } catch (err) {
+      if (isNotFound(err)) {
+        throw new NotConfiguredError(
+          `the ObjectStore ${config.backup.objectStore} is not in ${config.databaseNamespace}, ` +
+            "so drigodb cannot tell which bucket to purge",
+        );
+      }
+      throw err;
+    }
+    const configuration = store.spec?.configuration;
+    const s3 = configuration?.s3Credentials;
+    const accessKeyId = s3?.accessKeyId;
+    const secretAccessKey = s3?.secretAccessKey;
+    // Everything checked, because the alternative is a Job whose environment is
+    // half-built: boto3 with no key falls back to looking for instance metadata
+    // and hangs, and an empty destination path is a prefix at the bucket root.
+    if (
+      !configuration?.destinationPath ||
+      !accessKeyId?.name ||
+      !accessKeyId?.key ||
+      !secretAccessKey?.name ||
+      !secretAccessKey?.key
+    ) {
+      throw new NotConfiguredError(
+        `the ObjectStore ${config.backup.objectStore} has no destinationPath and s3Credentials, ` +
+          "which is the only configuration drigodb supports purging against",
+      );
+    }
+    return {
+      destinationPath: configuration.destinationPath,
+      ...(configuration.endpointURL ? { endpointUrl: configuration.endpointURL } : {}),
+      accessKeyId: { name: accessKeyId.name, key: accessKeyId.key },
+      secretAccessKey: { name: secretAccessKey.name, key: secretAccessKey.key },
+      ...(s3?.region?.name && s3.region.key
+        ? { region: { name: s3.region.name, key: s3.region.key } }
+        : {}),
+    };
+  }
+
+  // Found by drigodb's own label rather than Kubernetes' `job-name`, which has
+  // been deprecated since 1.27 with two spellings currently in use.
+  private async purgeLog(id: string): Promise<string> {
+    const pods = await this.core.listNamespacedPod({
+      namespace: config.databaseNamespace,
+      labelSelector: `${OPERATION_LABEL}=${PURGE_OPERATION},${DB_ID_LABEL}=${id}`,
+    });
+    const name = pods.items?.[0]?.metadata?.name;
+    if (!name) return "";
+    try {
+      return await this.core.readNamespacedPodLog({
+        name,
+        namespace: config.databaseNamespace,
+      });
+    } catch {
+      // A log that cannot be read must not turn a successful purge into a 500 on
+      // its own — the caller finds out from the missing summary instead, which
+      // says the same thing more precisely.
+      return "";
     }
   }
 

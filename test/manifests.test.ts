@@ -476,3 +476,149 @@ describe("archive generations", () => {
     expect(b2.metadata.labels["drigodb.io/archive-generation"]).toBe("2");
   });
 });
+
+// The Job that empties a deleted database's archive (#135).
+//
+// Every assertion here is about something the API process is deliberately unable
+// to do: it has no bucket credential and no S3 client, so the whole operation is
+// a pod specification and the specification is the only place it can be wrong.
+describe("the archive purge Job", () => {
+  afterEach(() => { vi.unstubAllEnvs(); vi.resetModules(); });
+
+  const STORE = {
+    destinationPath: "s3://drigodb-backups-fra1/",
+    endpointUrl: "https://fra1.digitaloceanspaces.com",
+    accessKeyId: { name: "drigodb-backup-credentials", key: "access_key" },
+    secretAccessKey: { name: "drigodb-backup-credentials", key: "secret_key" },
+  };
+
+  async function withPurge() {
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_BACKUP_OBJECT_STORE", "drigodb-api-backups");
+    vi.stubEnv("DRIGODB_ARCHIVE_PURGE_CONFIGMAP", "drigodb-api-archive-purge");
+    vi.stubEnv("DRIGODB_BACKUP_PURGE_IMAGE", "ghcr.io/example/sidecar:v9");
+    return await import("../src/k8s/manifests.js");
+  }
+
+  type PurgeJob = {
+    spec: {
+      backoffLimit: number;
+      activeDeadlineSeconds: number;
+      template: {
+        metadata: { labels: Record<string, string> };
+        spec: {
+          restartPolicy: string;
+          automountServiceAccountToken: boolean;
+          containers: Array<{
+            image: string;
+            command: string[];
+            env: Array<{
+              name: string;
+              value?: string;
+              valueFrom?: { secretKeyRef: { name: string; key: string } };
+            }>;
+            volumeMounts: Array<{ name: string; mountPath: string }>;
+          }>;
+          volumes: Array<{ name: string; configMap: { name: string; defaultMode: number } }>;
+        };
+      };
+    };
+  };
+
+  const envOf = (job: PurgeJob) =>
+    Object.fromEntries(
+      job.spec.template.spec.containers[0]!.env.map((e) => [e.name, e]),
+    ) as Record<string, { value?: string; valueFrom?: { secretKeyRef: { name: string; key: string } } }>;
+
+  it("runs the mounted script on the sidecar image, because that image has no shell", async () => {
+    // Distroless: there is no /bin/sh in plugin-barman-cloud-sidecar, so a shell
+    // one-liner would exec-fail with "no such file or directory" and nothing in a
+    // mocked test would notice. The interpreter path and the mount path have to
+    // agree with the ConfigMap the chart renders.
+    const m = await withPurge();
+    const job = m.buildPurgeJob(ID, STORE, { dryRun: false }) as unknown as PurgeJob;
+    const container = job.spec.template.spec.containers[0]!;
+    expect(container.image).toBe("ghcr.io/example/sidecar:v9");
+    expect(container.command).toEqual(["/venv/bin/python", "/opt/drigodb/purge-archive.py"]);
+    expect(container.volumeMounts[0]!.mountPath).toBe("/opt/drigodb");
+    expect(job.spec.template.spec.volumes[0]!.configMap.name).toBe("drigodb-api-archive-purge");
+  });
+
+  it("passes the credential by reference and never by value", async () => {
+    // The property this whole design exists to keep. A literal key in the env
+    // would mean the control plane read the Secret, which is the thing it must
+    // not be able to do — and it would then be in a Job spec anyone with list
+    // rights in the namespace can read.
+    const m = await withPurge();
+    const env = envOf(m.buildPurgeJob(ID, STORE, { dryRun: false }) as unknown as PurgeJob);
+    expect(env.AWS_ACCESS_KEY_ID!.value).toBeUndefined();
+    expect(env.AWS_ACCESS_KEY_ID!.valueFrom?.secretKeyRef).toEqual({
+      name: "drigodb-backup-credentials",
+      key: "access_key",
+    });
+    expect(env.AWS_SECRET_ACCESS_KEY!.valueFrom?.secretKeyRef.key).toBe("secret_key");
+    expect(env.DRIGODB_DESTINATION_PATH!.value).toBe("s3://drigodb-backups-fra1/");
+    expect(env.DRIGODB_ENDPOINT_URL!.value).toBe("https://fra1.digitaloceanspaces.com");
+    expect(env.DRIGODB_SERVER_NAME!.value).toBe(`db-${ID}`);
+  });
+
+  it("sets both region variables, or neither", async () => {
+    // boto3 reads AWS_DEFAULT_REGION, and its newer releases read AWS_REGION.
+    // Setting one and being wrong about which shows up as a signature mismatch
+    // against a store that cares about the region, which does not look like a
+    // missing region at all.
+    const m = await withPurge();
+    const without = envOf(m.buildPurgeJob(ID, STORE, { dryRun: false }) as unknown as PurgeJob);
+    expect(without).not.toHaveProperty("AWS_REGION");
+    expect(without).not.toHaveProperty("AWS_DEFAULT_REGION");
+    const with_ = envOf(
+      m.buildPurgeJob(
+        ID,
+        { ...STORE, region: { name: "drigodb-backup-credentials", key: "region" } },
+        { dryRun: false },
+      ) as unknown as PurgeJob,
+    );
+    expect(with_.AWS_REGION!.valueFrom?.secretKeyRef.key).toBe("region");
+    expect(with_.AWS_DEFAULT_REGION!.valueFrom?.secretKeyRef.key).toBe("region");
+  });
+
+  it("carries the dry run as the script reads it", async () => {
+    const m = await withPurge();
+    const dry = envOf(m.buildPurgeJob(ID, STORE, { dryRun: true }) as unknown as PurgeJob);
+    expect(dry.DRIGODB_DRY_RUN!.value).toBe("1");
+    const wet = envOf(m.buildPurgeJob(ID, STORE, { dryRun: false }) as unknown as PurgeJob);
+    expect(wet.DRIGODB_DRY_RUN!.value).toBe("");
+  });
+
+  it("runs exactly one pod, so there is exactly one log to answer from", async () => {
+    // backoffLimit above zero would retry behind a pod that has already been
+    // replaced, and the endpoint reads a pod's log to say what was removed. It
+    // would then report on an attempt that is not the one that ran.
+    const m = await withPurge();
+    const job = m.buildPurgeJob(ID, STORE, { dryRun: false }) as unknown as PurgeJob;
+    expect(job.spec.backoffLimit).toBe(0);
+    expect(job.spec.template.spec.restartPolicy).toBe("Never");
+    expect(job.spec.template.spec.automountServiceAccountToken).toBe(false);
+  });
+
+  it("labels the pod with drigodb's own operation label, not Kubernetes' job-name", async () => {
+    // `job-name` has been deprecated since 1.27 in favour of
+    // `batch.kubernetes.io/job-name` and both are currently applied, so selecting
+    // on either is a bet on which one survives. This label is set in the pod
+    // template and cannot be taken away.
+    const m = await withPurge();
+    const job = m.buildPurgeJob(ID, STORE, { dryRun: false }) as unknown as PurgeJob;
+    expect(job.spec.template.metadata.labels[m.OPERATION_LABEL]).toBe(m.PURGE_OPERATION);
+    expect(job.spec.template.metadata.labels[DB_ID_LABEL]).toBe(ID);
+  });
+
+  it("gives up rather than holding the only name a retry can use", async () => {
+    // The name is derived from the id so a retry can find and clear the previous
+    // attempt. A Job with no deadline against an unreachable endpoint would hold
+    // that name until an operator noticed.
+    const m = await withPurge();
+    const job = m.buildPurgeJob(ID, STORE, { dryRun: false }) as unknown as PurgeJob;
+    expect(job.spec.activeDeadlineSeconds).toBe(300);
+    expect(m.purgeJobName(ID)).toBe(`purge-db-${ID}`);
+  });
+});
