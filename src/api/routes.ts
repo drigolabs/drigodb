@@ -9,6 +9,7 @@ import {
   DeletionInFlightError,
   NotConfiguredError,
   validateHighAvailability,
+  validateHighAvailabilityChange,
   validateRestoreFrom,
   validateRestoreInPlace,
   ValidationError,
@@ -115,6 +116,28 @@ export function buildRoutes(provisioner: Provisioner): Hono {
 
   // Take a backup now. 202, because the operator does the work — this returns
   // once the request exists, which is the only thing that has actually happened.
+  // Adding a standby to a database that already exists, or removing one.
+  //
+  // The decision to want high availability usually arrives after the database
+  // does — an application gets real users, and by then its database exists
+  // (#110). Both directions, because removing a standby destroys only the
+  // standby's volume: the primary holds everything, so nothing is lost, and a
+  // caller who could turn it on but not off would rightly ask why.
+  app.post("/v1/databases/:id/high-availability", async (c) => {
+    let enabled: boolean;
+    try {
+      enabled = validateHighAvailabilityChange(await c.req.json().catch(() => null));
+    } catch (err) {
+      if (err instanceof ValidationError) return c.json({ error: err.message }, 400);
+      throw err;
+    }
+    // 202: turning it ON clones the standby from the live primary, which takes as
+    // long as a base backup of the database. Poll `standby` — it reads
+    // `provisioning` for the duration, which is the whole reason that value
+    // exists.
+    return c.json(await provisioner.setHighAvailability(c.req.param("id"), enabled), 202);
+  });
+
   // Restoring OVER a database, keeping its id and its URI.
   //
   // The destructive twin of `restore_from` on create, which makes a new database

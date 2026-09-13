@@ -19,6 +19,7 @@ import {
   ResizeRefusedError,
   ValidationError,
   validateHighAvailability,
+  validateHighAvailabilityChange,
   validateRestoreFrom,
   validateRestoreInPlace,
   validateTier,
@@ -1133,5 +1134,127 @@ describe("restore in place destroys nothing before it validates", () => {
       provisioner.restoreInPlace("ffffffffffff", { backupId: "bk-1" }),
     ).rejects.toThrow(NFE);
     expect(acted).toEqual([]);
+  });
+});
+
+describe("adding a standby to a database that already exists", () => {
+  // readyPods defaults to instances: the states that matter here differ in how
+  // many pods are actually up, not only in the phase string. A clone in progress
+  // is instances: 2 with ONE ready pod — claiming two would be a state that
+  // cannot exist, and the code is right to call that `ready` whatever the phase
+  // says.
+  function clusterAt(instances: number, phase = "Cluster in healthy state", readyPods = instances) {
+    const notFound = () => Object.assign(new Error("not found"), { code: 404 });
+    const patched: Array<Record<string, unknown>> = [];
+    const spec: Record<string, unknown> = {
+      instances,
+      ...(instances > 1
+        ? { postgresql: { synchronous: { method: "any", number: 1, dataDurability: "preferred" } } }
+        : {}),
+    };
+    const objectsApi = {
+      getNamespacedCustomObject: async () => ({
+        metadata: {
+          name: `db-${ID}`,
+          labels: {
+            "drigodb.io/database-id": ID,
+            "drigodb.io/external-id": EXT,
+            "drigodb.io/tier": "small",
+          },
+        },
+        spec,
+        status: { phase, readyInstances: instances },
+      }),
+      listNamespacedCustomObject: async () => ({ items: [] }),
+      patchNamespacedCustomObject: async (req: { body: Record<string, unknown> }) => {
+        patched.push(req.body);
+        return {};
+      },
+    };
+    const core = {
+      listNamespacedPod: async (req: { labelSelector: string }) => ({
+        items: Array.from(
+          { length: req.labelSelector.includes("instanceRole=primary") ? 1 : readyPods },
+          () => ({ status: { conditions: [{ type: "Ready", status: "True" }] } }),
+        ),
+      }),
+      listNamespacedPersistentVolumeClaim: async () => ({ items: [] }),
+    };
+    const net = { createNamespacedNetworkPolicy: async () => ({}) };
+    const batch = { readNamespacedJob: async () => { throw notFound(); } };
+    return {
+      patched,
+      provisioner: new Provisioner(
+        {} as never, core as never, net as never, batch as never, objectsApi as never,
+      ),
+    };
+  }
+
+  it("refuses a body that does not say which way", () => {
+    for (const bad of [null, {}, { enabled: "true" }, { enabled: 1 }, "yes"]) {
+      expect(() => validateHighAvailabilityChange(bad)).toThrow(ValidationError);
+    }
+    expect(validateHighAvailabilityChange({ enabled: true })).toBe(true);
+    expect(validateHighAvailabilityChange({ enabled: false })).toBe(false);
+  });
+
+  it("patches instances and the synchronous posture when turning it on", async () => {
+    const { provisioner, patched } = clusterAt(1);
+    await provisioner.setHighAvailability(ID, true);
+    expect(patched).toHaveLength(1);
+    const spec = (patched[0] as { spec: { instances: number; postgresql: { synchronous: unknown } } }).spec;
+    expect(spec.instances).toBe(2);
+    // Rendered by buildCluster, so it cannot drift from what create() would set.
+    expect(spec.postgresql.synchronous).toEqual({
+      method: "any",
+      number: 1,
+      dataDurability: "preferred",
+    });
+  });
+
+  it("sets synchronous to NULL when turning it off, not absent", async () => {
+    // A merge patch only removes a key when it is explicitly null. Absent leaves
+    // what is there — a primary waiting on a standby that no longer exists, which
+    // is harmless under dataDurability `preferred` and a write outage the moment
+    // anybody changes that to `required`.
+    const { provisioner, patched } = clusterAt(2);
+    await provisioner.setHighAvailability(ID, false);
+    const spec = (patched[0] as { spec: { instances: number; postgresql: { synchronous: unknown } } }).spec;
+    expect(spec.instances).toBe(1);
+    expect(spec.postgresql.synchronous).toBeNull();
+  });
+
+  it("patches nothing when it is already in the state asked for", async () => {
+    // Asking twice while a clone is running must not start a second one.
+    const on = clusterAt(2);
+    await on.provisioner.setHighAvailability(ID, true);
+    expect(on.patched).toEqual([]);
+    const off = clusterAt(1);
+    await off.provisioner.setHighAvailability(ID, false);
+    expect(off.patched).toEqual([]);
+  });
+
+  it("reports the standby as provisioning while the clone runs", async () => {
+    // The distinction #110 turns on: being BUILT is not the same as having died,
+    // and a clone of a real database takes minutes.
+    // instances: 2 desired, one pod up, and CloudNativePG saying why.
+    const { provisioner } = clusterAt(2, "Creating a new replica", 1);
+    const db = await provisioner.setHighAvailability(ID, true);
+    expect(db.standby).toBe("provisioning");
+  });
+
+  it("does not call it provisioning once the cluster is healthy again", async () => {
+    const { provisioner } = clusterAt(2);
+    const db = await provisioner.setHighAvailability(ID, true);
+    expect(db.standby).toBe("ready");
+  });
+
+  it("does not call a standby that simply died provisioning", async () => {
+    // One pod up and NO clone running. This is the `unavailable` case, and
+    // calling it `provisioning` would tell a caller to wait for something nobody
+    // is doing.
+    const { provisioner } = clusterAt(2, "Cluster in healthy state", 1);
+    const db = await provisioner.setHighAvailability(ID, true);
+    expect(db.standby).toBe("unavailable");
   });
 });
