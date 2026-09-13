@@ -29,7 +29,7 @@ jobs:
     name: typecheck and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -62,7 +62,7 @@ jobs:
     # rather than hours, not because the job is expected to approach it.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # kubectl, helm and docker are already on ubuntu-latest — this repository
       # already builds images on these runners. kind is the only addition, and it
@@ -187,7 +187,7 @@ jobs:
     # 90-second Helm timeout. The ceiling is here so a hang costs minutes.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install kind
         run: |
           curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
@@ -226,7 +226,7 @@ jobs:
     name: diagrams render
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -246,7 +246,7 @@ jobs:
     name: api image builds
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
