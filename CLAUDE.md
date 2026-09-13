@@ -134,6 +134,18 @@ no tag at all and its repositories vanished from Docker Hub, breaking every
 branch; and `appVersion` sat four releases behind its own chart, so a documented
 install could never become ready.
 
+**It then did it again, and the cause is worth knowing: `prConcurrentLimit` is
+global.** With three ordinary dependency bumps open, Renovate planned the promotion
+branch and never created its pull request — so `appVersion` sat SIX releases behind
+while every other pin moved, and the install instructions pointed at a build with none
+of that work in it. Nothing reported a problem, because nothing was broken: a PR that
+was never opened looks exactly like a pin that is up to date.
+
+The promotion rule carries `prPriority: 10` for that reason. If this recurs, the
+question to ask is not whether Renovate is working — it was, and a local
+`renovate --platform=local --dry-run=lookup` shows the update in the flattened list —
+but whether its pull request can be created at all.
+
 ## Comments
 
 The repo is heavily commented and the comments explain *why* — the failure that

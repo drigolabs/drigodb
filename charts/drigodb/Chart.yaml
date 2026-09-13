@@ -21,7 +21,7 @@ version: 0.1.0
 # noticed because every path that runs regularly overrides the image: CI builds
 # :dev from the tree, and kind-up.sh does the same. The only caller using this
 # value is a person following the instructions.
-appVersion: "0.16.3"
+appVersion: "0.23.0"
 home: https://github.com/drigolabs/drigodb
 sources:
   - https://github.com/drigolabs/drigodb
