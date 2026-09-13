@@ -112,12 +112,18 @@ A bucket cannot tell a live prefix from an orphan.
 
 ## Finding orphans
 
-The purge takes an id. It does not discover which ids are orphaned, and a policy
-component that deletes databases already knows — so the gap is only for archives
-nobody has a record of, like the 14 measured above.
+`GET /v1/archives` answers this now. It reports every prefix in the bucket with its
+size and its state — `live`, `superseded`, `orphaned` or `foreign` — and
+`reclaimable_bytes` for the orphaned ones. That is the number this document was
+written to say nobody could see.
 
-The prefixes are named after the database, so they are identifiable without
-drigodb. What is live is what has a `Cluster`:
+```
+curl -H "Authorization: Bearer $TOKEN" "$DRIGODB/v1/archives"
+```
+
+By hand, without drigodb, the same question is two lists compared. Worth knowing for
+an installation whose API is down, and it is where the `superseded` distinction came
+from:
 
 ```
 # Every prefix in the bucket

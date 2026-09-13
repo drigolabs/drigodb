@@ -33,7 +33,10 @@ import {
   OBJECT_STORES_PLURAL,
   OPERATION_LABEL,
   PURGE_OPERATION,
+  buildArchiveListJob,
   buildPurgeJob,
+  listJobName,
+  LIST_OPERATION,
   purgeJobName,
   type ArchiveStore,
   CNPG_ARCHIVING_CONDITION,
@@ -481,6 +484,77 @@ function parsePurgeSummary(log: string): Omit<ArchivePurge, "id"> | undefined {
   return undefined;
 }
 
+// One prefix, against the set of live databases and the generation each is archiving
+// to now.
+//
+// The name is the whole input: `db-<12 hex>` is generation 0 and `db-<12 hex>-rN` is
+// generation N, which is exactly what archiveServerName builds. Anything else was not
+// written by drigodb.
+const ARCHIVE_PREFIX_RE = /^db-([0-9a-f]{12})(?:-r([1-9][0-9]*))?$/;
+
+function classifyArchive(
+  a: { name: string; prefix: string; objects: number; bytes: number },
+  live: Map<string, number>,
+): Archive {
+  const base = { prefix: a.prefix, objects: a.objects, bytes: a.bytes };
+  const m = ARCHIVE_PREFIX_RE.exec(a.name);
+  if (!m) return { ...base, state: "foreign" };
+  const id = m[1] as string;
+  const generation = m[2] ? Number.parseInt(m[2], 10) : 0;
+  const current = live.get(id);
+  // `has` rather than a truthiness check on the generation: generation 0 is the
+  // common case and is falsy, so `if (current)` would report every un-restored live
+  // database's archive as orphaned — and offer it for deletion.
+  if (!live.has(id)) return { ...base, database_id: id, generation, state: "orphaned" };
+  return {
+    ...base,
+    database_id: id,
+    generation,
+    state: current === generation ? "live" : "superseded",
+  };
+}
+
+function parseArchiveList(log: string):
+  | { archives: Array<{ name: string; prefix: string; objects: number; bytes: number }>;
+      objects: number;
+      bytes: number;
+      truncated: boolean }
+  | undefined {
+  // Matched on its own fields, for the same reason parsePurgeSummary is: barman and
+  // boto3 log to stderr, the container merges the streams, and nothing says where in
+  // the result the script's one line of stdout lands.
+  for (const line of log.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    const p = parsed as {
+      root?: unknown;
+      archives?: unknown;
+      objects?: number;
+      bytes?: number;
+      truncated?: unknown;
+    };
+    if (typeof p.root !== "string" || !Array.isArray(p.archives)) continue;
+    return {
+      archives: p.archives as Array<{
+        name: string;
+        prefix: string;
+        objects: number;
+        bytes: number;
+      }>,
+      objects: p.objects ?? 0,
+      bytes: p.bytes ?? 0,
+      truncated: p.truncated === true,
+    };
+  }
+  return undefined;
+}
+
 // The end of a log, for an error message. The end rather than the start: a purge
 // that failed says why last — a Python traceback ends with the exception, and
 // botocore's retries put everything that is not the reason in front of it.
@@ -536,6 +610,50 @@ export interface ArchivePurge {
   // The purge reached the generation bound with objects still under it, so there
   // may be more above it. Reported rather than swallowed: a caller that believes
   // an archive is gone when it is not would stop retrying.
+  truncated: boolean;
+}
+
+// What an archive prefix is, once the bucket and the Clusters are read together.
+//
+// Neither side can say this alone. The bucket knows `db-a1b2c3d4e5f6-r1/` exists; only
+// Kubernetes knows whether a1b2c3d4e5f6 still has a database and which generation it
+// is archiving to now.
+export type ArchiveState =
+  // The working archive of a live database. Its backups and its recovery window.
+  | "live"
+  // A live database's history from BEFORE an in-place restore. Not garbage — it is
+  // what makes a pre-restore backup restorable at all (docs/restore-in-place.md) —
+  // and deliberately not purgeable, because the purge endpoint refuses any id that
+  // still has a Cluster. Removing it is a decision about whether that history is
+  // still wanted, which is a different operation nobody has asked for yet.
+  | "superseded"
+  // No Cluster for this id. The only state the purge acts on, and the only bytes
+  // reported as reclaimable.
+  | "orphaned"
+  // Not shaped like a drigodb archive at all. Reported so an operator can see the
+  // whole bucket, and never offered for purging: drigodb did not write it and has no
+  // business deciding it is expendable. Real buckets have these — `probe-server/`
+  // from a connectivity check is in one right now.
+  | "foreign";
+
+export interface Archive {
+  prefix: string;
+  // Absent for a foreign prefix, because there is no id to have.
+  database_id?: string;
+  generation?: number;
+  state: ArchiveState;
+  objects: number;
+  bytes: number;
+}
+
+export interface ArchiveListing {
+  archives: Archive[];
+  objects: number;
+  bytes: number;
+  // Orphaned bytes only. The number the question is actually asked for: a total over
+  // every prefix includes every live database's working archive and answers nothing
+  // about what can be reclaimed.
+  reclaimable_bytes: number;
   truncated: boolean;
 }
 
@@ -1906,12 +2024,7 @@ export class Provisioner {
         "backups are not configured for this installation, so there is no archive to purge",
       );
     }
-    if (!config.backup.purgeScriptConfigMap) {
-      throw new NotConfiguredError(
-        "DRIGODB_ARCHIVE_PURGE_CONFIGMAP is not set, so there is no purge program to run; " +
-          "the chart sets it whenever backups are configured",
-      );
-    }
+    this.assertArchiveToolsPresent();
 
     // The guard the whole endpoint exists behind, and it is `has a Cluster`
     // rather than `has a running pod` on purpose: a hibernated database has no
@@ -1923,44 +2036,130 @@ export class Provisioner {
     }
 
     const store = await this.archiveStore();
-    const name = purgeJobName(id);
+    const summary = await this.runArchiveJob({
+      name: purgeJobName(id),
+      operation: PURGE_OPERATION,
+      id,
+      body: buildPurgeJob(id, store, opts),
+      what: `the purge of ${id}`,
+      parse: parsePurgeSummary,
+    });
+    return { id, ...summary };
+  }
 
-    // Clear the previous attempt before starting another.
-    //
-    // Foreground propagation, not Background: the endpoint answers by reading one
-    // pod's log, and with Background the old Job is gone from the API while its
-    // pod is still in the namespace wearing the same labels. Waiting for the Job
-    // to disappear then also means waiting for the pod.
+
+  // What is actually in the bucket, and which of it belongs to a database that
+  // still exists (#23).
+  //
+  // The other half of the purge. `POST /v1/archives/{id}/purge` takes an id, and
+  // until this existed nothing could tell anyone which ids to give it: an archive
+  // whose database was deleted has no Cluster and no Backup objects, so neither
+  // `GET /v1/databases` nor `GET /v1/databases/{id}/backups` can see it. Measured at
+  // 14 prefixes and 155 MiB in one real bucket, invisible to every other endpoint.
+  //
+  // The classification is the part only drigodb can do, and it is why this is not
+  // just a bucket listing an operator could do with `mc`: it needs the bucket AND
+  // the Clusters, and nothing else holds both.
+  async listArchives(): Promise<ArchiveListing> {
+    if (!backupsEnabled()) {
+      throw new NotConfiguredError(
+        "backups are not configured for this installation, so there are no archives",
+      );
+    }
+    this.assertArchiveToolsPresent();
+
+    const store = await this.archiveStore();
+    const listed = await this.runArchiveJob({
+      name: listJobName(),
+      operation: LIST_OPERATION,
+      body: buildArchiveListJob(store),
+      what: "the archive listing",
+      parse: parseArchiveList,
+    });
+
+    // Every Cluster once, not one lookup per prefix. A bucket with a prefix for
+    // every database drigodb has ever hosted would otherwise be one API call per
+    // archive, most of them 404s.
+    const live = new Map<string, number>();
+    for (const cluster of await this.listClusters(`${MANAGED_BY_LABEL}=${MANAGED_BY_VALUE}`)) {
+      const id = cluster.metadata?.labels?.[DB_ID_LABEL];
+      if (id) live.set(id, archiveGenerationOf(cluster.metadata));
+    }
+
+    const archives = listed.archives.map((a) => classifyArchive(a, live));
+    const total = (state: ArchiveState) =>
+      archives.filter((a) => a.state === state).reduce((n, a) => n + a.bytes, 0);
+    return {
+      archives,
+      objects: listed.objects,
+      bytes: listed.bytes,
+      // Broken out because it is the number the question was asked for: what is
+      // being paid for that nothing is using. A total over every prefix includes
+      // every live database's working archive and answers nothing.
+      reclaimable_bytes: total("orphaned"),
+      truncated: listed.truncated,
+    };
+  }
+
+  private assertArchiveToolsPresent(): void {
+    if (!config.backup.archiveToolsConfigMap) {
+      throw new NotConfiguredError(
+        "DRIGODB_ARCHIVE_TOOLS_CONFIGMAP is not set, so there is no program to run " +
+          "against the bucket; the chart sets it whenever backups are configured",
+      );
+    }
+  }
+
+  // Create a Job, wait for it, and read the one line of summary it printed.
+  //
+  // Shared by both bucket operations because every step of it is a place to be
+  // subtly wrong in the same way twice: clearing the previous attempt with the
+  // right propagation policy, waiting the same length of time as the Job's own
+  // deadline, and telling a failed Job apart from one that succeeded without
+  // saying what it did.
+  private async runArchiveJob<T>(spec: {
+    name: string;
+    operation: string;
+    // Present for a purge, absent for a listing. The purge's pod is one of possibly
+    // many purge pods in the namespace, so its log has to be found by id as well.
+    id?: string;
+    body: V1Job;
+    what: string;
+    parse: (log: string) => T | undefined;
+  }): Promise<T> {
+    const ns = config.databaseNamespace;
+
+    // Foreground propagation, not Background: the answer comes from one pod's log,
+    // and with Background the old Job is gone from the API while its pod is still in
+    // the namespace wearing the same labels. Waiting for the Job to disappear then
+    // also means waiting for the pod.
     await this.ignoreMissing(() =>
       this.batch.deleteNamespacedJob({
-        name,
+        name: spec.name,
         namespace: ns,
         propagationPolicy: "Foreground",
       }),
     );
     for (let i = 0; i < 60; i++) {
-      if (!(await this.jobFor(name))) break;
+      if (!(await this.jobFor(spec.name))) break;
       await new Promise((r) => setTimeout(r, 1000));
     }
 
-    await this.batch.createNamespacedJob({
-      namespace: ns,
-      body: buildPurgeJob(id, store, opts),
-    });
+    await this.batch.createNamespacedJob({ namespace: ns, body: spec.body });
 
     let finished: V1Job | undefined;
     for (let i = 0; i < 300; i++) {
-      const job = await this.jobFor(name);
+      const job = await this.jobFor(spec.name);
       if ((job?.status?.succeeded ?? 0) > 0 || (job?.status?.failed ?? 0) > 0) {
         finished = job;
         break;
       }
       await new Promise((r) => setTimeout(r, 1000));
     }
-    const log = await this.purgeLog(id);
+    const log = await this.archiveJobLog(spec.operation, spec.id);
     if (!finished) {
       throw new Error(
-        `the purge of ${id} did not finish within five minutes. The Job ${name} is in ` +
+        `${spec.what} did not finish within five minutes. The Job ${spec.name} is in ` +
           `${ns}; nothing has been lost, and running this again is safe. ${tail(log)}`,
       );
     }
@@ -1968,21 +2167,46 @@ export class Provisioner {
       // The log, not the Job's status. A Job says "failed"; the script says which
       // prefix it could not read and why, and that is the difference between a
       // wrong credential and a bucket that is not there.
-      throw new Error(`the purge of ${id} failed. ${tail(log)}`);
+      throw new Error(`${spec.what} failed. ${tail(log)}`);
     }
-
-    const summary = parsePurgeSummary(log);
-    if (!summary) {
+    const parsed = spec.parse(log);
+    if (!parsed) {
       // Succeeded without saying what it did. Reported rather than answered with
-      // zeroes: "nothing to purge" and "I cannot tell you what I deleted" are
-      // different, and a caller acting on the first when the second is true would
-      // believe an archive is gone.
+      // an empty result: "there is nothing there" and "I cannot tell you what is
+      // there" are different, and a caller acting on the first when the second is
+      // true would believe a bucket is empty.
       throw new Error(
-        `the purge of ${id} reported success but printed no summary, so what it removed is ` +
+        `${spec.what} reported success but printed no summary, so its result is ` +
           `unknown. ${tail(log)}`,
       );
     }
-    return { id, ...summary };
+    return parsed;
+  }
+
+  // Found by drigodb's own operation label rather than Kubernetes' `job-name`, which
+  // has been deprecated since 1.27 with two spellings currently in use.
+  private async archiveJobLog(operation: string, id?: string): Promise<string> {
+    const selector = [
+      `${OPERATION_LABEL}=${operation}`,
+      ...(id ? [`${DB_ID_LABEL}=${id}`] : []),
+    ].join(",");
+    const pods = await this.core.listNamespacedPod({
+      namespace: config.databaseNamespace,
+      labelSelector: selector,
+    });
+    const name = pods.items?.[0]?.metadata?.name;
+    if (!name) return "";
+    try {
+      return await this.core.readNamespacedPodLog({
+        name,
+        namespace: config.databaseNamespace,
+      });
+    } catch {
+      // A log that cannot be read must not turn a successful operation into a 500
+      // on its own — the caller finds out from the missing summary instead, which
+      // says the same thing more precisely.
+      return "";
+    }
   }
 
   // The bucket a purge writes to, read from the ObjectStore the chart created.

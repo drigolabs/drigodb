@@ -1,0 +1,38 @@
+{{/*
+The two programs that reach the backup bucket, and nothing else does.
+
+Shipped as a ConfigMap rather than embedded in a Job's command because these are
+real reviewable files under charts/drigodb/files/ and not string literals inside
+TypeScript. The thing holding the bucket credential and delete rights is the one
+place a heredoc is the wrong medium.
+
+Two files, one per verb. list-archives.py cannot delete anything and purge-archive.py
+takes one id — keeping them separate keeps the program that CAN delete as small as it
+is possible to read.
+
+They run on the barman-cloud sidecar image, which has python3 and barman and no
+shell, so each Job's command is the interpreter and a path. The ConfigMap and the API
+image that names it ship in the same chart release, which is what keeps the paths and
+the environment variable names in step.
+
+In the DATABASE namespace: that is where the credential Secret and the Job are,
+and the API's Role reaches nowhere else.
+
+Rendered under the same condition as the ObjectStore. With no bucket there is nothing
+to list and nothing to purge, and a ConfigMap for operations that return 409 either
+way would just be a question to answer later.
+*/}}
+{{- if and .Values.backup.bucket .Values.backup.endpoint }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "drigodb.fullname" . }}-archive-tools
+  namespace: {{ .Values.databaseNamespace }}
+  labels:
+    {{- include "drigodb.labels" . | nindent 4 }}
+data:
+  purge-archive.py: |
+{{ .Files.Get "files/purge-archive.py" | indent 4 }}
+  list-archives.py: |
+{{ .Files.Get "files/list-archives.py" | indent 4 }}
+{{- end }}

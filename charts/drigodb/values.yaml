@@ -181,5 +181,13 @@ backup:
   # meaning there may be more above the bound and the bound is the thing to change.
   purgeMaxGenerations: 20
 
+  # How many archive prefixes `GET /v1/archives` returns.
+  #
+  # A ceiling on the answer rather than on the work. A bucket with more than this
+  # says `truncated: true` instead of returning a response nothing can read — the
+  # listing comes back through a pod's log, which is not a place to put a fleet's
+  # worth of prefixes.
+  archiveListLimit: 500
+
 nameOverride: ""
 fullnameOverride: ""
