@@ -5,7 +5,7 @@
 // itself. What is left is the part that is still drigodb's — idempotent create,
 // the lock, and the statuses a consumer polls.
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   DB_ID_LABEL,
@@ -1256,5 +1256,271 @@ describe("adding a standby to a database that already exists", () => {
     const { provisioner } = clusterAt(2, "Cluster in healthy state", 1);
     const db = await provisioner.setHighAvailability(ID, true);
     expect(db.standby).toBe("unavailable");
+  });
+});
+
+// Purging the archive of a database that no longer exists (#135).
+//
+// Nothing here can see the bucket, and that is the point of the design rather
+// than a limit of the test: the API process has no S3 client, so everything it
+// gets wrong it gets wrong in the Job it builds or in how it reads the result.
+// The part a mock cannot check — that the prefix is the one the objects are
+// actually under — is in scripts/smoke.sh, against MinIO.
+describe("archive purge", () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetModules();
+  });
+
+  const SUMMARY = JSON.stringify({
+    server_name: `db-${ID}`,
+    dry_run: false,
+    generations: [
+      { generation: 0, prefix: `db-${ID}/`, objects: 41, bytes: 700000000 },
+      { generation: 1, prefix: `db-${ID}-r1/`, objects: 9, bytes: 150000000 },
+    ],
+    objects: 50,
+    bytes: 850000000,
+    truncated: false,
+  });
+
+  // A namespace holding an ObjectStore, no Cluster unless asked for, and a Job
+  // that behaves the way the Job controller does: absent until created, and then
+  // reporting a terminal status with one pod whose log is the answer.
+  async function purgeCluster(
+    opts: { clusterExists?: boolean; log?: string; fails?: boolean; store?: unknown } = {},
+  ) {
+    vi.resetModules();
+    vi.stubEnv("DRIGODB_BACKUP_OBJECT_STORE", "drigodb-api-backups");
+    vi.stubEnv("DRIGODB_ARCHIVE_PURGE_CONFIGMAP", "drigodb-api-archive-purge");
+    const p = await import("../src/k8s/provisioner.js");
+
+    const notFound = () => Object.assign(new Error("not found"), { code: 404 });
+    const store =
+      opts.store === undefined
+        ? {
+            spec: {
+              configuration: {
+                destinationPath: "s3://drigodb-backups-fra1/",
+                endpointURL: "https://fra1.digitaloceanspaces.com",
+                s3Credentials: {
+                  accessKeyId: { name: "drigodb-backup-credentials", key: "access_key" },
+                  secretAccessKey: { name: "drigodb-backup-credentials", key: "secret_key" },
+                },
+              },
+            },
+          }
+        : opts.store;
+
+    const created: Array<{ name: string; env: Record<string, unknown> }> = [];
+    const deleted: string[] = [];
+    let jobExists = false;
+
+    const objects = {
+      getNamespacedCustomObject: async (req: { plural: string; name: string }) => {
+        if (req.plural === "clusters") {
+          if (opts.clusterExists) return { metadata: { name: req.name, labels: {} } };
+          throw notFound();
+        }
+        if (req.plural === "objectstores") {
+          if (store === null) throw notFound();
+          return store;
+        }
+        throw notFound();
+      },
+    };
+    const batch = {
+      createNamespacedJob: async (req: {
+        body: {
+          metadata: { name: string };
+          spec: { template: { spec: { containers: Array<{ env: Array<{ name: string }> }> } } };
+        };
+      }) => {
+        jobExists = true;
+        created.push({
+          name: req.body.metadata.name,
+          env: Object.fromEntries(
+            req.body.spec.template.spec.containers[0]!.env.map((e) => [e.name, e]),
+          ),
+        });
+        return req.body;
+      },
+      readNamespacedJob: async (req: { name: string }) => {
+        if (!jobExists) throw notFound();
+        return {
+          metadata: { name: req.name },
+          status: opts.fails ? { failed: 1 } : { succeeded: 1 },
+        };
+      },
+      deleteNamespacedJob: async (req: { name: string }) => {
+        deleted.push(req.name);
+        if (!jobExists) throw notFound();
+        jobExists = false;
+        return {};
+      },
+    };
+    const core = {
+      listNamespacedPod: async () => ({
+        items: jobExists ? [{ metadata: { name: `purge-db-${ID}-abcde` } }] : [],
+      }),
+      readNamespacedPodLog: async () => opts.log ?? SUMMARY,
+    };
+
+    return {
+      p,
+      created,
+      deleted,
+      provisioner: new p.Provisioner(
+        {} as never, core as never, {} as never, batch as never, objects as never,
+      ),
+    };
+  }
+
+  it("refuses an id that still has a Cluster, and starts nothing", async () => {
+    // The entire safety model. A live database's archive is its backups and its
+    // recovery window; there is no reason to reach it through this operation, and
+    // the refusal has to happen before a Job with delete rights is created.
+    const { provisioner, created, p } = await purgeCluster({ clusterExists: true });
+    await expect(provisioner.purgeArchive(ID, { dryRun: false })).rejects.toThrow(
+      p.ArchiveInUseError,
+    );
+    expect(created).toEqual([]);
+  });
+
+  it("builds the Job from the ObjectStore, not from its own environment", async () => {
+    // One bucket declared twice is two things that can disagree, and the half
+    // that is wrong here deletes objects.
+    const { provisioner, created } = await purgeCluster();
+    await provisioner.purgeArchive(ID, { dryRun: false });
+    expect(created).toHaveLength(1);
+    const job = created[0]!;
+    expect(job.name).toBe(`purge-db-${ID}`);
+    const env = job.env as Record<string, { value?: string; valueFrom?: unknown } | undefined>;
+    expect(env.DRIGODB_DESTINATION_PATH?.value).toBe("s3://drigodb-backups-fra1/");
+    expect(env.DRIGODB_ENDPOINT_URL?.value).toBe("https://fra1.digitaloceanspaces.com");
+    expect(env.AWS_ACCESS_KEY_ID?.valueFrom).toEqual({
+      secretKeyRef: { name: "drigodb-backup-credentials", key: "access_key" },
+    });
+  });
+
+  it("returns what was removed, per generation", async () => {
+    // The reason this waits instead of returning 202: a caller purging to reclaim
+    // storage wants the number, and after the database is deleted there is no
+    // resource left to poll for it.
+    const { provisioner } = await purgeCluster();
+    const result = await provisioner.purgeArchive(ID, { dryRun: false });
+    expect(result.id).toBe(ID);
+    expect(result.objects).toBe(50);
+    expect(result.bytes).toBe(850000000);
+    expect(result.generations.map((g) => g.generation)).toEqual([0, 1]);
+    expect(result.truncated).toBe(false);
+  });
+
+  it("clears the previous attempt before starting another", async () => {
+    // The Job name is derived from the id so a retry can find the attempt before
+    // it. Without the delete, create would 409 and a failed purge could never be
+    // retried through the API at all.
+    const { provisioner, deleted } = await purgeCluster();
+    await provisioner.purgeArchive(ID, { dryRun: false });
+    await provisioner.purgeArchive(ID, { dryRun: false });
+    expect(deleted).toEqual([`purge-db-${ID}`, `purge-db-${ID}`]);
+  });
+
+  it("finds the summary among log records that are themselves JSON", async () => {
+    // barman and boto3 log to stderr, the container merges the streams, and
+    // nothing puts the script's one line of stdout at either end of the result. So
+    // the summary is identified by its own fields: neither "the last line" nor
+    // "the first line that parses" is it, and structured log records parse fine.
+    const noise = [
+      '{"level":"info","msg":"starting"}',
+      JSON.stringify({
+        server_name: `db-${ID}`,
+        dry_run: true,
+        generations: [],
+        objects: 0,
+        bytes: 0,
+        truncated: false,
+      }),
+      '{"level":"info","msg":"done","objects":9999}',
+      "INFO: done",
+    ].join("\n");
+    const { provisioner } = await purgeCluster({ log: noise });
+    const result = await provisioner.purgeArchive(ID, { dryRun: true });
+    expect(result.dry_run).toBe(true);
+    expect(result.objects).toBe(0);
+  });
+
+  it("reports a success with no summary as a failure to know, not as an empty archive", async () => {
+    // "There was nothing to purge" and "I cannot tell you what I deleted" are
+    // different facts, and a caller acting on the first when the second is true
+    // would believe an archive is gone.
+    const { provisioner } = await purgeCluster({ log: "Traceback: something odd\n" });
+    await expect(provisioner.purgeArchive(ID, { dryRun: false })).rejects.toThrow(
+      /printed no summary/,
+    );
+  });
+
+  it("puts the script's own words in the error when the Job fails", async () => {
+    // A Job status says "failed". The script says which prefix it could not read
+    // and why, which is the difference between a wrong credential and a bucket
+    // that is not there.
+    const { provisioner } = await purgeCluster({
+      fails: true,
+      log: "botocore.exceptions.ClientError: An error occurred (SignatureDoesNotMatch)",
+    });
+    await expect(provisioner.purgeArchive(ID, { dryRun: false })).rejects.toThrow(
+      /SignatureDoesNotMatch/,
+    );
+  });
+
+  it("refuses when the installation has no ObjectStore to read the bucket from", async () => {
+    const { provisioner, p, created } = await purgeCluster({ store: null });
+    await expect(provisioner.purgeArchive(ID, { dryRun: false })).rejects.toThrow(
+      p.NotConfiguredError,
+    );
+    expect(created).toEqual([]);
+  });
+
+  it("refuses an ObjectStore with no credential rather than running boto3 without one", async () => {
+    // boto3 with no key falls back to looking for instance metadata and hangs
+    // until the Job's deadline, which looks like a slow bucket rather than a
+    // misconfiguration.
+    const { provisioner, p, created } = await purgeCluster({
+      store: { spec: { configuration: { destinationPath: "s3://b/" } } },
+    });
+    await expect(provisioner.purgeArchive(ID, { dryRun: false })).rejects.toThrow(
+      p.NotConfiguredError,
+    );
+    expect(created).toEqual([]);
+  });
+});
+
+describe("archive purge validation", () => {
+  it("requires the id itself as confirmation", async () => {
+    const p = await import("../src/k8s/provisioner.js");
+    expect(() => p.validateArchivePurge(ID, {})).toThrow(p.ValidationError);
+    expect(() => p.validateArchivePurge(ID, { confirm: true })).toThrow(p.ValidationError);
+    expect(() => p.validateArchivePurge(ID, { confirm: "b2c3d4e5f6a1" })).toThrow(
+      p.ValidationError,
+    );
+    expect(p.validateArchivePurge(ID, { confirm: ID })).toEqual({ dryRun: false });
+  });
+
+  it("rejects an id that is not a drigodb id, because the id becomes a bucket prefix", async () => {
+    // Every other endpoint looks for a Cluster and 404s. This one's precondition
+    // is that there is no Cluster, so the id goes straight into an object-storage
+    // prefix and a malformed one is somebody else's data.
+    const p = await import("../src/k8s/provisioner.js");
+    for (const bad of ["", "..", "a1b2c3d4e5f", "A1B2C3D4E5F6", "a1b2c3d4e5f6x", "*"]) {
+      expect(() => p.validateArchivePurge(bad, { confirm: bad })).toThrow(p.ValidationError);
+    }
+  });
+
+  it("takes a dry run, and only as a boolean", async () => {
+    const p = await import("../src/k8s/provisioner.js");
+    expect(p.validateArchivePurge(ID, { confirm: ID, dry_run: true })).toEqual({ dryRun: true });
+    expect(() => p.validateArchivePurge(ID, { confirm: ID, dry_run: "yes" })).toThrow(
+      p.ValidationError,
+    );
   });
 });

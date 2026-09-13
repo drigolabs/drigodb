@@ -1,13 +1,15 @@
-// HTTP surface. Nine operations, designed against one real consumer.
+// HTTP surface. Designed against one real consumer.
 
 import { Hono } from "hono";
 
 import {
+  ArchiveInUseError,
   NotFoundError,
   ResizeRefusedError,
   Provisioner,
   DeletionInFlightError,
   NotConfiguredError,
+  validateArchivePurge,
   validateHighAvailability,
   validateHighAvailabilityChange,
   validateRestoreFrom,
@@ -179,6 +181,34 @@ export function buildRoutes(provisioner: Provisioner): Hono {
     return c.body(null, 204);
   });
 
+  // Not /v1/databases/{id}/…, and the path is the argument.
+  //
+  // An archive whose database is gone is not a sub-resource of that database:
+  // there is nothing at /v1/databases/{id} to hang it off, and a POST under a
+  // path that 404s everywhere else would read as a bug. It is a different kind of
+  // thing — the last object a deleted database left — and it gets its own noun.
+  //
+  // A dry run is offered because this is irreversible, and because it is the only
+  // way a caller can see what is in a prefix at all: drigodb does not list
+  // buckets, and after the database is deleted there are no Backup objects left
+  // to read either.
+  app.post("/v1/archives/:id/purge", async (c) => {
+    const id = c.req.param("id");
+    let opts: { dryRun: boolean };
+    try {
+      const body = await c.req.json().catch(() => null);
+      opts = validateArchivePurge(id, body);
+    } catch (err) {
+      if (err instanceof ValidationError) return c.json({ error: err.message }, 400);
+      throw err;
+    }
+    // 200, not 202: this one waits. A purge is list calls and batch deletes, and
+    // what it removed is the answer the caller asked for — a job id it has to
+    // come back for would make reclaiming storage a two-step conversation with
+    // nothing to poll, since there is no database left to report status on.
+    return c.json(await provisioner.purgeArchive(id, opts));
+  });
+
   app.onError((err, c) => {
     if (err instanceof NotFoundError) return c.json({ error: err.message }, 404);
     if (err instanceof ValidationError) return c.json({ error: err.message }, 400);
@@ -191,6 +221,10 @@ export function buildRoutes(provisioner: Provisioner): Hono {
     // 409, not 500: the id is briefly taken by a database on its way out. The
     // caller has done nothing wrong and a retry in a few seconds succeeds.
     if (err instanceof DeletionInFlightError) return c.json({ error: err.message }, 409);
+    // 409, not 404: the archive is there and so is its database, which is exactly
+    // why the purge was refused. A 404 would send the caller looking for the
+    // archive instead of at the database still using it.
+    if (err instanceof ArchiveInUseError) return c.json({ error: err.message }, 409);
     console.error("[drigodb] unhandled error:", err);
     return c.json({ error: "internal error" }, 500);
   });

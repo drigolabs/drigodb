@@ -1,0 +1,32 @@
+{{/*
+The program that empties an orphaned database's archive, and nothing else.
+
+Shipped as a ConfigMap rather than embedded in the Job's command because it is a
+real reviewable file — charts/drigodb/files/purge-archive.py — and not a string
+literal inside TypeScript. The thing holding the bucket credential and delete
+rights is the one place a heredoc is the wrong medium.
+
+It runs on the barman-cloud sidecar image, which has python3 and barman and no
+shell, so the Job's command is the interpreter and this path. The ConfigMap and
+the API image that names it ship in the same chart release, which is what keeps
+the path and the environment variable names in step.
+
+In the DATABASE namespace: that is where the credential Secret and the Job are,
+and the API's Role reaches nowhere else.
+
+Rendered under the same condition as the ObjectStore. With no bucket there is no
+archive to purge, and a ConfigMap for an operation that returns 409 either way
+would just be a question to answer later.
+*/}}
+{{- if and .Values.backup.bucket .Values.backup.endpoint }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "drigodb.fullname" . }}-archive-purge
+  namespace: {{ .Values.databaseNamespace }}
+  labels:
+    {{- include "drigodb.labels" . | nindent 4 }}
+data:
+  purge-archive.py: |
+{{ .Files.Get "files/purge-archive.py" | indent 4 }}
+{{- end }}

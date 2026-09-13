@@ -66,6 +66,16 @@ spec:
             # control plane never talks to object storage.
             - name: DRIGODB_BACKUP_OBJECT_STORE
               value: {{ include "drigodb.objectStoreName" . | quote }}
+            # What a purge runs, and where its program is. Still no bucket, no
+            # endpoint and no credential: the purge Job reads those out of the
+            # ObjectStore and mounts the Secret the ObjectStore names, so the
+            # control plane passes references it cannot itself resolve.
+            - name: DRIGODB_BACKUP_PURGE_IMAGE
+              value: {{ .Values.backup.purgeImage | quote }}
+            - name: DRIGODB_ARCHIVE_PURGE_CONFIGMAP
+              value: {{ include "drigodb.fullname" . }}-archive-purge
+            - name: DRIGODB_ARCHIVE_PURGE_MAX_GENERATIONS
+              value: {{ .Values.backup.purgeMaxGenerations | quote }}
             {{- end }}
             - name: DRIGODB_TLS_CA_SECRET
               value: {{ include "drigodb.caSecret" . | quote }}
