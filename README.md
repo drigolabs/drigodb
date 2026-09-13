@@ -351,6 +351,37 @@ A backup belongs to the database it was taken from, and drigodb refuses a
 `restore_from` that names someone else's — otherwise any backup in the
 installation could be read by guessing its id.
 
+### Tokens
+
+```
+POST   /v1/tokens        { name, tier?, expires_in? }   → 201, the token, once
+GET    /v1/tokens        metadata only
+DELETE /v1/tokens/{id}   revoke
+```
+
+A token is a Kubernetes Secret holding a **SHA-256 hash and never the token**. The raw
+value is in the creating response and nowhere else, ever again — the same contract
+`connection_uri` has, and for the same reason. drigodb could not show it to you twice
+if it wanted to.
+
+`tier` is `admin` or `tenant`, and defaults to **tenant**: a token that does not ask
+for the power to issue more does not get it. Only an admin token may call these three
+endpoints at all.
+
+`DRIGODB_API_TOKEN` is still what the chart supplies and is now the **bootstrap admin
+token** — the pre-existing trust that mints the rest, because to call the API you need
+a token and to get a token you call the API. It is listed by `GET /v1/tokens` as
+`bootstrap: true` and cannot be revoked through the API: it is the installation's, not
+drigodb's. Remove it from the deployment once you have issued your own.
+
+A revoked or expired token stops working within **five seconds** — the authentication
+cache's TTL, chosen so that authenticating does not require an API round trip per
+request. Written down rather than papered over.
+
+Databases are not yet scoped to the token that created them; every valid token still
+sees every database. That is [#72](https://github.com/drigolabs/drigodb/issues/72),
+and it is what makes this a fourth isolation layer rather than a third and a half.
+
 ### Seeing what is in the backup bucket
 
 ```

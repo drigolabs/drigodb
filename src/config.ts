@@ -15,17 +15,6 @@ function positiveOr(name: string, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
-function required(name: string): string {
-  const v = process.env[name];
-  if (!v || v.length === 0) {
-    throw new Error(
-      `${name} is not set. The service refuses to start without it — an API that provisions ` +
-        `databases must not run unauthenticated.`,
-    );
-  }
-  return v;
-}
-
 export const config = {
   port: Number(envOr("DRIGODB_PORT", "8080")),
 
@@ -141,9 +130,28 @@ export function serverAuthEnabled(): boolean {
 }
 
 
-// Read lazily so tests and `--help`-style invocations do not need a token.
-export function apiToken(): string {
-  return required("DRIGODB_API_TOKEN");
+// The installation's bootstrap admin token, if it set one.
+//
+// There was a `required()` helper here whose error said "the service refuses to start
+// without it — an API that provisions databases must not run unauthenticated". The
+// sentiment is still true and the mechanism moved: what must not happen is serving a
+// /v1 request without a valid credential, and that is now enforced per request in
+// src/auth.ts against every token this installation has, rather than once at boot
+// against one string in the environment.
+//
+// OPTIONAL, where this used to be `required()`. A token is a resource drigodb
+// issues now (#62), and this one is the pre-existing trust that mints the first of
+// them — it comes from whoever installed drigodb, because to call the API you need
+// a token and to get a token you call the API.
+//
+// Still supported and still what the chart provides, so no installation changes.
+// What changed is that it is no longer the ONLY credential, and no longer a startup
+// requirement: an installation that has issued its own tokens and removed this one
+// is a valid installation, and refusing to boot without it would make reaching that
+// state impossible.
+export function bootstrapToken(): string | undefined {
+  const v = process.env["DRIGODB_API_TOKEN"];
+  return v && v.length > 0 ? v : undefined;
 }
 
 // Backups exist for this installation when the chart rendered an ObjectStore

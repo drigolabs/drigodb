@@ -306,6 +306,125 @@ else
   note "no CA served; this installation issues no certificates and URIs say sslmode=require"
 fi
 
+step "Tokens are issued, scoped and revocable"
+# The auth path every other assertion in this file depends on, and until #62 it was
+# one static string compared with `!==`. A bug here is not a failed test elsewhere —
+# it is either a locked-out installation or an open one.
+#
+# The token used for the rest of this script is the installation's bootstrap token,
+# so these assertions are run with it and then the issued ones are thrown away.
+TOKENS="$(api "localhost:${API_PORT}/v1/tokens")"
+if echo "$TOKENS" | grep -q '"bootstrap":true'; then
+  ok "the bootstrap token is listed, so an unrevocable credential is visible rather than hidden"
+else
+  fail "GET /v1/tokens does not report the bootstrap token: ${TOKENS}"
+  exit 1
+fi
+# No token value and no hash, ever, in a listing.
+if echo "$TOKENS" | grep -qiE '"(token|hash)"'; then
+  fail "GET /v1/tokens returned a token or a hash: a listing must be metadata only"
+  exit 1
+fi
+ok "the listing carries no token and no hash"
+
+ISSUED="$(api -XPOST "localhost:${API_PORT}/v1/tokens" -d '{"name":"smoke tenant"}')"
+TENANT_TOKEN="$(echo "$ISSUED" | jqf '["token"]')"
+TENANT_ID="$(echo "$ISSUED" | jqf '["id"]')"
+TENANT_TIER="$(echo "$ISSUED" | jqf '["tier"]')"
+[ -n "$TENANT_TOKEN" ] || { fail "issuing a token returned no token: ${ISSUED}"; exit 1; }
+if [ "$TENANT_TIER" = "tenant" ]; then
+  ok "issued ${TENANT_ID}, tier tenant — nobody becomes an admin by omission"
+else
+  fail "a token issued with no tier came back as '${TENANT_TIER}'"
+  exit 1
+fi
+
+# It works. A hash stored and a token accepted are two halves of one thing, and a
+# unit test cannot tell you the Secret round-tripped through the API server.
+TENANT_CODE="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TENANT_TOKEN}" \
+  "localhost:${API_PORT}/v1/databases")"
+if [ "$TENANT_CODE" = "200" ]; then
+  ok "the issued token authenticates against a real API server round trip"
+else
+  fail "an issued token returned ${TENANT_CODE} on GET /v1/databases, not 200"
+  exit 1
+fi
+
+# And it cannot mint more. This is the whole tier split; without it an issued token
+# could issue itself an admin one and the split would mean nothing.
+ESCALATE="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TENANT_TOKEN}" \
+  -H 'content-type: application/json' -XPOST "localhost:${API_PORT}/v1/tokens" \
+  -d '{"name":"privilege escalation","tier":"admin"}')"
+if [ "$ESCALATE" = "403" ]; then
+  ok "a tenant token cannot issue tokens (403)"
+else
+  fail "a tenant token got ${ESCALATE} from POST /v1/tokens, not 403 — it can mint itself an admin token"
+  exit 1
+fi
+
+# Revoked, and then it stops working. The five-second cache is the documented
+# window, so this waits past it rather than asserting on a race.
+api -XDELETE "localhost:${API_PORT}/v1/tokens/${TENANT_ID}" >/dev/null
+sleep 7
+REVOKED="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TENANT_TOKEN}" \
+  "localhost:${API_PORT}/v1/databases")"
+if [ "$REVOKED" = "401" ]; then
+  ok "a revoked token stops working within the cache window"
+else
+  fail "a revoked token still returned ${REVOKED} seven seconds after DELETE"
+  exit 1
+fi
+
+# An expiry is honoured by the same path, and nothing removes the Secret when it
+# lapses — only the check does.
+SHORT="$(api -XPOST "localhost:${API_PORT}/v1/tokens" -d '{"name":"expires fast","expires_in":5}')"
+SHORT_TOKEN="$(echo "$SHORT" | jqf '["token"]')"
+SHORT_ID="$(echo "$SHORT" | jqf '["id"]')"
+sleep 12
+EXPIRED="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${SHORT_TOKEN}" \
+  "localhost:${API_PORT}/v1/databases")"
+if [ "$EXPIRED" = "401" ]; then
+  ok "an expired token is refused, though its Secret is still there"
+else
+  fail "a token whose expires_in has passed returned ${EXPIRED}, not 401"
+  exit 1
+fi
+api -XDELETE "localhost:${API_PORT}/v1/tokens/${SHORT_ID}" >/dev/null 2>&1 || true
+
+# The bootstrap token is the installation's, not drigodb's.
+BOOT_DEL="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer ${TOKEN}" \
+  -XDELETE "localhost:${API_PORT}/v1/tokens/bootstrap")"
+if [ "$BOOT_DEL" = "409" ]; then
+  ok "the bootstrap token cannot be revoked through the API (409)"
+else
+  fail "DELETE /v1/tokens/bootstrap returned ${BOOT_DEL}, not 409 — an installation could lock itself out"
+  exit 1
+fi
+
+# A garbage token is refused, which is the assertion that would have caught the
+# whole path being wired wrong.
+JUNK="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer not-a-real-token" \
+  "localhost:${API_PORT}/v1/databases")"
+NONE="$(curl -sS -o /dev/null -w '%{http_code}' "localhost:${API_PORT}/v1/databases")"
+if [ "$JUNK" = "401" ] && [ "$NONE" = "401" ]; then
+  ok "a wrong token and no token both get 401, and the same one"
+else
+  fail "wrong token gave ${JUNK} and no token gave ${NONE}; both must be 401"
+  exit 1
+fi
+
+# Token Secrets must not be confusable with a database's password Secret: they
+# share a namespace.
+TOKEN_SECRETS="$(k -n drigodb-databases get secrets -l drigodb.io/token-id --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+DB_SECRETS="$(k -n drigodb-databases get secrets -l drigodb.io/database-id --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+OVERLAP="$(k -n drigodb-databases get secrets -l drigodb.io/token-id,drigodb.io/database-id --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+if [ "$OVERLAP" = "0" ]; then
+  ok "${TOKEN_SECRETS} token Secret(s) and ${DB_SECRETS} database Secret(s) share a namespace and no labels"
+else
+  fail "${OVERLAP} Secret(s) carry both labels; a listing of one could pick up the other"
+  exit 1
+fi
+
 step "Provisioning '${EXTERNAL_ID}'"
 RESP="$(api -XPOST "localhost:${API_PORT}/v1/databases" -d "{\"external_id\":\"${EXTERNAL_ID}\"}")"
 DB_ID="$(echo "$RESP" | jqf '["id"]')"
