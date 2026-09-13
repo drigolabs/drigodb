@@ -6,7 +6,7 @@
   "timezone": "Europe/Lisbon",
   "dependencyDashboard": true,
   "dependencyDashboardTitle": "Pins that could move",
-  "prConcurrentLimit": 3,
+  "prConcurrentLimit": 6,
   "rebaseWhen": "conflicted",
   "labels": [
     "dependencies"
@@ -14,7 +14,7 @@
   "commitMessagePrefix": "chore(deps):",
   "packageRules": [
     {
-      "description": "One pull request per pin. A batched bump is a batched revert, and these pins fail in unrelated ways — a CloudNativePG minor and a mermaid patch have nothing to say to each other.",
+      "description": "One pull request per pin. A batched bump is a batched revert, and these pins fail in unrelated ways \u2014 a CloudNativePG minor and a mermaid patch have nothing to say to each other.",
       "matchManagers": [
         "custom.regex",
         "helm-values",
@@ -25,7 +25,7 @@
       "groupName": null
     },
     {
-      "description": "Label the pins this repository maintains deliberately, so they stay findable. config:recommended also proposes npm and GitHub Actions majors — fifteen of them on the first run — and the versions.env pins are the ones that have actually broken things: MinIO vanishing from Docker Hub, and appVersion four releases behind its own chart.",
+      "description": "Label the pins this repository maintains deliberately, so they stay findable. config:recommended also proposes npm and GitHub Actions majors \u2014 fifteen of them on the first run \u2014 and the versions.env pins are the ones that have actually broken things: MinIO vanishing from Docker Hub, and appVersion four releases behind its own chart.",
       "matchManagers": [
         "custom.regex"
       ],
@@ -34,7 +34,7 @@
       ]
     },
     {
-      "description": "MinIO's tags are RELEASE.<timestamp>, which `loose` versioning cannot parse — it skipped both pins with skipReason invalid-value, so Renovate could never have proposed a bump for the one dependency that has already broken CI by disappearing. A regex versioning reads the date as major.minor.patch and the time as the build, which orders correctly. It also does the filtering allowedVersions used to attempt: the pattern requires a trailing Z, so the -cpuv1 and .hotfix. variants do not parse and are ignored rather than mistaken for newer.",
+      "description": "MinIO's tags are RELEASE.<timestamp>, which `loose` versioning cannot parse \u2014 it skipped both pins with skipReason invalid-value, so Renovate could never have proposed a bump for the one dependency that has already broken CI by disappearing. A regex versioning reads the date as major.minor.patch and the time as the build, which orders correctly. It also does the filtering allowedVersions used to attempt: the pattern requires a trailing Z, so the -cpuv1 and .hotfix. variants do not parse and are ignored rather than mistaken for newer.",
       "matchPackageNames": [
         "quay.io/minio/minio",
         "quay.io/minio/mc"
@@ -42,7 +42,7 @@
       "versioning": "regex:^RELEASE\\.(?<major>\\d{4})-(?<minor>\\d{2})-(?<patch>\\d{2})T(?<build>[\\d-]+)Z$"
     },
     {
-      "description": "The API image this chart deploys is built from this repository, so a bump here is the promotion step decision 0002 says has to be a second merge. It cannot be automerged: the commit being released cannot name the image the release is about to build.",
+      "description": "The API image this chart deploys is built from this repository, so a bump here is the promotion step decision 0002 says has to be a second merge. It cannot be automerged: the commit being released cannot name the image the release is about to build. prPriority, because this is the PR that SHIPS a release and it was starving. prConcurrentLimit is global: with three dependency bumps open, the promotion branch was planned and its pull request never created \u2014 so appVersion sat six releases behind while every other pin moved. Priority is what gets it the first free slot. The limit below is raised for headroom rather than as the fix.",
       "matchDatasources": [
         "docker"
       ],
@@ -53,7 +53,8 @@
       "labels": [
         "dependencies",
         "promotion"
-      ]
+      ],
+      "prPriority": 10
     }
   ],
   "customManagers": [
@@ -151,7 +152,7 @@
       "datasourceTemplate": "docker"
     },
     {
-      "description": "The sidecar image an archive purge runs on (charts/drigodb/values.yaml). It must stay in step with BARMAN_PLUGIN_VERSION above: the sidecar the plugin injects and the one a purge runs are the same image, and an older one has no delete_under_prefix. Two managers, one version — a bump that lands on only one of them is visible as a diff, where a chart value nothing watched would just rot.",
+      "description": "The sidecar image an archive purge runs on (charts/drigodb/values.yaml). It must stay in step with BARMAN_PLUGIN_VERSION above: the sidecar the plugin injects and the one a purge runs are the same image, and an older one has no delete_under_prefix. Two managers, one version \u2014 a bump that lands on only one of them is visible as a diff, where a chart value nothing watched would just rot.",
       "customType": "regex",
       "managerFilePatterns": [
         "/^charts/drigodb/values\\.yaml$/"
