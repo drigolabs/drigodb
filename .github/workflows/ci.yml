@@ -233,7 +233,7 @@ jobs:
       # Chromium is the slow part and it does not change between runs. Keyed on
       # the pinned mermaid-cli version, so a bump fetches once and then caches.
       - name: Cache the browser mermaid-cli drives
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cache/puppeteer
