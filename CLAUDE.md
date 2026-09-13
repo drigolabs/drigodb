@@ -132,6 +132,12 @@ old configuration, the new one starting, one terminating. `{.items[0]}` picked t
 old one and an assertion about a broken configuration read the working one's
 answer.
 
+This applies to **`kubectl logs -l …` too**, which is where it recurred a third time:
+grepping the API's log for a message that only the NEW configuration prints, with a
+selector that also matched the terminating pod, read the old pod's log and asserted
+the opposite of the truth. Any `kubectl` call in a test that names pods by app label
+alone is this bug waiting to happen.
+
 Select the ReplicaSet by the Deployment's `deployment.kubernetes.io/revision`
 annotation, which is what `kubectl rollout` matches on. **Not the newest
 `creationTimestamp`**: reverting a value to empty makes the pod template byte
@@ -139,6 +145,12 @@ identical to an earlier one, because Kubernetes drops an env var whose value is
 `""` — so no new ReplicaSet is created, the FIRST one is scaled back up and its
 revision bumped, and the newest by timestamp is a stale one scaled to zero with no
 pods in it at all.
+
+A cluster assertion whose inputs are empty passes and means nothing. "No Secret
+carries both labels" reported success against **zero Secrets of either kind**, because
+it ran before any database was provisioned and after its own tokens were revoked. If
+an assertion compares or counts two populations, assert each is non-empty first and
+fail if it is not — the check that cannot fail is the one that will be trusted.
 
 And do not reach a pod through `kubectl port-forward` in a test. A forward that
 outlives its caller keeps the local port, the next one cannot bind it, and reads go
