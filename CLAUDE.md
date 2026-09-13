@@ -140,6 +140,12 @@ identical to an earlier one, because Kubernetes drops an env var whose value is
 revision bumped, and the newest by timestamp is a stale one scaled to zero with no
 pods in it at all.
 
+A cluster assertion whose inputs are empty passes and means nothing. "No Secret
+carries both labels" reported success against **zero Secrets of either kind**, because
+it ran before any database was provisioned and after its own tokens were revoked. If
+an assertion compares or counts two populations, assert each is non-empty first and
+fail if it is not — the check that cannot fail is the one that will be trusted.
+
 And do not reach a pod through `kubectl port-forward` in a test. A forward that
 outlives its caller keeps the local port, the next one cannot bind it, and reads go
 to whichever pod the stale forward points at — silently, and it has already turned

@@ -413,18 +413,6 @@ else
   exit 1
 fi
 
-# Token Secrets must not be confusable with a database's password Secret: they
-# share a namespace.
-TOKEN_SECRETS="$(k -n drigodb-databases get secrets -l drigodb.io/token-id --no-headers 2>/dev/null | wc -l | tr -d ' ')"
-DB_SECRETS="$(k -n drigodb-databases get secrets -l drigodb.io/database-id --no-headers 2>/dev/null | wc -l | tr -d ' ')"
-OVERLAP="$(k -n drigodb-databases get secrets -l drigodb.io/token-id,drigodb.io/database-id --no-headers 2>/dev/null | wc -l | tr -d ' ')"
-if [ "$OVERLAP" = "0" ]; then
-  ok "${TOKEN_SECRETS} token Secret(s) and ${DB_SECRETS} database Secret(s) share a namespace and no labels"
-else
-  fail "${OVERLAP} Secret(s) carry both labels; a listing of one could pick up the other"
-  exit 1
-fi
-
 step "Provisioning '${EXTERNAL_ID}'"
 RESP="$(api -XPOST "localhost:${API_PORT}/v1/databases" -d "{\"external_id\":\"${EXTERNAL_ID}\"}")"
 DB_ID="$(echo "$RESP" | jqf '["id"]')"
@@ -440,6 +428,29 @@ for _ in $(seq 1 90); do
 done
 [ "$STATUS" = "ready" ] || { fail "never became ready (last: ${STATUS})"; exit 1; }
 ok "ready in $(( $(date +%s) - t0 ))s"
+
+# Token Secrets and database password Secrets share a namespace, and neither
+# listing may ever pick up the other's objects (#62).
+#
+# HERE, not in the token step above, and the first version of this was in the token
+# step and was worthless: it ran before any database existed and after its tokens
+# were revoked, so it compared zero against zero and reported success. A check whose
+# inputs are both empty cannot fail. This one refuses to run on empty.
+OVERLAP_TOKEN="$(api -XPOST "localhost:${API_PORT}/v1/tokens" -d '{"name":"secret label check"}' | jqf '["id"]')"
+TOKEN_SECRETS="$(k -n drigodb-databases get secrets -l drigodb.io/token-id --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+DB_SECRETS="$(k -n drigodb-databases get secrets -l drigodb.io/database-id --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+OVERLAP="$(k -n drigodb-databases get secrets -l drigodb.io/token-id,drigodb.io/database-id --no-headers 2>/dev/null | wc -l | tr -d ' ')"
+if [ "${TOKEN_SECRETS:-0}" -lt 1 ] || [ "${DB_SECRETS:-0}" -lt 1 ]; then
+  fail "this check needs at least one Secret of each kind and found ${TOKEN_SECRETS} token / ${DB_SECRETS} database; it would pass on nothing"
+  exit 1
+fi
+if [ "$OVERLAP" = "0" ]; then
+  ok "${TOKEN_SECRETS} token and ${DB_SECRETS} database Secret(s) in one namespace, sharing no label"
+else
+  fail "${OVERLAP} Secret(s) carry both labels; a listing of one would pick up the other"
+  exit 1
+fi
+api -XDELETE "localhost:${API_PORT}/v1/tokens/${OVERLAP_TOKEN}" >/dev/null 2>&1 || true
 
 step "Two callers at once get one database"
 # Not a replica test — a create test. The handler awaits a read before it
