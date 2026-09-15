@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@hono/node-server": "^1.14.0",
-    "@kubernetes/client-node": "^1.4.0",
+    "@kubernetes/client-node": "^2.0.0",
     "hono": "^4.7.0"
   },
   "devDependencies": {
