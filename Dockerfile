@@ -1,5 +1,5 @@
 # The drigodb control-plane API.
-FROM node:22-alpine AS build
+FROM node:24-alpine AS build
 WORKDIR /app
 # The lockfile comes along and `npm ci` installs exactly it. `npm install`
 # resolves ranges afresh on every build, so two builds of the same commit could
@@ -10,7 +10,7 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN npx tsc -p tsconfig.json
 
-FROM node:22-alpine
+FROM node:24-alpine
 WORKDIR /app
 ENV NODE_ENV=production
 
