@@ -32,7 +32,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
       - run: npm ci
       - run: npm run typecheck
@@ -229,7 +229,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 24
       # Chromium is the slow part and it does not change between runs. Keyed on
       # the pinned mermaid-cli version, so a bump fetches once and then caches.
       - name: Cache the browser mermaid-cli drives
